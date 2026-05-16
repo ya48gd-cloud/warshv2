@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node
+react-src/node_modules/
+react-src/dist/
+node_modules/
+dist-electron/
+
+# Built frontend (generated — not committed)
+# frontend/ is committed as a convenience so docker compose up works immediately
+# Remove this line if you prefer to always build from source:
+# frontend/
+
+# Env
+.env
+*.env.local
+
+# Docker volumes (local dev)
+postgres-data/
+desktop-data/
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,99 @@
+# ═══════════════════════════════════════════════════════════════
+#  Heavy ERP — docker-compose.yml
+#  React (Vite) + FastAPI + PostgreSQL 16 + Redis + nginx
+# ═══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Database ─────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: erp_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     erp_user
+      POSTGRES_PASSWORD: erp_pass
+      POSTGRES_DB:       heavy_erp
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_user -d heavy_erp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: erp_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # ── FastAPI backend ───────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: erp_backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql+asyncpg://erp_user:erp_pass@db:5432/heavy_erp
+      REDIS_URL:    redis://redis:6379
+      # ⚠️  Change this before going to production!
+      JWT_SECRET:   change-me-in-production-use-a-long-random-string
+      ENVIRONMENT:  development
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["sh", "/app/start.sh"]
+
+  # ── React frontend builder ────────────────────────────────────
+  # Builds the React/Vite app and writes static files into ./frontend/
+  # Run with:  docker compose --profile build run --rm frontend-builder
+  # Or simply: make build-frontend
+  frontend-builder:
+    image: node:20-alpine
+    container_name: erp_frontend_builder
+    working_dir: /app
+    volumes:
+      - ./react-src:/app              # source
+      - ./frontend:/app/dist          # vite outDir=dist → ./frontend on host
+    command: >
+      sh -c "
+        echo '📦  npm ci...' &&
+        npm ci --silent &&
+        echo '⚛️   Building React app...' &&
+        npm run build &&
+        echo '✅  Done — static files written to ./frontend/'
+      "
+    profiles:
+      - build   # only starts when: docker compose --profile build ...
+
+  # ── nginx (reverse-proxy + SPA) ───────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: erp_nginx
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
+      - uploads_data:/uploads:ro
+    depends_on:
+      - backend
+
+volumes:
+  pg_data:
+  uploads_data:

@@ -1,0 +1,27 @@
+# ── Stage 1: Build React app ──────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies first (cached layer)
+COPY react-src/package*.json ./
+RUN npm ci --silent
+
+# Copy source and build
+COPY react-src/ .
+RUN npm run build
+# Built files land in /app/../frontend = needs adjustment:
+# vite outDir is '../frontend', relative to /app → /frontend (host volume)
+# We'll output to /dist instead and copy in docker-compose
+
+# Override outDir for Docker: build to /app/dist
+RUN sed -i "s|outDir: '../frontend'|outDir: 'dist'|" vite.config.js && npm run build
+
+# ── Stage 2: Serve with nginx ──────────────────────────────────
+FROM nginx:alpine AS runner
+
+# Copy built assets
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# nginx config is mounted via docker-compose volume
+EXPOSE 80

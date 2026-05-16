@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Heavy ERP Desktop</title>
+    <link rel="stylesheet" href="./setup.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Heavy ERP Desktop</p>
+          <h1>تشغيل النظام محليًا بدون Docker</h1>
+          <p class="sub">
+            هذه الشاشة تجهز Python وSQLite، تبني واجهة React، ثم تشغل التطبيق كبرنامج Desktop.
+          </p>
+        </div>
+        <div class="status-pill" id="statusText">جار فحص الحالة...</div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>الإعداد</h2>
+          <label class="check">
+            <input id="seedDemo" type="checkbox" checked />
+            <span>تحميل بيانات تجريبية بعد الإعداد</span>
+          </label>
+          <label class="check">
+            <input id="rebuildVenv" type="checkbox" checked />
+            <span>إعادة بناء بيئة Python عند وجود تثبيت سابق فاشل</span>
+          </label>
+          <div class="actions">
+            <button id="setupBtn" class="primary">Setup</button>
+            <button id="startBtn">Start Backend</button>
+            <button id="openBtn">Open App</button>
+            <button id="stopBtn" class="danger">Stop</button>
+          </div>
+          <div class="facts">
+            <div><span>Python env</span><strong id="venvState">...</strong></div>
+            <div><span>Frontend build</span><strong id="buildState">...</strong></div>
+            <div><span>Database</span><strong id="dbState">...</strong></div>
+            <div><span>Backend</span><strong id="backendState">...</strong></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>بيانات التشغيل</h2>
+          <p class="hint">بعد أول Setup يمكنك استخدام Start أو Open App مباشرة.</p>
+          <dl>
+            <dt>الرابط المحلي</dt>
+            <dd id="appUrl">http://127.0.0.1:8000</dd>
+            <dt>المستخدم الافتراضي</dt>
+            <dd>admin / admin123</dd>
+            <dt>مجلد بيانات البرنامج</dt>
+            <dd id="basePath">...</dd>
+          </dl>
+        </article>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="log-head">
+          <h2>Logs</h2>
+          <button id="clearBtn" class="ghost">Clear</button>
+        </div>
+        <pre id="logs"></pre>
+      </section>
+    </main>
+    <script src="./setup.js"></script>
+  </body>
+</html>

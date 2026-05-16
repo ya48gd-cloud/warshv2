@@ -1,0 +1,230 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  :root {
+    --teal:    #0F6E56;
+    --teal-lt: #E1F5EE;
+    --teal-md: #1D9E75;
+    --teal-dk: #0a5a45;
+    --amber:   #854F0B;
+    --amber-lt:#FAEEDA;
+    --amber-md:#EF9F27;
+    --red:     #A32D2D;
+    --red-lt:  #FCEBEB;
+    --red-md:  #E24B4A;
+    --blue:    #185FA5;
+    --blue-lt: #E6F1FB;
+    --green:   #3B6D11;
+    --green-lt:#EAF3DE;
+    --green-md:#639922;
+    --bg:      #f5f4f0;
+    --surface: #ffffff;
+    --border:  #e2e0d8;
+    --text:    #1a1a18;
+    --muted:   #6b6a64;
+  }
+
+  html, body, #root {
+    height: 100%;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Sans Arabic', 'Tajawal', sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    direction: rtl;
+  }
+
+  input, select, textarea, button {
+    font-family: inherit;
+  }
+}
+
+@layer components {
+  /* ── Layout ─────────────────────────────────────── */
+  .sidebar {
+    @apply fixed top-0 right-0 bottom-0 bg-white border-l border-erp-border flex flex-col z-50;
+    width: 228px;
+  }
+
+  .main-content {
+    margin-right: 228px;
+    @apply flex-1 flex flex-col min-h-screen;
+  }
+
+  /* ── Cards ──────────────────────────────────────── */
+  .card {
+    @apply bg-white border border-erp-border rounded-erp-lg p-5;
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+  }
+
+  .card-sm {
+    @apply bg-white border border-erp-border rounded-erp p-4;
+  }
+
+  /* ── Tables ─────────────────────────────────────── */
+  .erp-table {
+    @apply w-full border-collapse text-sm;
+  }
+
+  .erp-table th {
+    @apply text-right px-3 py-2 text-xs font-semibold text-erp-muted border-b-2 border-erp-border;
+  }
+
+  .erp-table td {
+    @apply px-3 py-2.5 border-b border-erp-border align-middle;
+  }
+
+  .erp-table tr:hover td {
+    background: var(--bg);
+  }
+
+  .erp-table tr:last-child td {
+    border-bottom: none;
+  }
+
+  /* ── Buttons ─────────────────────────────────────── */
+  .btn {
+    @apply inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-erp border border-erp-border
+           bg-white text-sm font-medium text-erp-text cursor-pointer transition-all duration-150;
+  }
+  .btn:hover { background: var(--bg); }
+
+  .btn-primary {
+    @apply btn border-teal bg-teal text-white;
+  }
+  .btn-primary:hover { background: var(--teal-dk); border-color: var(--teal-dk); }
+
+  .btn-danger {
+    @apply btn border-red-lt text-red;
+  }
+  .btn-danger:hover { background: var(--red-lt); }
+
+  .btn-sm {
+    @apply px-2.5 py-1 text-xs;
+  }
+
+  /* ── Badges ─────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold;
+  }
+  .badge-green  { background: var(--green-lt); color: var(--green); }
+  .badge-amber  { background: var(--amber-lt); color: var(--amber); }
+  .badge-red    { background: var(--red-lt);   color: var(--red); }
+  .badge-blue   { background: var(--blue-lt);  color: var(--blue); }
+  .badge-teal   { background: var(--teal-lt);  color: var(--teal); }
+  .badge-gray   { background: var(--bg);       color: var(--muted); }
+
+  /* Role badges */
+  .role-admin       { background: #fee2e2; color: #b91c1c; }
+  .role-accountant  { background: #dbeafe; color: #1d4ed8; }
+  .role-production  { background: #dcfce7; color: #15803d; }
+  .role-viewer      { background: #f3f4f6; color: #6b7280; }
+
+  /* ── Forms ──────────────────────────────────────── */
+  .field-label {
+    @apply block text-xs font-medium text-erp-muted mb-1;
+  }
+
+  .field-input {
+    @apply w-full px-3 py-2 border border-erp-border rounded-erp text-sm
+           bg-white focus:outline-none focus:border-teal-md transition-colors;
+  }
+
+  .field-select {
+    @apply field-input appearance-none cursor-pointer;
+  }
+
+  /* ── Progress ───────────────────────────────────── */
+  .progress-track {
+    @apply bg-erp-border rounded-full h-1.5 overflow-hidden;
+  }
+  .progress-fill {
+    @apply h-full rounded-full transition-all duration-300;
+  }
+
+  /* ── Stat cards ─────────────────────────────────── */
+  .kpi-card {
+    @apply card cursor-pointer hover:shadow-float transition-all duration-200;
+  }
+  .kpi-card:hover { transform: translateY(-1px); }
+
+  /* ── Nav ─────────────────────────────────────────── */
+  .nav-item {
+    @apply flex items-center gap-2.5 px-4 py-2 text-sm text-erp-muted cursor-pointer
+           border-r-[3px] border-transparent transition-all duration-150;
+  }
+  .nav-item:hover { background: var(--bg); color: var(--text); }
+  .nav-item.active {
+    background: var(--teal-lt);
+    color: var(--teal);
+    border-right-color: var(--teal-md);
+    font-weight: 500;
+  }
+
+  /* ── Modal ──────────────────────────────────────── */
+  .modal-backdrop {
+    @apply fixed inset-0 z-50 flex items-center justify-center;
+    background: rgba(0, 0, 0, 0.35);
+    animation: fadeIn 0.15s ease;
+  }
+
+  .modal-box {
+    @apply bg-white rounded-erp-lg p-6 w-full max-h-[90vh] overflow-y-auto;
+    max-width: 540px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.15);
+    animation: slideUp 0.2s ease;
+  }
+
+  .modal-box-lg {
+    max-width: 720px;
+  }
+
+  /* ── Toast ──────────────────────────────────────── */
+  .toast {
+    @apply fixed bottom-6 left-6 z-[100] px-4 py-2.5 rounded-erp text-sm font-medium;
+    animation: slideUpFade 0.3s ease, fadeOut 0.3s ease 2.7s forwards;
+  }
+
+  /* ── Scrollbar ──────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+}
+
+@layer utilities {
+  .text-erp-muted { color: var(--muted); }
+  .text-erp-text  { color: var(--text); }
+  .bg-erp         { background: var(--bg); }
+  .bg-erp-surface { background: var(--surface); }
+  .border-erp-border { border-color: var(--border); }
+
+  .font-arabic { font-family: 'IBM Plex Sans Arabic', 'Tajawal', sans-serif; }
+  .font-mono   { font-family: 'JetBrains Mono', monospace; }
+}
+
+/* ── Animations ─────────────────────────────────── */
+@keyframes fadeIn   { from { opacity: 0 } to { opacity: 1 } }
+@keyframes slideUp  { from { opacity: 0; transform: translateY(12px) } to { opacity: 1; transform: translateY(0) } }
+@keyframes slideUpFade { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: translateY(0) } }
+@keyframes fadeOut  { from { opacity: 1 } to { opacity: 0; pointer-events: none } }
+@keyframes spin     { to { transform: rotate(360deg) } }
+@keyframes pulse    { 0%,100% { opacity: 1 } 50% { opacity: .5 } }
+
+.animate-spin   { animation: spin 1s linear infinite; }
+.animate-pulse  { animation: pulse 2s ease infinite; }
+
+/* ── Sidebar collapse animation ─────────────────── */
+.sidebar-enter { animation: slideInRight 0.2s ease; }
+@keyframes slideInRight { from { transform: translateX(20px); opacity: 0 } to { transform: translateX(0); opacity: 1 } }
+
+/* ── Table row highlight ─────────────────────────── */
+.row-highlight { animation: highlightFade 1.5s ease; }
+@keyframes highlightFade { 0%,20% { background: var(--teal-lt) } 100% { background: transparent } }
