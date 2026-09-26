@@ -1,0 +1,6 @@
+﻿content = open('app/main.py', encoding='utf-8').read()
+lines = content.split('\n')
+print(f'Line 60: {repr(lines[59])}')
+print(f'Line 61: {repr(lines[60])}')
+print(f'Line 62: {repr(lines[61])}')
+print(f'Line 63: {repr(lines[62])}')

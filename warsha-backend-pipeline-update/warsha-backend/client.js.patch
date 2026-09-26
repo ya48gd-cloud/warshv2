@@ -1,0 +1,10 @@
+// تعديل مطلوب في react-src/src/api/client.js
+// السطر 5 — غيّر من:
+const BASES = ['/api/v1', 'http://localhost:8000/api/v1']
+
+// إلى:
+const BASES = [
+  '/api/v1',
+  import.meta.env.VITE_API_URL ? `${import.meta.env.VITE_API_URL}/api/v1` : null,
+  'http://localhost:8000/api/v1'
+].filter(Boolean)
