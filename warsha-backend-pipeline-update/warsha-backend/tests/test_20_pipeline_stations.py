@@ -707,6 +707,67 @@ async def test_work_order_to_invoice_blocks_double_invoicing(cli):
     assert "مسبقًا" in r2.json()["detail"]
 
 
+@pytest.mark.asyncio
+async def test_work_order_to_invoice_deducts_fg_stock_and_posts_cogs(cli):
+    """
+    قبل الإصلاح: فوترة أمر إنتاج مباشرة (work-orders/{id}/to-invoice) كانت
+    بتسجّل إيراد كامل (journal_sales_invoice_create) من غير ما تخصم أي مخزون
+    تام الصنع (FG-{code}) ومن غير أي قيد COGS — نفس فئة فجوة "عقود التوريد"
+    اللي اتصلحت قبل كده، لكن هنا في المسار الأكتر استخدامًا لفوترة التصنيع.
+    """
+    eq_id = await _make_equipment(cli)
+    cust_id = await _make_customer(cli)
+    quot = await _make_quotation(cli, cust_id, unit_price=1000, qty=2)
+    order_id = (await cli.post(f"/api/v1/sales/quotations/{quot['id']}/to-order", json={})).json()["id"]
+    wo_r = (await cli.post(f"/api/v1/sales/orders/{order_id}/to-work-order", json={
+        "equipment_id": eq_id, "quantity": 2, "quantity_unit": "وحدة",
+        "start_date": str(date.today()),
+    })).json()
+    wo_id, wo_code = wo_r["id"], wo_r["code"]
+    await cli.post(f"{COA}/chart/seed")
+    await cli.post(f"{ACC}/cost-lines", json={
+        "work_order_id": wo_id, "cost_type": "material",
+        "description": "صاج", "qty": 2, "unit_cost": 150,
+    })
+    await cli.post(f"{PROD}/complete/{wo_id}")
+
+    mats_before = (await cli.get("/api/v1/inventory/materials")).json()
+    fg_before = next(m for m in mats_before if m["code"] == f"FG-{wo_code}")
+    assert float(fg_before["stock_qty"]) == 2.0
+
+    before_bal = await _trial_balance_map(cli)
+    cogs_before = float(before_bal.get("5100", {}).get("total_debit", 0))
+
+    r = await cli.post(f"/api/v1/sales/work-orders/{wo_id}/to-invoice", json={})
+    assert r.status_code == 201, r.text
+
+    mats_after = (await cli.get("/api/v1/inventory/materials")).json()
+    fg_after = next(m for m in mats_after if m["code"] == f"FG-{wo_code}")
+    assert float(fg_after["stock_qty"]) == 0.0, "FG stock must be fully released on direct work-order invoicing"
+
+    after_bal = await _trial_balance_map(cli)
+    cogs_after = float(after_bal.get("5100", {}).get("total_debit", 0))
+    assert cogs_after > cogs_before, "a COGS entry must be posted when invoicing a completed work order directly"
+
+
+@pytest.mark.asyncio
+async def test_work_order_to_invoice_blocked_when_not_yet_produced(cli):
+    """محاولة فوترة أمر إنتاج معملوش /production/complete لسه لازم تترفض (مفيش رصيد FG)."""
+    eq_id = await _make_equipment(cli)
+    cust_id = await _make_customer(cli)
+    quot = await _make_quotation(cli, cust_id, unit_price=500, qty=1)
+    order_id = (await cli.post(f"/api/v1/sales/quotations/{quot['id']}/to-order", json={})).json()["id"]
+    wo_id = (await cli.post(f"/api/v1/sales/orders/{order_id}/to-work-order", json={
+        "equipment_id": eq_id, "quantity": 1, "quantity_unit": "وحدة",
+        "start_date": str(date.today()),
+    })).json()["id"]
+    # ملحوظة: مفيش /production/complete هنا — التصنيع لسه ماخلصش
+
+    r = await cli.post(f"/api/v1/sales/work-orders/{wo_id}/to-invoice", json={})
+    assert r.status_code == 400
+    assert "FG" in r.json()["detail"] or "تام الصنع" in r.json()["detail"]
+
+
 # ═══════════════════════════════════════════════════════════════
 # محطة 24 — استكشاف: استلام أمر شراء (create_invoice=True) — هل بيترحّل محاسبيًا؟
 # ═══════════════════════════════════════════════════════════════

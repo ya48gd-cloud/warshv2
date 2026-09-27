@@ -22,7 +22,7 @@ from app.models.models import (
 from app.services.invoice_due import sync_invoice_due_date
 from app.services.auto_journal import (
     journal_sales_invoice_create, journal_sales_invoice_payment,
-    journal_sales_invoice_delete,
+    journal_sales_invoice_delete, journal_cogs,
 )
 from app.services.treasury_link import record_payment_in_treasury
 from app.services.analytics import log_event, Events
@@ -1456,6 +1456,33 @@ async def work_order_to_invoice(wo_id: int, data: WorkOrderToInvoiceRequest,
 
     # قيد محاسبي
     await journal_sales_invoice_create(db, tid, inv.id, inv.code, tax_amt, total, date.today())
+
+    # خصم فعلي من مخزون تام الصنع (FG-{wo.code}) + قيد COGS — نفس النمط بالظبط
+    # المستخدم في delivery_orders.py._release_fg_stock_for_line. قبل التصليح
+    # ده، فوترة أمر إنتاج كانت بتسجّل إيراد كامل من غير ما تخصم أي مخزون
+    # ومن غير أي قيد تكلفة بضاعة مباعة — رصيد FG بيفضل واقف في المخزون للأبد
+    # (مخزون وهمي) والربح المعروض بيبقى أعلى من الحقيقة بقيمة التكلفة كاملة.
+    from app.models.models import Material as _FGMat
+    from app.services.inventory_ledger import get_or_create_warehouse_bin as _get_fg_bin, post_issue as _post_fg_issue
+    fg_mat = (await db.execute(
+        select(_FGMat).where(_FGMat.tenant_id == tid, _FGMat.code == f"FG-{wo.code}")
+    )).scalar_one_or_none()
+    if not fg_mat or (fg_mat.stock_qty or Decimal("0")) < qty:
+        raise HTTPException(
+            400,
+            f"لا يمكن إصدار فاتورة لأمر الإنتاج {wo.code} — لسه معندوش رصيد كافٍ في مخزون "
+            f"تام الصنع (FG). لازم يتم إنهاء التصنيع (POST /production/complete/{{id}}) أولاً."
+        )
+    fg_unit_cost = fg_mat.unit_cost or Decimal("0")
+    cogs_amount = qty * fg_unit_cost
+    fg_bin = await _get_fg_bin(db, tid, "FG")
+    await _post_fg_issue(
+        db, material=fg_mat, qty=qty, unit_cost=fg_unit_cost,
+        source_doc_type="sales_invoice", source_doc_id=inv.id,
+        source_location_id=fg_bin.id,
+        reference=inv.code, notes=f"فاتورة مبيعات مباشرة من أمر الإنتاج — {inv.code}",
+    )
+    await journal_cogs(db, tid, inv.id, inv.code, cogs_amount, date.today())
 
     # محطة 23: ما بنلمسش wo.status هنا. كان بيتحط "billed" وده كان بيمسح
     # حالة "done" اللي تقارير كتير بتفلتر بيها (dashboard_new.py, reports.py,
