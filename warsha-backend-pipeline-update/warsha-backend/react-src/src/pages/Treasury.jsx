@@ -29,6 +29,10 @@ export default function Treasury() {
   const [deleteTxn, setDeleteTxn] = useState(null)
   const [confirmTxn, setConfirmTxn] = useState(false)
   const [editingTxnId, setEditingTxnId] = useState(null)
+  // لقطة من الحركة الأصلية قبل التعديل — تُستخدم لحساب "الرصيد المتاح" الحقيقي
+  // أثناء تعديل مصروف (out): رصيد الخزنة المعروض من الـ summary يشمل بالفعل أثر
+  // الحركة القديمة، فلازم نضيفه مرة أخرى قبل مقارنته بالمبلغ الجديد.
+  const [editingOriginal, setEditingOriginal] = useState(null)
 
   const [form, setForm] = useState({})
   const [tForm, setTForm] = useState({})
@@ -55,8 +59,14 @@ export default function Treasury() {
       description: t.description || '',
       reference: t.reference || '',
       payment_method: t.payment_method || 'cash',
+      // كانت هذي الحقول بتتفقد عند فتح تعديل حركة شيك — يضطر المستخدم
+      // يعيد كتابتها من الصفر (والتحقق كان بيرفض الحفظ لحد ما يعملها)
+      cheque_number: t.cheque_number || '',
+      cheque_date: t.cheque_date || '',
+      cheque_bank: t.cheque_bank || '',
     })
     setEditingTxnId(t.id)
+    setEditingOriginal({ treasury_id: t.treasury_id, direction: t.direction, amount: t.amount })
     setTxnModal(t.direction)
   }
 
@@ -81,7 +91,7 @@ export default function Treasury() {
       await api.treasury.addTxn(payload)
       toast(txnModal === 'in' ? 'تم تسجيل الإيراد' : 'تم تسجيل المصروف')
     }
-    setConfirmTxn(false); setTxnModal(null); setForm({}); setEditingTxnId(null); setEditingTxnId(null); reload(); reloadTxns(); reloadCheques()
+    setConfirmTxn(false); setTxnModal(null); setForm({}); setEditingTxnId(null); setEditingOriginal(null); reload(); reloadTxns(); reloadCheques()
   })
 
   // التحقق قبل فتح التأكيد
@@ -366,7 +376,7 @@ export default function Treasury() {
 
       {/* مودال إيراد/مصروف */}
       {txnModal && (
-        <Modal open onClose={() => { setTxnModal(null); setForm({}); setEditingTxnId(null) }}
+        <Modal open onClose={() => { setTxnModal(null); setForm({}); setEditingTxnId(null); setEditingOriginal(null) }}
           title={txnModal === 'in' ? '↓ تسجيل إيراد (فلوس داخلة)' : '↑ تسجيل مصروف (فلوس خارجة)'}>
           <FormGrid>
             <Select label="الخزنة *" value={form.treasury_id || ''}
@@ -376,19 +386,30 @@ export default function Treasury() {
             </Select>
             {txnModal === 'out' && form.treasury_id && (() => {
               const sel = treasuries.find(t => String(t.id) === String(form.treasury_id))
-              return sel ? (
+              if (!sel) return null
+              // عند تعديل مصروف قائم على نفس الخزنة، رصيد الخزنة (sel.balance) بيكون
+              // شامل بالفعل خصم المبلغ القديم — فنضيفه تاني هنا عشان الرصيد "المتاح"
+              // المعروض يعكس الحقيقة (وهو نفس المنطق اللي بيطبّقه الباك إند وقت الحفظ)
+              const isEditingSameOut = editingOriginal
+                && String(editingOriginal.treasury_id) === String(form.treasury_id)
+                && editingOriginal.direction === 'out'
+              const availableBalance = isEditingSameOut
+                ? Number(sel.balance) + Number(editingOriginal.amount)
+                : Number(sel.balance)
+              const overAmount = Number(form.amount) > availableBalance
+              return (
                 <div style={{
                   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                   padding: '8px 12px', borderRadius: 8,
-                  background: Number(form.amount) > Number(sel.balance) ? 'var(--red-lt)' : 'var(--green-lt)',
+                  background: overAmount ? 'var(--red-lt)' : 'var(--green-lt)',
                 }}>
                   <span className="text-sm text-erp-muted">الرصيد المتاح:</span>
-                  <span className="font-bold" style={{ color: Number(form.amount) > Number(sel.balance) ? 'var(--red)' : 'var(--green)' }}>
-                    {egp(sel.balance)}
-                    {Number(form.amount) > Number(sel.balance) && ' ⚠️ المبلغ أكبر من الرصيد'}
+                  <span className="font-bold" style={{ color: overAmount ? 'var(--red)' : 'var(--green)' }}>
+                    {egp(availableBalance)}
+                    {overAmount && ' ⚠️ المبلغ أكبر من الرصيد'}
                   </span>
                 </div>
-              ) : null
+              )
             })()}
             <Input label="المبلغ *" type="number" value={form.amount || ''}
               onChange={e => setForm(f => ({ ...f, amount: e.target.value }))} />
@@ -425,7 +446,7 @@ export default function Treasury() {
               onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />
           </div>
           <ModalFooter>
-            <button className="btn" onClick={() => { setTxnModal(null); setForm({}); setEditingTxnId(null) }}>إلغاء</button>
+            <button className="btn" onClick={() => { setTxnModal(null); setForm({}); setEditingTxnId(null); setEditingOriginal(null) }}>إلغاء</button>
             <button className="btn btn-primary" disabled={savingTxn} onClick={requestSaveTxn}>
               {savingTxn ? '...' : 'التالي ←'}
             </button>

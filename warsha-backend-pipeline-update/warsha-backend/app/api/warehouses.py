@@ -87,6 +87,16 @@ async def update_warehouse(warehouse_id: int, data: WarehouseIn, db: AsyncSessio
         raise HTTPException(404, "المخزن غير موجود")
     new_code = data.code.strip().upper()
     if new_code != w.code:
+        # أكواد المخازن الأساسية الـ8 (RAW/WIP/FG/...) معتمَد عليها بالاسم في
+        # أماكن تانية كتير (get_or_create_warehouse_bin، استلام المستورد،
+        # الهالك، النسالة...) — تغيير الكود هنا هيسيب لوجيك المكان الافتراضي
+        # يدوّر على كود مش موجود ويعمل BinLocation يتيم (warehouse_id=None).
+        if w.code in DEFAULT_WAREHOUSE_CODES:
+            raise HTTPException(
+                400,
+                f"'{w.name_ar}' مخزن أساسي في النظام ({w.code}) — كوده لا يمكن تغييره لأن أجزاء "
+                f"أخرى من النظام تعتمد عليه بهذا الكود تحديدًا. يمكنك تعديل الاسم فقط.",
+            )
         exists = await db.scalar(
             select(Warehouse.id).where(Warehouse.tenant_id == w.tenant_id, Warehouse.code == new_code)
         )

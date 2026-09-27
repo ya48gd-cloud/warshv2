@@ -9,7 +9,11 @@ import os
 import asyncio
 
 # ── MUST happen BEFORE any app import ────────────────────────────────
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:////tmp/test_warsh.db"
+# TEST_DB_PATH lets multiple pytest processes (e.g. several agents/CI shards
+# running concurrently) point at their own SQLite file instead of colliding
+# on the shared default — falls back to the historical fixed path unchanged.
+_TEST_DB_PATH = os.getenv("TEST_DB_PATH", "/tmp/test_warsh.db")
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_TEST_DB_PATH}"
 os.environ.setdefault("ERP_UPLOAD_DIR", "/tmp/warsh_test_uploads")
 
 import pytest
@@ -24,7 +28,7 @@ from app.core.database import Base, get_db, current_tenant_id
 from app.api.auth import create_token
 
 # ── Test Database ────────────────────────────────────────────────────
-TEST_DB_URL = "sqlite+aiosqlite:////tmp/test_warsh.db"
+TEST_DB_URL = os.environ["DATABASE_URL"]
 
 test_engine = create_async_engine(
     TEST_DB_URL,

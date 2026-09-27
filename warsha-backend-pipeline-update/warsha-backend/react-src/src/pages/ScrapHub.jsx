@@ -58,6 +58,9 @@ function ScrapRegister() {
   const [save, saving] = useAction(async () => {
     if (!form.material_id || !form.qty || Number(form.qty) <= 0) { toast('اختر المادة وأدخل كمية أكبر من صفر', 'error'); return }
     if (!form.date) { toast('التاريخ مطلوب', 'error'); return }
+    // الباك-إند (ScrapIn.reason) يفرض حقل "السبب" كنص مطلوب بدون قيمة افتراضية —
+    // التحقق هنا يمنع رسالة validation خام (اسم حقل إنجليزي وسط واجهة عربية).
+    if (!form.reason || !form.reason.trim()) { toast('سبب الهالك مطلوب', 'error'); return }
     await api.production.recordScrap(form)
     toast('تم تسجيل الهالك'); setModal(false); setForm({ date: today(), qty: '' }); reload()
   })
@@ -100,7 +103,7 @@ function ScrapRegister() {
             <Input label="الكمية *" type="number" step="0.01" value={form.qty || ''} onChange={e => setForm(f => ({ ...f, qty: e.target.value }))} />
             <Input label="التاريخ *" type="date" value={form.date || today()} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
           </FormGrid>
-          <Textarea label="السبب" value={form.reason || ''} onChange={e => setForm(f => ({ ...f, reason: e.target.value }))} rows={2} />
+          <Textarea label="السبب *" value={form.reason || ''} onChange={e => setForm(f => ({ ...f, reason: e.target.value }))} rows={2} />
         </div>
         <ModalFooter>
           <button className="btn" onClick={() => setModal(false)}>إلغاء</button>

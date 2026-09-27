@@ -264,6 +264,36 @@ async def test_update_material_price(cli):
     assert r.status_code == 200
 
 
+@pytest.mark.asyncio
+async def test_update_material_price_rejects_negative(cli):
+    mr = await cli.post(f"{BASE}/materials", json=_mat_payload())
+    mid = mr.json()["id"]
+    r = await cli.put(f"{BASE}/materials/{mid}/price", params={"new_price": -5})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_material_price_logs_history(cli):
+    """تعديل سعر المادة لازم يسجّل صف في MaterialPriceHistory (كان الجدول
+    موجود بالموديل بس محدّش بيكتب فيه فعليًا قبل الإصلاح)."""
+    from tests.conftest import TestSessionLocal
+    from sqlalchemy import select as _select
+    from app.models.models import MaterialPriceHistory
+
+    mr = await cli.post(f"{BASE}/materials", json=_mat_payload())
+    mid = mr.json()["id"]
+    r = await cli.put(f"{BASE}/materials/{mid}/price", params={"new_price": 42.0})
+    assert r.status_code == 200
+
+    async with TestSessionLocal() as session:
+        rows = (await session.execute(
+            _select(MaterialPriceHistory).where(MaterialPriceHistory.material_id == mid)
+        )).scalars().all()
+    assert len(rows) == 1
+    assert float(rows[0].new_price) == 42.0
+    assert float(rows[0].old_price) == 10.0
+
+
 # ════════════════ LOW-STOCK ALERTS ═══════════════════════════════════
 @pytest.mark.asyncio
 async def test_low_stock_alerts(cli):
@@ -501,6 +531,55 @@ async def test_quant_matches_after_multiple_mixed_movements(cli):
     assert check["stock_qty"] == float(expected)
     assert check["quant_total"] == float(expected)
     assert check["matches"] is True
+
+
+# ════════════ cutting-plan/commit: خصم المخزون الأساسي عبر post_issue ═══
+@pytest.mark.asyncio
+async def test_cutting_plan_main_stock_consumption_goes_through_ledger(cli):
+    """قبل الإصلاح: commit_cutting_plan كان بيعدّل stock_qty يدويًا وينشئ
+    StockMovement خام من غير movement_no ولا مزامنة StockQuant. دلوقتي
+    لازم يعدي عبر post_issue زي أي حركة صادر تانية في النظام."""
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload())
+    mid = r.json()["id"]
+    await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 10, "unit_cost": 10.0,
+    })
+
+    commit = await cli.post(f"{BASE}/cutting-plan/commit", json={
+        "material_id": mid, "consumed_qty_from_main_stock": 4,
+    })
+    assert commit.status_code == 200, commit.text
+    assert commit.json()["main_stock_deducted"] == 4.0
+
+    check = (await cli.get(f"{BASE}/materials/{mid}/stock-check")).json()
+    assert check["stock_qty"] == 6.0
+    assert check["quant_total"] == 6.0
+    assert check["matches"] is True
+
+    movs = (await cli.get(f"{BASE}/movements/{mid}")).json()
+    cut_mov = next(m for m in movs if m["reference"] == "مخطط تقطيع")
+    assert cut_mov["movement_no"] is not None
+
+
+@pytest.mark.asyncio
+async def test_cutting_plan_main_stock_over_consumption_rejected(cli):
+    """قبل الإصلاح: طلب استهلاك أكتر من الرصيد المتاح كان بيتقبل بصمت
+    ويعمل max(0, stock_qty - qty) بدل ما يرفض الطلب — فيضيع الفرق من غير
+    أي أثر أو تنبيه. دلوقتي لازم يترفض بـ400 زي أي صرف تاني ناقص الرصيد له."""
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload())
+    mid = r.json()["id"]
+    await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 5, "unit_cost": 10.0,
+    })
+
+    commit = await cli.post(f"{BASE}/cutting-plan/commit", json={
+        "material_id": mid, "consumed_qty_from_main_stock": 999,
+    })
+    assert commit.status_code == 400
+
+    # الرصيد يفضل زي ما هو — الطلب اتلغى بالكامل، مش اتقبل جزئيًا
+    check = (await cli.get(f"{BASE}/materials/{mid}/stock-check")).json()
+    assert check["stock_qty"] == 5.0
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,12 @@ async def upload_cad_file(
     if file_size > MAX_SIZE:
         raise HTTPException(400, f"الملف أكبر من 50MB — الحجم: {file_size//1024//1024}MB")
 
+    # تحقق من نوع الملف المسموح به — كان معرّف (ALLOWED_TYPES) لكن غير مُفعّل خالص،
+    # فأي نوع ملف كان يُقبل بغض النظر عن القائمة البيضاء
+    content_type = file.content_type or "application/octet-stream"
+    if content_type not in ALLOWED_TYPES:
+        raise HTTPException(400, f"نوع الملف غير مسموح به: {content_type}")
+
     # اسم فريد للتخزين
     ext = Path(file.filename).suffix.lower() if file.filename else ".bin"
     stored_name = f"eq{equipment_id}_{uuid.uuid4().hex}{ext}"

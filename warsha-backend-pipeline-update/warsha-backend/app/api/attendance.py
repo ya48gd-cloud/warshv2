@@ -54,10 +54,13 @@ async def record_attendance(data: AttendanceIn, db: AsyncSession = Depends(get_d
     if data.overtime_hours is not None and data.overtime_hours < 0:
         raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تكون سالبة")
 
+    from app.core.database import current_tenant_id as _ctid_att
+    tid = _ctid_att.get() or 1
     existing = (await db.execute(
         select(Attendance).where(
             Attendance.worker_id == data.worker_id,
-            Attendance.date == the_date
+            Attendance.date == the_date,
+            Attendance.tenant_id == tid,
         )
     )).scalar_one_or_none()
 
@@ -70,9 +73,8 @@ async def record_attendance(data: AttendanceIn, db: AsyncSession = Depends(get_d
                 "status": existing.status, "overtime_hours": float(existing.overtime_hours or 0),
                 "notes": existing.notes}
 
-    from app.core.database import current_tenant_id as _ctid_att
     att = Attendance(
-        tenant_id=_ctid_att.get() or 1,
+        tenant_id=tid,
         worker_id=data.worker_id,
         date=the_date,
         status=data.status,
@@ -96,8 +98,12 @@ async def list_attendance_by_date(date: Optional[str] = None, db: AsyncSession =
         parsed_date = date_type.fromisoformat(date)
     except (ValueError, TypeError):
         raise HTTPException(400, "صيغة التاريخ غير صحيحة")
+    from app.core.database import current_tenant_id as _ctid_lad
     result = await db.execute(
-        select(Attendance).where(Attendance.date == parsed_date).order_by(Attendance.worker_id)
+        select(Attendance).where(
+            Attendance.date == parsed_date,
+            Attendance.tenant_id == (_ctid_lad.get() or 1),
+        ).order_by(Attendance.worker_id)
     )
     records = result.scalars().all()
     return [
@@ -119,28 +125,34 @@ async def bulk_attendance(data: BulkAttendanceIn, db: AsyncSession = Depends(get
     if not the_date:
         raise HTTPException(400, "يرجى تحديد التاريخ")
 
+    from app.core.database import current_tenant_id as _ctid_battat
+    tid = _ctid_battat.get() or 1
+
     results = []
     for rec in data.records:
+        overtime = Decimal(str(rec.get("overtime_hours") or 0))
+        if overtime < 0:
+            raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تكون سالبة")
         existing = (await db.execute(
             select(Attendance).where(
                 Attendance.worker_id == rec["worker_id"],
-                Attendance.date == the_date
+                Attendance.date == the_date,
+                Attendance.tenant_id == tid,
             )
         )).scalar_one_or_none()
 
         if existing:
             existing.status = rec.get("status", "present")
-            existing.overtime_hours = Decimal(str(rec.get("overtime_hours") or 0))
+            existing.overtime_hours = overtime
             if rec.get("notes") is not None:
                 existing.notes = rec.get("notes")
         else:
-            from app.core.database import current_tenant_id as _ctid_battat
             att = Attendance(
-                tenant_id=_ctid_battat.get() or 1,
+                tenant_id=tid,
                 worker_id=rec["worker_id"],
                 date=the_date,
                 status=rec.get("status", "present"),
-                overtime_hours=Decimal(str(rec.get("overtime_hours") or 0)),
+                overtime_hours=overtime,
             )
             db.add(att)
         results.append({"worker_id": rec["worker_id"], "status": rec.get("status")})
@@ -165,15 +177,18 @@ async def get_week_attendance(week_start: date_type, db: AsyncSession = Depends(
 
 
 async def _week_attendance(week_start: date_type, db: AsyncSession):
+    from app.core.database import current_tenant_id as _ctid_wk
+    tid = _ctid_wk.get() or 1
     week_end = week_start + timedelta(days=6)
     workers = (await db.execute(
-        select(Worker).where(Worker.is_active == True).order_by(Worker.name)
+        select(Worker).where(Worker.is_active == True, Worker.tenant_id == tid).order_by(Worker.name)
     )).scalars().all()
 
     att_records = (await db.execute(
         select(Attendance).where(
             Attendance.date >= week_start,
             Attendance.date <= week_end,
+            Attendance.tenant_id == tid,
         )
     )).scalars().all()
 
@@ -234,8 +249,9 @@ async def get_worker_attendance(worker_id: int, month: int, year: int,
     _, days_in_month = monthrange(year, month)
     start = date_type(year, month, 1)
     end   = date_type(year, month, days_in_month)
+    from app.core.database import current_tenant_id as _ctid_gwa
     w = await db.get(Worker, worker_id)
-    if not w: raise HTTPException(404)
+    if not w or w.tenant_id != (_ctid_gwa.get() or 1): raise HTTPException(404)
 
     records = (await db.execute(
         select(Attendance).where(
@@ -262,8 +278,9 @@ async def get_worker_attendance(worker_id: int, month: int, year: int,
 @router.delete("/{att_id}", status_code=204)
 async def delete_attendance(att_id: int, db: AsyncSession = Depends(get_db)):
     """حذف سجل حضور"""
+    from app.core.database import current_tenant_id as _ctid_del_att
     att = await db.get(Attendance, att_id)
-    if not att:
+    if not att or att.tenant_id != (_ctid_del_att.get() or 1):
         raise HTTPException(404, "سجل الحضور غير موجود")
     await db.delete(att)
     await db.commit()

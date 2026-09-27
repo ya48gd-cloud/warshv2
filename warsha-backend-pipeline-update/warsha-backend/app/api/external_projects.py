@@ -104,6 +104,7 @@ class ProjectIn(BaseModel):
 
 @router.get("")
 async def list_projects(db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_lp2
     q = (select(ExtProject)
          .options(
              selectinload(ExtProject.client),
@@ -114,6 +115,7 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
              selectinload(ExtProject.payments),
              selectinload(ExtProject.progress_reports),
          )
+         .where(ExtProject.tenant_id == (_ctid_lp2.get() or 1))
          .order_by(ExtProject.created_at.desc()))
     rows = (await db.execute(q)).scalars().all()
     return [_proj(p, include_costs=True) for p in rows]
@@ -122,6 +124,7 @@ async def list_projects(db: AsyncSession = Depends(get_db)):
 @router.get("/dashboard")
 async def dashboard(db: AsyncSession = Depends(get_db)):
     """KPIs للصفحة الرئيسية"""
+    from app.core.database import current_tenant_id as _ctid_epdash
     rows = (await db.execute(
         select(ExtProject).options(
             selectinload(ExtProject.team_members),
@@ -129,7 +132,7 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
             selectinload(ExtProject.trips),
             selectinload(ExtProject.expenses),
             selectinload(ExtProject.payments),
-        )
+        ).where(ExtProject.tenant_id == (_ctid_epdash.get() or 1))
     )).scalars().all()
 
     total_contract = sum(float(p.contract_value) for p in rows)
@@ -195,6 +198,7 @@ async def create_project(data: ProjectIn, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{pid}")
 async def get_project(pid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_gp
     p = (await db.execute(
         select(ExtProject).options(
             selectinload(ExtProject.client),
@@ -205,7 +209,7 @@ async def get_project(pid: int, db: AsyncSession = Depends(get_db)):
             selectinload(ExtProject.expenses),
             selectinload(ExtProject.progress_reports),
             selectinload(ExtProject.payments),
-        ).where(ExtProject.id == pid)
+        ).where(ExtProject.id == pid, ExtProject.tenant_id == (_ctid_gp.get() or 1))
     )).scalar_one_or_none()
     if not p:
         raise HTTPException(404, "المشروع غير موجود")
@@ -299,8 +303,9 @@ async def get_project(pid: int, db: AsyncSession = Depends(get_db)):
 
 @router.put("/{pid}")
 async def update_project(pid: int, data: ProjectIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_up
     p = await db.get(ExtProject, pid)
-    if not p:
+    if not p or p.tenant_id != (_ctid_up.get() or 1):
         raise HTTPException(404)
     if data.planned_start and data.planned_end and data.planned_end < data.planned_start:
         raise HTTPException(400, "تاريخ الانتهاء المخطط يجب أن يكون بعد تاريخ البدء")
@@ -310,14 +315,16 @@ async def update_project(pid: int, data: ProjectIn, db: AsyncSession = Depends(g
     return {"message": "تم التحديث"}
 
 
-_VALID_PROJECT_STATUSES = {"planning", "in_progress", "handover", "closed", "cancelled"}
+_VALID_PROJECT_STATUSES = {"draft", "approved", "mobilizing", "in_progress", "testing",
+                            "handover", "warranty", "closed", "cancelled"}
 
 @router.patch("/{pid}/status")
 async def update_status(pid: int, status: str, db: AsyncSession = Depends(get_db)):
     if status not in _VALID_PROJECT_STATUSES:
         raise HTTPException(400, f"حالة غير صالحة. القيم المسموحة: {sorted(_VALID_PROJECT_STATUSES)}")
+    from app.core.database import current_tenant_id as _ctid_us
     p = await db.get(ExtProject, pid)
-    if not p:
+    if not p or p.tenant_id != (_ctid_us.get() or 1):
         raise HTTPException(404)
     prev_status = p.status
     p.status = status
@@ -356,8 +363,9 @@ async def update_status(pid: int, status: str, db: AsyncSession = Depends(get_db
 
 @router.delete("/{pid}")
 async def delete_project(pid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dp
     p = await db.get(ExtProject, pid)
-    if not p:
+    if not p or p.tenant_id != (_ctid_dp.get() or 1):
         raise HTTPException(404)
     await db.delete(p)
     await db.commit()
@@ -380,8 +388,9 @@ class MemberIn(BaseModel):
 @router.post("/{pid}/team", status_code=201)
 async def add_member(pid: int, data: MemberIn, db: AsyncSession = Depends(get_db)):
     # تحقق إن الورشة موجودة
+    from app.core.database import current_tenant_id as _ctid_am
     p = await db.get(ExtProject, pid)
-    if not p:
+    if not p or p.tenant_id != (_ctid_am.get() or 1):
         raise HTTPException(404)
     if data.daily_rate is None or data.daily_rate <= 0:
         raise HTTPException(400, "الأجر اليومي يجب أن يكون أكبر من صفر")
@@ -447,68 +456,84 @@ class AttBulkIn(BaseModel):
 async def record_attendance(pid: int, data: AttBulkIn, db: AsyncSession = Depends(get_db)):
     """
     تسجيل حضور يومي للمشروع الخارجي.
-    يُحدّث جدول attendance الأصلي مع status='on_project' + ext_project_id
-    → كشف الرواتب يقرأ منه تلقائياً بالأجر اليومي للمشروع
+    يُحدّث جدول attendance الأصلي مع status='on_project'/'half_project' + ext_project_id
+    → كشف الرواتب يقرأ منه تلقائياً بالأجر اليومي للمشروع (راجع workers.generate_from_attendance)
+
+    ملاحظة إصلاح: قبل كده كانت أيام يوم "half" (نص يوم في المشروع) بتتسجل
+    بحالة "half" وبدون ext_project_id — يعني تتحسب غلط كأنها نص يوم ورشة
+    عادي بدل أجر المشروع، ومفيش أي ربط فعلي بينها وبين المشروع. وكمان
+    actual_days كانت بتتحسب "عدد الأيام السابقة + 1" رغم إن autoflush في
+    SQLAlchemy بيبعت سجل اليوم الحالي فعلاً قبل تنفيذ استعلام العدّ ده، يعني
+    كانت بتتضاعف (double count) كل مرة، وكمان بترجعش لو صححنا يوم من
+    on_project لـ absent. دلوقتي بنعيد حساب actual_days بالكامل من جدول
+    الحضور الفعلي في كل مرة — مصدر حقيقة واحد ومتّسق دايماً.
     """
+    from app.core.database import current_tenant_id as _ctid_epatt
+    tid = _ctid_epatt.get() or 1
     p = await db.get(ExtProject, pid)
-    if not p:
+    if not p or p.tenant_id != tid:
         raise HTTPException(404)
+
+    def _map_status(s: str) -> str:
+        if s in ("present", "on_project"):
+            return "on_project"
+        if s == "half":
+            return "half_project"
+        return s  # absent | leave | ...
 
     for rec in data.records:
         wid = rec["worker_id"]
-        status = rec.get("status", "present")
+        raw_status = rec.get("status", "present")
+        new_status = _map_status(raw_status)
+        is_project_day = new_status in ("on_project", "half_project")
 
         # ابحث عن سجل الحضور الحالي
         existing = (await db.execute(
             select(Attendance).where(
                 Attendance.worker_id == wid,
                 Attendance.date == data.work_date,
+                Attendance.tenant_id == tid,
             )
         )).scalar_one_or_none()
 
         if existing:
-            existing.status = "on_project" if status in ("present", "on_project") else status
-            existing.ext_project_id = pid if status in ("present", "on_project") else None
+            existing.status = new_status
+            existing.ext_project_id = pid if is_project_day else None
         else:
-            att_status = "on_project" if status in ("present", "on_project") else status
-            from app.core.database import current_tenant_id as _ctid_epatt
             att = Attendance(
-                tenant_id=_ctid_epatt.get() or 1,
+                tenant_id=tid,
                 worker_id=wid,
                 date=data.work_date,
-                status=att_status,
-                ext_project_id=pid if att_status == "on_project" else None,
+                status=new_status,
+                ext_project_id=pid if is_project_day else None,
             )
             db.add(att)
 
-        # حدّث actual_days للعضو في المشروع
-        if status in ("present", "on_project"):
-            member = (await db.execute(
-                select(ExtProjectMember).where(
-                    ExtProjectMember.project_id == pid,
-                    ExtProjectMember.worker_id == wid,
+        # أعد حساب actual_days من سجلات الحضور الفعلية (مش تراكمي) — يضمن
+        # نتيجة صحيحة سواء كانت أول مرة، تكرار لنفس اليوم، أو تصحيح لاحق
+        # (زي الرجوع من on_project لـ absent).
+        member = (await db.execute(
+            select(ExtProjectMember).where(
+                ExtProjectMember.project_id == pid,
+                ExtProjectMember.worker_id == wid,
+            )
+        )).scalar_one_or_none()
+        if member:
+            full_days = (await db.execute(
+                select(func.count(Attendance.id)).where(
+                    Attendance.ext_project_id == pid,
+                    Attendance.worker_id == wid,
+                    Attendance.status == "on_project",
                 )
-            )).scalar_one_or_none()
-            if member:
-                # احسب الأيام الفعلية من حضور المشروع
-                count = (await db.execute(
-                    select(func.count(Attendance.id)).where(
-                        Attendance.ext_project_id == pid,
-                        Attendance.worker_id == wid,
-                        Attendance.status == "on_project",
-                    )
-                )).scalar() or 0
-                member.actual_days = Decimal(str(count + 1))  # +1 لليوم الحالي
-
-        elif status == "half":
-            member = (await db.execute(
-                select(ExtProjectMember).where(
-                    ExtProjectMember.project_id == pid,
-                    ExtProjectMember.worker_id == wid,
+            )).scalar() or 0
+            half_days = (await db.execute(
+                select(func.count(Attendance.id)).where(
+                    Attendance.ext_project_id == pid,
+                    Attendance.worker_id == wid,
+                    Attendance.status == "half_project",
                 )
-            )).scalar_one_or_none()
-            if member:
-                member.actual_days = (member.actual_days or Decimal("0")) + Decimal("0.5")
+            )).scalar() or 0
+            member.actual_days = Decimal(str(full_days)) + Decimal(str(half_days)) * Decimal("0.5")
 
     await db.commit()
     return {"message": "تم تسجيل الحضور", "date": str(data.work_date)}
@@ -517,6 +542,10 @@ async def record_attendance(pid: int, data: AttBulkIn, db: AsyncSession = Depend
 @router.get("/{pid}/attendance/{work_date}")
 async def get_attendance(pid: int, work_date: date, db: AsyncSession = Depends(get_db)):
     """حضور الفريق في يوم معين"""
+    from app.core.database import current_tenant_id as _ctid_ga2
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != (_ctid_ga2.get() or 1):
+        raise HTTPException(404)
     members = (await db.execute(
         select(ExtProjectMember).options(selectinload(ExtProjectMember.worker))
         .where(ExtProjectMember.project_id == pid)
@@ -573,10 +602,22 @@ async def return_tool(pid: int, tid: int, returned_qty: Decimal,
     t = await db.get(ExtProjectTool, tid)
     if not t or t.project_id != pid:
         raise HTTPException(404)
+    if returned_qty < 0:
+        raise HTTPException(400, "الكمية المرتجعة لا يمكن أن تكون سالبة")
+    if returned_qty > t.quantity:
+        raise HTTPException(400, f"الكمية المرتجعة ({returned_qty}) أكبر من الكمية المسحوبة ({t.quantity})")
     t.returned_qty = returned_qty
     t.condition_in = condition_in
     t.returned_date = returned_date or date.today()
-    t.status = "returned" if returned_qty >= t.quantity else "damaged"
+    # الحالة تعتمد على اكتمال الكمية المرتجعة *و* حالتها — كانت قبل كده
+    # بتتجاهل condition_in تماماً، يعني أداة رجعت كاملة لكن "تالفة" كانت
+    # بتتسجل status="returned" غلط.
+    if returned_qty < t.quantity:
+        t.status = "lost"
+    elif condition_in != "good":
+        t.status = "damaged"
+    else:
+        t.status = "returned"
     if notes:
         t.notes = notes
     await db.commit()
@@ -867,6 +908,7 @@ async def delete_payment(pid: int, payid: int, db: AsyncSession = Depends(get_db
 @router.get("/{pid}/cost-summary")
 async def cost_summary(pid: int, db: AsyncSession = Depends(get_db)):
     """ملخص تكاليف مفصّل بالتصنيف — للتقارير والطباعة"""
+    from app.core.database import current_tenant_id as _ctid_cs
     p = (await db.execute(
         select(ExtProject).options(
             selectinload(ExtProject.team_members).selectinload(ExtProjectMember.worker),
@@ -874,7 +916,7 @@ async def cost_summary(pid: int, db: AsyncSession = Depends(get_db)):
             selectinload(ExtProject.trips),
             selectinload(ExtProject.expenses),
             selectinload(ExtProject.payments),
-        ).where(ExtProject.id == pid)
+        ).where(ExtProject.id == pid, ExtProject.tenant_id == (_ctid_cs.get() or 1))
     )).scalar_one_or_none()
     if not p:
         raise HTTPException(404)

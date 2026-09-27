@@ -73,12 +73,26 @@ export default function PriceCatalog() {
     }
     setAllRows(prev => prev.map(r => (r.kind === row.kind && r.ref_id === row.ref_id) ? updated : r))
     try {
-      await catalogApi.upsertSource({
-        kind: updated.kind, ref_id: updated.ref_id, name: updated.name, unit: updated.unit,
-        cost_price: Number(updated.cost_price), margin_pct: Number(updated.margin_pct),
-        selling_price: updated.price_mode === 'manual' ? Number(updated.selling_price) : null,
-        price_mode: updated.price_mode,
-      })
+      if (row.kind === 'catalog') {
+        // ده صنف كتالوج حقيقي (مش مادة/معدة) — لازم نحدّثه مباشرة بدل upsert-from-source
+        // (upsert-from-source بيفترض kind = material|equipment وبيعتبر أي حاجة تانية "equipment"،
+        // فكان بيعمل صنف كتالوج مكرر غلط بدل ما يحدّث الصنف الأصلي)
+        const full = await http.get(`${BASE}/${row.ref_id}`)
+        await catalogApi.update(row.ref_id, {
+          ...full,
+          cost_price: Number(updated.cost_price),
+          margin_pct: Number(updated.margin_pct),
+          selling_price: updated.price_mode === 'manual' ? Number(updated.selling_price) : null,
+          price_mode: updated.price_mode,
+        })
+      } else {
+        await catalogApi.upsertSource({
+          kind: updated.kind, ref_id: updated.ref_id, name: updated.name, unit: updated.unit,
+          cost_price: Number(updated.cost_price), margin_pct: Number(updated.margin_pct),
+          selling_price: updated.price_mode === 'manual' ? Number(updated.selling_price) : null,
+          price_mode: updated.price_mode,
+        })
+      }
     } catch (e) { toast(e.message || 'تعذّر حفظ التعديل — حاول تاني', 'error') }
   }
 

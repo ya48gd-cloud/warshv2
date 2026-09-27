@@ -18,7 +18,7 @@ from app.core.database import get_db
 from app.api.auth import require_any
 from app.models.models import (
     SupplyContract, SupplyContractLine, Customer, Quotation, QuotationLine,
-    StockMovement, Material, Invoice, InvoiceLine,
+    Material, Invoice, InvoiceLine,
     PaymentScheduleTemplate, InvoicePaymentSchedule,
 )
 from app.services.invoice_due import sync_invoice_due_date
@@ -64,6 +64,18 @@ class ContractIn(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+async def _tenant_contract_query(contract_id: int):
+    """عقد توريد مقيّد بالـ tenant الحالي — يمنع أي tenant من قراءة/تعديل
+    عقد تابع لـ tenant تاني عن طريق تخمين الـ id (كل استخدامات db.get
+    القديمة هنا كانت بترجع أي عقد بغض النظر عن الـ tenant)."""
+    from app.core.database import current_tenant_id as _ctid_tcq
+    tid = _ctid_tcq.get()
+    q = select(SupplyContract).where(SupplyContract.id == contract_id)
+    if tid is not None:
+        q = q.where(SupplyContract.tenant_id == tid)
+    return q
+
 
 async def _next_code(db: AsyncSession) -> str:
     count = await db.scalar(select(func.count()).select_from(SupplyContract))
@@ -153,10 +165,14 @@ async def list_contracts(
     customer_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.core.database import current_tenant_id as _ctid_lc
+    tid = _ctid_lc.get()
     q = select(SupplyContract).options(
         selectinload(SupplyContract.customer),
         selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material),
     ).order_by(SupplyContract.date.desc())
+    if tid is not None:
+        q = q.where(SupplyContract.tenant_id == tid)
     if status:
         q = q.where(SupplyContract.status == status)
     if customer_id:
@@ -173,9 +189,10 @@ async def get_next_contract_code(db: AsyncSession = Depends(get_db)):
 @router.get("/{contract_id}")
 async def get_contract(contract_id: int, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
-        select(SupplyContract)
-        .options(selectinload(SupplyContract.customer), selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material))
-        .where(SupplyContract.id == contract_id)
+        (await _tenant_contract_query(contract_id)).options(
+            selectinload(SupplyContract.customer),
+            selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material),
+        )
     )
     c = res.scalar_one_or_none()
     if not c:
@@ -203,6 +220,10 @@ async def create_contract(data: ContractIn, db: AsyncSession = Depends(get_db)):
     )
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
+
+    cust_check = await db.get(Customer, data.customer_id)
+    if not cust_check or (tid is not None and cust_check.tenant_id != tid):
+        raise HTTPException(400, "العميل غير موجود")
 
     c = SupplyContract(
         tenant_id=tid,
@@ -257,19 +278,20 @@ async def create_contract(data: ContractIn, db: AsyncSession = Depends(get_db)):
 @router.post("/from-quotation/{quotation_id}", status_code=201)
 async def contract_from_quotation(quotation_id: int, db: AsyncSession = Depends(get_db)):
     """تحويل عرض سعر إلى عقد توريد"""
-    res = await db.execute(
-        select(Quotation)
-        .options(selectinload(Quotation.lines), selectinload(Quotation.customer))
-        .where(Quotation.id == quotation_id)
-    )
+    from app.core.database import current_tenant_id
+    tid = current_tenant_id.get()
+    q_query = select(Quotation).options(
+        selectinload(Quotation.lines), selectinload(Quotation.customer)
+    ).where(Quotation.id == quotation_id)
+    if tid is not None:
+        q_query = q_query.where(Quotation.tenant_id == tid)
+    res = await db.execute(q_query)
     q = res.scalar_one_or_none()
     if not q:
         raise HTTPException(404, "عرض السعر غير موجود")
     if q.status not in ("sent", "accepted", "draft"):
         raise HTTPException(400, f"لا يمكن تحويل عرض بحالة '{q.status}' إلى عقد")
 
-    from app.core.database import current_tenant_id
-    tid = current_tenant_id.get()
     code = await _next_code(db)
 
     c = SupplyContract(
@@ -316,7 +338,7 @@ async def contract_from_quotation(quotation_id: int, db: AsyncSession = Depends(
 
 @router.patch("/{contract_id}/activate")
 async def activate_contract(contract_id: int, db: AsyncSession = Depends(get_db)):
-    c = await db.get(SupplyContract, contract_id)
+    c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
     if not c:
         raise HTTPException(404)
     if c.status != "draft":
@@ -328,9 +350,16 @@ async def activate_contract(contract_id: int, db: AsyncSession = Depends(get_db)
 
 @router.patch("/{contract_id}/cancel")
 async def cancel_contract(contract_id: int, db: AsyncSession = Depends(get_db)):
-    c = await db.get(SupplyContract, contract_id)
+    c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
     if not c:
         raise HTTPException(404)
+    # كان الإلغاء مسموحاً بلا أي شرط — حتى بعد تأكيد التسليم فعلياً، رغم إن
+    # التسليم بيكون خلّف بالفعل فاتورة مبيعات حقيقية + رصيد عميل مرفوع +
+    # حركة مخزون صادرة. إلغاء العقد في الحالة دي كان بيسيب حالة متضاربة
+    # (عقد "ملغي" له أثر مالي/مخزني فعلي وقائم). امنع الإلغاء بعد التسليم،
+    # بنفس منطق delete_contract اللي بيمنع حذف عقد "active" أصلاً.
+    if c.delivery_confirmed:
+        raise HTTPException(400, "لا يمكن إلغاء عقد تم تأكيد تسليمه بالفعل — تم إنشاء فاتورة وحركة مخزون مرتبطتين به")
     c.status = "cancelled"
     await db.commit()
     return {"id": contract_id, "status": "cancelled"}
@@ -422,7 +451,12 @@ async def _next_inv_code(db: AsyncSession) -> str:
 @router.post("/{contract_id}/deliver")
 async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession = Depends(get_db)):
     """تسجيل إقرار التسليم والاستلام + تحديث المخزون تلقائياً"""
-    c = await db.get(SupplyContract, contract_id, options=[selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material)])
+    res = await db.execute(
+        (await _tenant_contract_query(contract_id)).options(
+            selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material)
+        )
+    )
+    c = res.scalar_one_or_none()
     if not c:
         raise HTTPException(404)
     if c.status != "active":
@@ -442,8 +476,21 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
     c.driver_phone       = body.driver_phone
 
     # ── تحديث المخزون تلقائياً لبنود مرتبطة بمواد ──────────────────
+    # كانت الدالة دي بتبني StockMovement مباشرة وتضيفه بـ db.add() من غير
+    # ما تمر على inventory_ledger.post_issue() — يعني Material.stock_qty
+    # (والـ StockQuant المطابق) ميتحدّثش خالص عند تسليم عقد توريد لعميل:
+    # المخزون فعلياً كان بيفضل زي ما هو حتى بعد "تسليم" الكمية، وكمان مفيش
+    # أي فحص للمتاح (ممكن يتسلّم أكتر من الرصيد الموجود من غير أي تحذير).
+    # نفس ما بيحصل في purchases.py/purchase_orders.py، لازم نمر من نفس
+    # المصدر الموحّد لحركات الصادر.
+    from app.services.inventory_ledger import post_issue
     movements_created = 0
     ref = f"SC-{c.code}"
+    # مراجعة تكامل (integration review): post_issue بيسجّل حركة المخزون فقط —
+    # لازم نراكم تكلفة البضاعة المصروفة هنا عشان نقيّد COGS فعلي (زي بالظبط
+    # delivery_orders.py._release_fg_stock_for_line) بدل ما تتسجل إيرادات
+    # الفاتورة (تحت) من غير أي تكلفة مقابلة أبداً في دفتر الأستاذ.
+    cogs_amount = Decimal("0")
     for line in c.lines:
         if not line.material_id:
             continue
@@ -451,22 +498,18 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
         if not mat:
             continue
         unit_cost = mat.unit_cost or Decimal("0")
-        mov = StockMovement(
-            tenant_id     = c.tenant_id,
-            material_id   = line.material_id,
-            movement_type = "out",
-            qty           = line.qty,
-            unit_cost     = unit_cost,
-            total_cost    = unit_cost * line.qty,
-            reference     = ref,
-            notes         = f"تسليم أمر توريد {c.code} — {line.description}",
-            movement_date = delivery_date,
-            destination   = "customer",
-            destination_ref = str(c.customer_id),
-            customer_id   = c.customer_id,
+        await post_issue(
+            db, material=mat, qty=line.qty, unit_cost=unit_cost,
+            movement_date=delivery_date,
+            source_doc_type="supply_contract", source_doc_id=c.id,
+            reference=ref,
+            notes=f"تسليم أمر توريد {c.code} — {line.description}",
+            destination="customer",
+            destination_ref=str(c.customer_id),
+            customer_id=c.customer_id,
         )
-        db.add(mov)
         movements_created += 1
+        cogs_amount += Decimal(str(line.qty)) * unit_cost
 
     # ── إنشاء فاتورة مبيعات تلقائياً عند تأكيد التسليم ────────────
     inv_code = await _next_inv_code(db)
@@ -510,7 +553,7 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
 
     # قيد محاسبي تلقائي
     from app.core.database import current_tenant_id as _ctid
-    from app.services.auto_journal import journal_sales_invoice_create
+    from app.services.auto_journal import journal_sales_invoice_create, journal_cogs
     from decimal import Decimal as _D
     _tid = _ctid.get() or c.tenant_id
     await journal_sales_invoice_create(
@@ -519,6 +562,10 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
         c.total,
         delivery_date,
     )
+    # قيد COGS الفعلي (مدين 5100 / دائن 1310) بنفس تكلفة المواد المصروفة
+    # فعليًا أعلاه — من غير ده، الإيراد بيتسجل من غير أي تكلفة مقابلة،
+    # فتفضل الأرباح المُبلَّغ عنها لكل عقود التوريد مبالغ فيها بشكل دائم.
+    await journal_cogs(db, _tid, c.id, c.code, cogs_amount, delivery_date)
 
     # ── خطة أقساط العقد ── لو العقد عنده قالب، طبّقه على الفاتورة الجديدة
     schedule_applied = await _materialize_contract_schedule(db, c, inv, _tid)
@@ -541,7 +588,7 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
 
 @router.delete("/{contract_id}", status_code=204)
 async def delete_contract(contract_id: int, db: AsyncSession = Depends(get_db)):
-    c = await db.get(SupplyContract, contract_id)
+    c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
     if not c:
         raise HTTPException(404)
     if c.status == "active":
@@ -1016,9 +1063,10 @@ table.totals-tbl{{width:260px;border-collapse:collapse;}}
 async def print_contract(contract_id: int, db: AsyncSession = Depends(get_db)):
     """طباعة أمر التوريد مع جدول السداد لو موجود"""
     res = await db.execute(
-        select(SupplyContract)
-        .options(selectinload(SupplyContract.customer), selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material))
-        .where(SupplyContract.id == contract_id)
+        (await _tenant_contract_query(contract_id)).options(
+            selectinload(SupplyContract.customer),
+            selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material),
+        )
     )
     c = res.scalar_one_or_none()
     if not c:
@@ -1236,7 +1284,7 @@ async def save_contract_schedule_template(
     replace=true → احذف القديم أولاً.
     الشرط: مجموع النسب = 100%.
     """
-    c = await db.get(SupplyContract, contract_id)
+    c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
     if not c:
         raise HTTPException(404, "العقد غير موجود")
 
@@ -1295,7 +1343,7 @@ async def get_contract_schedule_template(
     contract_id: int, db: AsyncSession = Depends(get_db)
 ):
     """اجلب قالب خطة الأقساط الحالي للعقد."""
-    c = await db.get(SupplyContract, contract_id)
+    c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
     if not c:
         raise HTTPException(404, "العقد غير موجود")
     rows = (await db.execute(
@@ -1318,6 +1366,12 @@ async def delete_contract_schedule_template(
     contract_id: int, db: AsyncSession = Depends(get_db)
 ):
     """احذف قالب خطة الأقساط من العقد (لو مش محتاجه)."""
+    # كانت بتحذف مباشرة من غير التحقق إن العقد أصلاً موجود/تابع لنفس الـ
+    # tenant — أي tenant كان يقدر يحذف قالب أقساط عقد تابع لـ tenant تاني
+    # بمجرد تخمين contract_id (تعديل بيانات بين مستأجرين مختلفين).
+    c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
+    if not c:
+        raise HTTPException(404, "العقد غير موجود")
     await db.execute(
         sa_delete(PaymentScheduleTemplate).where(
             PaymentScheduleTemplate.source_type == "supply_contract",
@@ -1331,9 +1385,10 @@ async def delete_contract_schedule_template(
 async def print_delivery_slip(contract_id: int, db: AsyncSession = Depends(get_db)):
     """طباعة وصل التسليم بدون أسعار"""
     res = await db.execute(
-        select(SupplyContract)
-        .options(selectinload(SupplyContract.customer), selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material))
-        .where(SupplyContract.id == contract_id)
+        (await _tenant_contract_query(contract_id)).options(
+            selectinload(SupplyContract.customer),
+            selectinload(SupplyContract.lines).selectinload(SupplyContractLine.material),
+        )
     )
     c = res.scalar_one_or_none()
     if not c:

@@ -89,6 +89,27 @@ async def test_update_project_status(cli):
 
 
 @pytest.mark.asyncio
+async def test_project_status_accepts_full_lifecycle(cli):
+    """Regression: _VALID_PROJECT_STATUSES used to be {"planning", "in_progress",
+    "handover", "closed", "cancelled"} — not matching the ExtProject model's real
+    status set (draft|approved|mobilizing|in_progress|testing|handover|warranty|
+    closed|cancelled). "draft" is the model's own default, meaning a brand new
+    project's own starting status was rejected as invalid, and the intermediate
+    approved/mobilizing/testing/warranty stages could never be set at all."""
+    cid = await _make_client(cli)
+    pid = await _create_project(cli, cid)
+    for status in ("approved", "mobilizing", "in_progress", "testing", "warranty"):
+        r = await cli.patch(f"{BASE}/{pid}/status", params={"status": status})
+        assert r.status_code == 200, f"{status}: {r.text}"
+        assert r.json()["status"] == status
+    # "draft" (the model default) and "planning" (the old, never-real value)
+    r_draft = await cli.patch(f"{BASE}/{pid}/status", params={"status": "draft"})
+    assert r_draft.status_code == 200
+    r_planning = await cli.patch(f"{BASE}/{pid}/status", params={"status": "planning"})
+    assert r_planning.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_delete_project(cli):
     cid = await _make_client(cli)
     pid = await _create_project(cli, cid)
@@ -137,6 +158,57 @@ async def test_project_attendance(cli):
         "records": [{"worker_id": wid, "status": "present"}],
     })
     assert r.status_code in (200, 201)
+
+
+@pytest.mark.asyncio
+async def test_project_attendance_actual_days_no_double_count(cli):
+    """Regression: actual_days used to be computed as
+    "count(on_project rows so far) + 1", but SQLAlchemy autoflush already
+    persists the just-added row before that count query runs, so every call
+    double-counted the current day. Half-day attendance was also never linked
+    to the project (ext_project_id stayed NULL, status stayed "half" instead
+    of "half_project"), so it silently fell back to workshop pay in payroll.
+    This test locks in the recomputed-from-source behaviour."""
+    from datetime import timedelta
+    cid = await _make_client(cli)
+    pid = await _create_project(cli, cid)
+    wid = await _make_worker(cli)
+    await cli.post(f"{BASE}/{pid}/team", json={"worker_id": wid, "role": "technician", "daily_rate": 120.0})
+
+    day1 = date.today()
+    day2 = day1 + timedelta(days=1)
+    day3 = day1 + timedelta(days=2)
+
+    await cli.post(f"{BASE}/{pid}/attendance", json={
+        "work_date": str(day1), "records": [{"worker_id": wid, "status": "present"}],
+    })
+    await cli.post(f"{BASE}/{pid}/attendance", json={
+        "work_date": str(day2), "records": [{"worker_id": wid, "status": "present"}],
+    })
+    await cli.post(f"{BASE}/{pid}/attendance", json={
+        "work_date": str(day3), "records": [{"worker_id": wid, "status": "half"}],
+    })
+
+    r = await cli.get(f"{BASE}/{pid}")
+    team = r.json()["team"]
+    member = next(t for t in team if t["worker_id"] == wid)
+    # 2 full days + 1 half day = 2.5 — not 4.5 (which the old double-count bug produced)
+    assert member["actual_days"] == 2.5
+
+    # the half-day record must actually be linked to the project so payroll
+    # can price it at the project's daily_rate instead of silently dropping it
+    att = await cli.get(f"{BASE}/{pid}/attendance/{day3}")
+    day3_status = next(a["status"] for a in att.json() if a["worker_id"] == wid)
+    assert day3_status == "half_project"
+
+    # correcting a day back to absent must reduce actual_days again (not just
+    # accumulate forever)
+    await cli.post(f"{BASE}/{pid}/attendance", json={
+        "work_date": str(day1), "records": [{"worker_id": wid, "status": "absent"}],
+    })
+    r2 = await cli.get(f"{BASE}/{pid}")
+    member2 = next(t for t in r2.json()["team"] if t["worker_id"] == wid)
+    assert member2["actual_days"] == 1.5
 
 
 # ════════════════ TOOLS ═══════════════════════════════════════════════

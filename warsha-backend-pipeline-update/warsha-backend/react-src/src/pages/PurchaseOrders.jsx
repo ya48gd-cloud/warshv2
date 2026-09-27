@@ -24,7 +24,7 @@ export default function PurchaseOrders() {
   const [receiveQtys, setReceiveQtys] = useState({})
   const [confirmCancel, setConfirmCancel] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(null)
-  const [form, setForm] = useState({ supplier_id:'', order_date: new Date().toISOString().slice(0,10), tax_pct:'0', notes:'', lines:[] })
+  const [form, setForm] = useState({ supplier_id:'', order_date: new Date().toISOString().slice(0,10), expected_date:'', tax_pct:'0', discount_amt:'0', notes:'', lines:[] })
   const [newLine, setNewLine] = useState({ material_id:'', description:'', ordered_qty:'', unit:'كجم', unit_cost:'' })
   const [acting, setActing] = useState(false)
   const act = async (fn) => {
@@ -40,12 +40,18 @@ export default function PurchaseOrders() {
     const d = await api.purchaseOrders.get(id)
     setDetailData(d)
     const init = {}
-    d.lines?.forEach(l => { init[l.id] = String(l.ordered_qty - l.received_qty) })
+    // نستخدم remaining_qty الجاهزة من الباك-إند (محسوبة بـ Decimal) بدل طرح
+    // ordered_qty - received_qty هنا كـ float — كان ممكن ينتج أخطاء تقريب
+    // زي 0.30000000000000004 تظهر في حقل الكمية المستلمة الافتراضي.
+    d.lines?.forEach(l => { init[l.id] = String(l.remaining_qty) })
     setReceiveQtys(init)
   }
 
   const addLine = () => {
-    if (!newLine.description || !newLine.ordered_qty || !newLine.unit_cost) return
+    if (!newLine.description || !newLine.ordered_qty || !newLine.unit_cost) {
+      toast('أدخل الوصف والكمية والسعر قبل إضافة البند', 'error')
+      return
+    }
     setForm(f => ({ ...f, lines: [...f.lines, { ...newLine, material_id: newLine.material_id || null }] }))
     setNewLine({ material_id:'', description:'', ordered_qty:'', unit:'كجم', unit_cost:'' })
   }
@@ -100,7 +106,7 @@ export default function PurchaseOrders() {
       }
       setShowCreate(false)
       setEditingId(null)
-      setForm({ supplier_id:'', order_date: new Date().toISOString().slice(0,10), tax_pct:'0', notes:'', lines:[] })
+      setForm({ supplier_id:'', order_date: new Date().toISOString().slice(0,10), expected_date:'', tax_pct:'0', discount_amt:'0', notes:'', lines:[] })
       reload()
     })
   }
@@ -275,7 +281,9 @@ export default function PurchaseOrders() {
               {suppliers?.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </Select>
             <Input label="تاريخ الأمر" type="date" value={form.order_date} onChange={e => setForm(f => ({ ...f, order_date: e.target.value }))} />
+            <Input label="تاريخ التوريد المتوقع" type="date" value={form.expected_date || ''} onChange={e => setForm(f => ({ ...f, expected_date: e.target.value }))} />
             <Input label="نسبة الضريبة %" value={form.tax_pct} onChange={e => setForm(f => ({ ...f, tax_pct: e.target.value }))} />
+            <Input label="خصم (ج)" type="number" value={form.discount_amt || '0'} onChange={e => setForm(f => ({ ...f, discount_amt: e.target.value }))} />
             <Textarea label="ملاحظات" value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} span={2} />
           </FormGrid>
           <div style={{ marginTop:16, padding:12, background:'var(--bg)', borderRadius:8, border:'1px solid var(--border)' }}>

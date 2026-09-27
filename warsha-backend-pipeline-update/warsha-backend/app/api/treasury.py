@@ -356,8 +356,22 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
     if getattr(x, "cheque_status", None) in ("cleared", "bounced"):
         raise HTTPException(400, "لا يمكن تعديل شيك مُقاص أو مرتجع")
 
+    from app.core.database import current_tenant_id as _ctid_utx
+    tid = _ctid_utx.get() or 1
+
+    # الأثر القديم (على الرصيد والقيد المحاسبي) لسه فعّال إلا لو كان شيكاً مرتجعاً/ملغياً
+    # (في الحالة دي يكون الأثر اتعكس بالفعل من update_cheque_status)
+    old_balance_active = x.cheque_status not in ("bounced", "cancelled")
+
+    # عكس القيد المحاسبي القديم المرتبط بالحركة — وإلا يفضل قيد بالبيانات القديمة
+    # في دليل الحسابات (COA) بعد ما نعدّل بيانات الحركة، وميزان المراجعة يبقى غير متوافق
+    # مع رصيد الخزنة الفعلي
+    if old_balance_active:
+        from app.services.auto_journal import journal_reverse_entry
+        await journal_reverse_entry(db, tid, "treasury_manual", x.id, "تعديل الحركة")
+
     # عكس الأثر القديم على رصيد الخزنة
-    if x.cheque_status not in ("bounced", "cancelled"):
+    if old_balance_active:
         await _apply_to_balance(db, x.treasury_id, x.direction, x.amount, revert=True)
 
     amt = Decimal(str(data.amount))
@@ -384,6 +398,22 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
     x.reference = data.reference
 
     await _apply_to_balance(db, data.treasury_id, data.direction, data.amount)
+
+    # إعادة ترحيل قيد محاسبي جديد يعكس البيانات المحدَّثة (نفس شرط الترحيل في create_transaction)
+    if old_balance_active:
+        treasury = await db.get(Treasury, data.treasury_id)
+        category = await db.get(TreasuryCategory, data.category_id) if data.category_id else None
+        category_account_id = (category.coa_account_id if category else None) or \
+            await _fallback_category_account_id(db, tid)
+        if treasury and treasury.coa_account_id and category_account_id:
+            from app.services.auto_journal import journal_treasury_manual
+            await journal_treasury_manual(
+                db, tid, x.id,
+                data.description or f"حركة خزينة: {data.direction}",
+                amt, data.direction,
+                treasury.coa_account_id, category_account_id, x.txn_date,
+            )
+
     await db.commit()
     await db.refresh(x)
 
@@ -397,9 +427,30 @@ async def delete_transaction(txn_id: int, db: AsyncSession = Depends(get_db)):
     x = await db.get(TreasuryTransaction, txn_id)
     if not x:
         raise HTTPException(404, "الحركة غير موجودة")
+    from app.core.database import current_tenant_id as _ctid_dtx
+    tid = _ctid_dtx.get() or 1
+    balance_active = x.cheque_status not in ("bounced", "cancelled")
     # نعكس أثرها على الرصيد — إلا لو كان شيكاً مرتجعاً/ملغياً (أثره معكوس أصلاً)
-    if x.cheque_status not in ("bounced", "cancelled"):
+    if balance_active:
         await _apply_to_balance(db, x.treasury_id, x.direction, x.amount, revert=True)
+
+    # عكس القيد المحاسبي المرتبط بالحركة (لو كان مرحّلاً فعلياً) — وإلا يفضل قيد يتيم
+    # في دليل الحسابات بعد حذف الحركة، فيختل تطابق ميزان المراجعة مع رصيد الخزينة الفعلي
+    if balance_active:
+        from app.services.auto_journal import journal_reverse_entry
+        if x.source == "manual":
+            await journal_reverse_entry(db, tid, "treasury_manual", x.id, "حذف الحركة")
+        elif x.source == "transfer" and x.transfer_group:
+            # القيد اتسجل مربوطاً بمعرّف حركة "الخروج" (out leg) من التحويل تحديداً
+            out_leg_id = await db.scalar(
+                select(TreasuryTransaction.id).where(
+                    TreasuryTransaction.transfer_group == x.transfer_group,
+                    TreasuryTransaction.direction == "out",
+                )
+            )
+            if out_leg_id:
+                await journal_reverse_entry(db, tid, "treasury_transfer", out_leg_id, "حذف حركة التحويل")
+
     await db.delete(x)
     await db.commit()
 

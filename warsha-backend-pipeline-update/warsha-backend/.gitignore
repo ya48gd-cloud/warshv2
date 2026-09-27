@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+react-src/dist/
+jwt_secret.key
+*.db
+.env

@@ -1173,7 +1173,7 @@ export default function Quotations() {
       setConvertTarget(null)
       reload()
     } catch (e) {
-      toast('حدث خطأ أثناء التحويل', 'error')
+      toast(e?.message || 'حدث خطأ أثناء التحويل', 'error')
     } finally {
       setConverting(false)
     }

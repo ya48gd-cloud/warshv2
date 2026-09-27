@@ -273,6 +273,52 @@ async def test_deliver_without_schedule_no_installments(cli):
 
 
 @pytest.mark.asyncio
+async def test_deliver_decrements_material_stock(cli):
+    """
+    تأكيد التسليم يجب أن يُنقص Material.stock_qty فعلياً (عبر inventory_ledger
+    .post_issue) — قبل الإصلاح كان بيُنشئ StockMovement خام من غير ما يمر
+    على post_issue، فـ stock_qty كان يفضل زي ما هو رغم "تسليم" الكمية.
+    """
+    cid = await _make_customer(cli)
+    mid = await _make_material(cli, qty=200)
+    stock_before = (await cli.get(f"{BASE_INV}/materials/{mid}")).json()["stock_qty"]
+
+    c = await _create_contract(cli, cid, mid)
+    cid_contract = c["id"]
+    await cli.patch(f"{BASE_SC}/{cid_contract}/activate")
+
+    deliv = await cli.post(f"{BASE_SC}/{cid_contract}/deliver", json={
+        "delivery_date": str(date.today()),
+    })
+    assert deliv.status_code == 200, deliv.text
+
+    stock_after = (await cli.get(f"{BASE_INV}/materials/{mid}")).json()["stock_qty"]
+    # العقد فيه بند بكمية 10 (وحدة "طن" لكن الكمية المخزومة بتتعامل بالرقم
+    # الخام في المادة نفسها — راجع _create_contract)
+    assert float(stock_after) == float(stock_before) - 10.0, (
+        f"المخزون قبل: {stock_before}، بعد: {stock_after} — لم يُنقص بالكمية المسلَّمة"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_blocked_after_delivery_confirmed(cli):
+    """لا يجوز إلغاء عقد توريد بعد تأكيد تسليمه (فاتورة ورصيد عميل وحركة مخزون تأثّروا فعلياً)."""
+    cid = await _make_customer(cli)
+    mid = await _make_material(cli, qty=200)
+    c = await _create_contract(cli, cid, mid)
+    cid_contract = c["id"]
+
+    await cli.patch(f"{BASE_SC}/{cid_contract}/activate")
+    deliv = await cli.post(f"{BASE_SC}/{cid_contract}/deliver", json={
+        "delivery_date": str(date.today()),
+    })
+    assert deliv.status_code == 200, deliv.text
+
+    r_cancel = await cli.patch(f"{BASE_SC}/{cid_contract}/cancel")
+    assert r_cancel.status_code == 400, r_cancel.text
+
+
+@pytest.mark.asyncio
 async def test_deliver_rounding_correction(cli):
     """
     قالب 3×33.33% على إجمالي 1000 ج → مجموع الأقساط = 1000 بالظبط (آخر قسط يمتص الفرق).

@@ -206,10 +206,11 @@ async def list_assets(
     in_warranty: Optional[bool] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.core.database import current_tenant_id as _ctid_la
     q = select(CustomerAsset).options(
         selectinload(CustomerAsset.customer),
         selectinload(CustomerAsset.current_location),
-    )
+    ).where(CustomerAsset.tenant_id == (_ctid_la.get() or 1))
     if customer_id:
         q = q.where(CustomerAsset.customer_id == customer_id)
     if in_warranty is True:
@@ -232,12 +233,13 @@ async def create_asset(data: AssetIn, db: AsyncSession = Depends(get_db)):
 
 @router.get("/assets/{aid}")
 async def get_asset(aid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ga
     res = await db.execute(
         select(CustomerAsset)
         .options(selectinload(CustomerAsset.customer),
                  selectinload(CustomerAsset.current_location),
                  selectinload(CustomerAsset.service_orders))
-        .where(CustomerAsset.id == aid)
+        .where(CustomerAsset.id == aid, CustomerAsset.tenant_id == (_ctid_ga.get() or 1))
     )
     a = res.scalar_one_or_none()
     if not a: raise HTTPException(404)
@@ -297,8 +299,9 @@ async def get_asset(aid: int, db: AsyncSession = Depends(get_db)):
 async def add_asset_movement(aid: int, data: AssetMovementIn, db: AsyncSession = Depends(get_db)):
     if data.event_type not in _VALID_MOVEMENT_TYPES:
         raise HTTPException(400, f"نوع حركة غير صالح. القيم المسموحة: {sorted(_VALID_MOVEMENT_TYPES)}")
+    from app.core.database import current_tenant_id as _ctid_aam
     a = await db.get(CustomerAsset, aid)
-    if not a: raise HTTPException(404)
+    if not a or a.tenant_id != (_ctid_aam.get() or 1): raise HTTPException(404)
     from_location_id = a.current_location_id
     m = AssetMovement(
         tenant_id=a.tenant_id, asset_id=a.id, event_type=data.event_type,
@@ -317,8 +320,9 @@ async def add_asset_movement(aid: int, data: AssetMovementIn, db: AsyncSession =
 
 @router.put("/assets/{aid}")
 async def update_asset(aid: int, data: AssetIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ua
     a = await db.get(CustomerAsset, aid)
-    if not a: raise HTTPException(404)
+    if not a or a.tenant_id != (_ctid_ua.get() or 1): raise HTTPException(404)
     for k, v in data.model_dump().items():
         setattr(a, k, v)
     await db.commit()
@@ -327,8 +331,9 @@ async def update_asset(aid: int, data: AssetIn, db: AsyncSession = Depends(get_d
 
 @router.delete("/assets/{aid}")
 async def delete_asset(aid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dela
     a = await db.get(CustomerAsset, aid)
-    if not a: raise HTTPException(404)
+    if not a or a.tenant_id != (_ctid_dela.get() or 1): raise HTTPException(404)
     await db.delete(a)
     await db.commit()
     return {"message": "تم الحذف", "id": aid}
@@ -346,13 +351,14 @@ async def list_service_orders(
     worker_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.core.database import current_tenant_id as _ctid_lso
     q = select(FieldServiceOrder).options(
         selectinload(FieldServiceOrder.customer),
         selectinload(FieldServiceOrder.location),
         selectinload(FieldServiceOrder.asset),
         selectinload(FieldServiceOrder.assignments).selectinload(ServiceAssignment.worker),
         selectinload(FieldServiceOrder.visits),
-    )
+    ).where(FieldServiceOrder.tenant_id == (_ctid_lso.get() or 1))
     if status:
         q = q.where(FieldServiceOrder.status == status)
     if customer_id:
@@ -382,6 +388,7 @@ async def create_service_order(data: ServiceOrderIn, db: AsyncSession = Depends(
 
 @router.get("/orders/{oid}")
 async def get_service_order(oid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_gso
     res = await db.execute(
         select(FieldServiceOrder).options(
             selectinload(FieldServiceOrder.customer),
@@ -389,7 +396,7 @@ async def get_service_order(oid: int, db: AsyncSession = Depends(get_db)):
             selectinload(FieldServiceOrder.asset),
             selectinload(FieldServiceOrder.assignments).selectinload(ServiceAssignment.worker),
             selectinload(FieldServiceOrder.visits),
-        ).where(FieldServiceOrder.id == oid)
+        ).where(FieldServiceOrder.id == oid, FieldServiceOrder.tenant_id == (_ctid_gso.get() or 1))
     )
     o = res.scalar_one_or_none()
     if not o: raise HTTPException(404)
@@ -398,8 +405,9 @@ async def get_service_order(oid: int, db: AsyncSession = Depends(get_db)):
 
 @router.put("/orders/{oid}")
 async def update_service_order(oid: int, data: ServiceOrderIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_uso
     o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
+    if not o or o.tenant_id != (_ctid_uso.get() or 1): raise HTTPException(404)
     for k, v in data.model_dump(exclude={"estimated_hours"}).items():
         if hasattr(o, k):
             setattr(o, k, v)
@@ -413,8 +421,9 @@ async def update_service_order(oid: int, data: ServiceOrderIn, db: AsyncSession 
 async def update_order_status(oid: int, data: StatusUpdate, db: AsyncSession = Depends(get_db)):
     if data.status not in _VALID_FS_STATUSES:
         raise HTTPException(400, f"حالة غير صالحة. القيم المسموحة: {sorted(_VALID_FS_STATUSES)}")
+    from app.core.database import current_tenant_id as _ctid_uos
     o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
+    if not o or o.tenant_id != (_ctid_uos.get() or 1): raise HTTPException(404)
     prev_status = o.status
     o.status = data.status
     if data.completion_date:
@@ -439,8 +448,9 @@ async def update_order_status(oid: int, data: StatusUpdate, db: AsyncSession = D
 
 @router.delete("/orders/{oid}")
 async def delete_service_order(oid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dso
     o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
+    if not o or o.tenant_id != (_ctid_dso.get() or 1): raise HTTPException(404)
     if o.status not in ("pending", "cancelled"):
         raise HTTPException(400, "لا يمكن حذف أمر جاري — قم بإلغائه أولاً")
     await db.delete(o)
@@ -452,12 +462,14 @@ async def delete_service_order(oid: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/orders/{oid}/assign")
 async def assign_workers(oid: int, data: AssignIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_asgn
+    tid_asgn = _ctid_asgn.get() or 1
     o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
+    if not o or o.tenant_id != tid_asgn: raise HTTPException(404)
 
     for wid in data.worker_ids:
         w = await db.get(Worker, wid)
-        if not w:
+        if not w or w.tenant_id != tid_asgn:
             continue
         existing = (await db.execute(
             select(ServiceAssignment).where(
@@ -466,9 +478,8 @@ async def assign_workers(oid: int, data: AssignIn, db: AsyncSession = Depends(ge
             )
         )).scalar_one_or_none()
         if not existing:
-            from app.core.database import current_tenant_id as _ctid_sa
             db.add(ServiceAssignment(
-                tenant_id=_ctid_sa.get() or 1,
+                tenant_id=tid_asgn,
                 service_order_id=oid,
                 worker_id=wid,
                 role=data.role,
@@ -494,12 +505,13 @@ async def remove_assignment(oid: int, assignment_id: int, db: AsyncSession = Dep
 
 @router.post("/orders/{oid}/visit", status_code=201)
 async def record_visit(oid: int, data: VisitIn, db: AsyncSession = Depends(get_db)):
-    o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
-
     from app.core.database import current_tenant_id as _ctid_sv
+    tid_sv = _ctid_sv.get() or 1
+    o = await db.get(FieldServiceOrder, oid)
+    if not o or o.tenant_id != tid_sv: raise HTTPException(404)
+
     visit = ServiceVisit(
-        tenant_id=_ctid_sv.get() or 1,
+        tenant_id=tid_sv,
         service_order_id=oid,
         visit_date=data.visit_date,
         arrival_time=data.arrival_time,
@@ -550,19 +562,23 @@ async def list_visits(oid: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/dashboard")
 async def field_service_dashboard(db: AsyncSession = Depends(get_db)):
-    total       = await db.scalar(select(func.count()).select_from(FieldServiceOrder))
-    pending     = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.status == "pending"))
-    in_progress = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.status == "in_progress"))
-    completed   = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.status == "completed"))
-    total_assets    = await db.scalar(select(func.count()).select_from(CustomerAsset))
+    from app.core.database import current_tenant_id as _ctid_dash
+    tid = _ctid_dash.get() or 1
+    total       = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.tenant_id == tid))
+    pending     = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.status == "pending", FieldServiceOrder.tenant_id == tid))
+    in_progress = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.status == "in_progress", FieldServiceOrder.tenant_id == tid))
+    completed   = await db.scalar(select(func.count()).select_from(FieldServiceOrder).where(FieldServiceOrder.status == "completed", FieldServiceOrder.tenant_id == tid))
+    total_assets    = await db.scalar(select(func.count()).select_from(CustomerAsset).where(CustomerAsset.tenant_id == tid))
     warranty_expiring = await db.scalar(
         select(func.count()).select_from(CustomerAsset).where(
             CustomerAsset.warranty_end >= date.today(),
+            CustomerAsset.tenant_id == tid,
         )
     )
 
     by_type_res = await db.execute(
         select(FieldServiceOrder.order_type, func.count())
+        .where(FieldServiceOrder.tenant_id == tid)
         .group_by(FieldServiceOrder.order_type)
     )
     by_type = [{"type": t, "type_ar": ORDER_TYPE_AR.get(t, t), "count": c} for t, c in by_type_res]
@@ -575,6 +591,7 @@ async def field_service_dashboard(db: AsyncSession = Depends(get_db)):
         ).where(
             FieldServiceOrder.planned_date >= date.today(),
             FieldServiceOrder.status.in_(["pending", "assigned"]),
+            FieldServiceOrder.tenant_id == tid,
         ).order_by(FieldServiceOrder.planned_date).limit(10)
     )
     upcoming = [{
@@ -606,6 +623,7 @@ async def service_calendar(
 ):
     """تقويم الزيارات الميدانية"""
     from sqlalchemy import extract
+    from app.core.database import current_tenant_id as _ctid_cal
     today = date.today()
     m = month or today.month
     y = year or today.year
@@ -618,6 +636,7 @@ async def service_calendar(
         ).where(
             extract("month", FieldServiceOrder.planned_date) == m,
             extract("year",  FieldServiceOrder.planned_date) == y,
+            FieldServiceOrder.tenant_id == (_ctid_cal.get() or 1),
         ).order_by(FieldServiceOrder.planned_date)
     )
     orders = res.scalars().all()
@@ -635,8 +654,10 @@ async def service_calendar(
 @router.get("/workers/{worker_id}/schedule")
 async def worker_schedule(worker_id: int, db: AsyncSession = Depends(get_db)):
     """جدول عمل فني معين"""
+    from app.core.database import current_tenant_id as _ctid_ws
+    tid = _ctid_ws.get() or 1
     w = await db.get(Worker, worker_id)
-    if not w: raise HTTPException(404)
+    if not w or w.tenant_id != tid: raise HTTPException(404)
 
     res = await db.execute(
         select(FieldServiceOrder).options(
@@ -646,6 +667,7 @@ async def worker_schedule(worker_id: int, db: AsyncSession = Depends(get_db)):
         ).join(ServiceAssignment).where(
             ServiceAssignment.worker_id == worker_id,
             FieldServiceOrder.status.in_(["assigned", "in_progress", "pending"]),
+            FieldServiceOrder.tenant_id == tid,
         ).order_by(FieldServiceOrder.planned_date)
     )
     orders = res.scalars().all()
@@ -723,17 +745,18 @@ async def list_labor(oid: int, db: AsyncSession = Depends(get_db)):
 # ── POST add labor entry ───────────────────────────────────────
 @router.post("/orders/{oid}/labor", status_code=201)
 async def add_labor(oid: int, data: LaborEntryIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ple
+    tid_ple = _ctid_ple.get() or 1
     o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
+    if not o or o.tenant_id != tid_ple: raise HTTPException(404)
     if data.days is None or data.days <= 0:
         raise HTTPException(400, "عدد الأيام يجب أن يكون أكبر من صفر")
     if data.daily_wage is not None and data.daily_wage < 0:
         raise HTTPException(400, "الأجر اليومي لا يمكن أن يكون سالباً")
 
     total = Decimal(str(data.days)) * Decimal(str(data.daily_wage)) + Decimal(str(data.allowance))
-    from app.core.database import current_tenant_id as _ctid_ple
     entry = ProjectLaborEntry(
-        tenant_id=_ctid_ple.get() or 1,
+        tenant_id=tid_ple,
         service_order_id=oid,
         worker_id=data.worker_id,
         entry_date=data.entry_date,
@@ -811,16 +834,17 @@ async def list_tools(oid: int, db: AsyncSession = Depends(get_db)):
 # ── POST withdraw tool ─────────────────────────────────────────
 @router.post("/orders/{oid}/tools", status_code=201)
 async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ptw
+    tid_ptw = _ctid_ptw.get() or 1
     o = await db.get(FieldServiceOrder, oid)
-    if not o: raise HTTPException(404)
+    if not o or o.tenant_id != tid_ptw: raise HTTPException(404)
     mat = await db.get(Material, data.material_id)
     if not mat: raise HTTPException(404, "المادة غير موجودة")
     if data.qty is None or data.qty <= 0:
         raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
 
-    from app.core.database import current_tenant_id as _ctid_ptw
     row = ProjectToolWithdrawal(
-        tenant_id=_ctid_ptw.get() or 1,
+        tenant_id=tid_ptw,
         service_order_id=oid,
         material_id=data.material_id,
         worker_id=data.worker_id,
@@ -841,10 +865,18 @@ async def return_tool(oid: int, wid: int, data: ToolReturnIn, db: AsyncSession =
     row = await db.get(ProjectToolWithdrawal, wid)
     if not row or row.service_order_id != oid: raise HTTPException(404)
 
+    returned_qty = Decimal(str(data.returned_qty))
+    damaged_qty  = Decimal(str(data.damaged_qty))
+    if returned_qty < 0 or damaged_qty < 0:
+        raise HTTPException(400, "الكمية لا يمكن أن تكون سالبة")
+    # مجموع المرتجع + التالف ما يزيدش عن الكمية المسحوبة أصلاً
+    if returned_qty + damaged_qty > row.qty:
+        raise HTTPException(400, f"إجمالي المرتجع والتالف ({returned_qty + damaged_qty}) أكبر من الكمية المسحوبة ({row.qty})")
+
     row.returned_date = data.returned_date
-    row.returned_qty  = Decimal(str(data.returned_qty))
-    row.damaged_qty   = Decimal(str(data.damaged_qty))
-    row.status = "damaged" if data.damaged_qty > 0 else "returned"
+    row.returned_qty  = returned_qty
+    row.damaged_qty   = damaged_qty
+    row.status = "damaged" if damaged_qty > 0 else "returned"
     if data.notes:
         row.notes = (row.notes or "") + f"\n{data.notes}"
 

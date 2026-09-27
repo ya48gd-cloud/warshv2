@@ -118,7 +118,7 @@ export default function WorkCompletionCerts() {
       setShowCreate(false)
       resetForm()
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ في الحفظ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في الحفظ', 'error') }
     finally { setSaving(false) }
   }
 
@@ -138,7 +138,7 @@ export default function WorkCompletionCerts() {
       await api.workCompletionCerts.fromContract(cid)
       addToast('تم إنشاء شهادة إتمام من العقد', 'success')
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   /* ── issue ── */
@@ -148,7 +148,7 @@ export default function WorkCompletionCerts() {
       addToast('تم إصدار الشهادة', 'success')
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   /* ── delete ── */
@@ -159,7 +159,7 @@ export default function WorkCompletionCerts() {
       setConfirmDel(null)
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   const printCert = (id) => api.print(`/work-completion-certs/${id}/print`)

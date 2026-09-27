@@ -600,6 +600,23 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
     if old_cust:
         old_cust.balance = old_cust.balance - inv.total
 
+    # إصلاح ثغرة تكامل: تعديل فاتورة موجودة (زيادة الإجمالي أو نقل الفاتورة
+    # لعميل تاني) كان الوحيد بين كل مسارات إنشاء/تعديل الفاتورة اللي مابيتحققش
+    # من حد الائتمان إطلاقًا. الفحص هنا بعد خصم الإجمالي القديم من رصيد العميل
+    # فوق مباشرة، فـ new_total هو الزيادة الحقيقية على رصيده بعد التعديل.
+    await _check_credit_limit(db, data.customer_id, new_total)
+
+    # إصلاح ثغرة تكامل: تعديل بنود/إجمالي الفاتورة كان يغيّر subtotal/tax/total
+    # في الجدول من غير ما يعكس القيد المحاسبي القديم أو يسجّل قيد جديد بالمبلغ
+    # الصحيح — فيفضل دفتر الأستاذ (Chart of Accounts) واقف على القيمة الأصلية
+    # القديمة للأبد رغم إن الفاتورة اتغيّرت فعليًا. نعكس القيد القديم بالقيم
+    # القديمة (نفس آلية الحذف) قبل ما نلمس أي حقل، ثم نسجّل قيد جديد بالقيم
+    # الجديدة بعد التعديل — تمامًا زي create/delete.
+    from app.core.database import current_tenant_id as _ctid_updj
+    _tid_updj = _ctid_updj.get() or 1
+    await journal_sales_invoice_delete(
+        db, _tid_updj, inv.id, inv.code, inv.tax_amount, inv.total, inv.date)
+
     # احذف السطور القديمة
     old_lines = (await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id == iid))).scalars().all()
     for l in old_lines:
@@ -645,6 +662,9 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
     new_cust = await db.get(Customer, data.customer_id)
     if new_cust:
         new_cust.balance = new_cust.balance + total
+
+    # قيد محاسبي جديد بالقيم بعد التعديل (يكمل عكس القيد القديم فوق)
+    await journal_sales_invoice_create(db, _tid_updj, inv.id, inv.code, tax_amt, total, data.date)
 
     await db.commit()
     await db.refresh(inv)
@@ -1133,6 +1153,17 @@ async def run_installment_scheduler_now(
 async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     inv = await db.get(Invoice, iid)
     if not inv: raise HTTPException(404)
+    # إصلاح ثغرة تكامل: حذف فاتورة عليها دفعات مسجّلة كان يعكس القيد المحاسبي
+    # للفاتورة بالكامل (بما فيها الجزء المدفوع) من غير ما يمس قيد الدفعة نفسه
+    # أو سجلات CustomerPayment/الخزنة المرتبطة — فيفضل حساب العملاء (AR) في
+    # دفتر الأستاذ غير متزن بقيمة المدفوع، والدفعة تفضل يتيمة بلا فاتورة.
+    # امنع الحذف طالما فيه مبلغ مسدد، واطلب استرجاعه/عكسه أولاً.
+    if inv.paid_amount and inv.paid_amount > 0:
+        raise HTTPException(
+            400,
+            f"لا يمكن حذف الفاتورة — عليها مبلغ مسدد {float(inv.paid_amount):,.2f}. "
+            f"يجب عكس/استرجاع الدفعات المسجّلة على هذه الفاتورة أولاً.",
+        )
     lines = (await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==iid))).scalars().all()
     for l in lines: await db.delete(l)
     await db.execute(sa_delete(InvoicePaymentSchedule).where(InvoicePaymentSchedule.invoice_id == iid))

@@ -9,6 +9,7 @@ BASE = "/api/v1/field-service"
 CUST = "/api/v1/customers"
 WORKERS = "/api/v1/workers"
 EQ = "/api/v1/equipment"
+INV = "/api/v1/inventory"
 
 
 async def _make_customer(cli):
@@ -23,6 +24,11 @@ async def _make_worker(cli):
 
 async def _make_equipment(cli):
     r = await cli.post(EQ, json={"name_ar": "معدة خدمة", "level": 1})
+    return r.json()["id"]
+
+
+async def _make_material(cli):
+    r = await cli.post(f"{INV}/materials", json={"name_ar": "أداة خدمة", "unit": "قطعة", "unit_cost": 10.0})
     return r.json()["id"]
 
 
@@ -233,6 +239,44 @@ async def test_list_labor(cli):
     r = await cli.get(f"{BASE}/orders/{oid}/labor")
     assert r.status_code == 200
     assert isinstance(r.json(), list)
+
+
+# ════════════════ TOOL WITHDRAWALS ═══════════════════════════════════
+@pytest.mark.asyncio
+async def test_withdraw_and_return_tool(cli):
+    cid = await _make_customer(cli)
+    oid = await _make_order(cli, cid)
+    mid = await _make_material(cli)
+    r = await cli.post(f"{BASE}/orders/{oid}/tools", json={
+        "material_id": mid, "qty": 2, "withdrawn_date": str(date.today()),
+    })
+    assert r.status_code == 201
+    wid = r.json()["id"]
+
+    r2 = await cli.patch(f"{BASE}/orders/{oid}/tools/{wid}/return", json={
+        "returned_date": str(date.today()), "returned_qty": 2, "damaged_qty": 0,
+    })
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "returned"
+
+
+@pytest.mark.asyncio
+async def test_return_tool_rejects_qty_over_withdrawn(cli):
+    """Regression: return_tool never validated returned_qty (+ damaged_qty)
+    against the originally withdrawn qty, so more tooling than was ever
+    checked out could be recorded as returned."""
+    cid = await _make_customer(cli)
+    oid = await _make_order(cli, cid)
+    mid = await _make_material(cli)
+    r = await cli.post(f"{BASE}/orders/{oid}/tools", json={
+        "material_id": mid, "qty": 1, "withdrawn_date": str(date.today()),
+    })
+    wid = r.json()["id"]
+
+    r2 = await cli.patch(f"{BASE}/orders/{oid}/tools/{wid}/return", json={
+        "returned_date": str(date.today()), "returned_qty": 5, "damaged_qty": 0,
+    })
+    assert r2.status_code == 400
 
 
 # ════════════════ DASHBOARD + CALENDAR ═══════════════════════════════

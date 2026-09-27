@@ -35,6 +35,13 @@ export default function SupplyContracts({ onNavigate }) {
   const [scheduleModal, setScheduleModal] = useState(null)   // contract id
   const [scheduleData, setScheduleData]   = useState(null)   // { installments: [] }
   const [scheduleRows, setScheduleRows]   = useState([{ label: '', pct: '', days_offset: '0' }])
+  const [deliverModal, setDeliverModal]   = useState(null)   // contract id
+  const EMPTY_DELIVER = {
+    delivery_date: new Date().toISOString().slice(0,10),
+    received_by: '', receiver_title: '', delivery_notes: '',
+    vehicle_plate: '', vehicle_type: '', driver_name: '', driver_license: '', driver_phone: '',
+  }
+  const [deliverForm, setDeliverForm]     = useState(EMPTY_DELIVER)
 
   const act = async (fn) => {
     if (acting) return
@@ -85,6 +92,31 @@ export default function SupplyContracts({ onNavigate }) {
     })
   }
 
+  const openDeliverModal = (contractId) => {
+    setDeliverForm(EMPTY_DELIVER)
+    setDeliverModal(contractId)
+  }
+
+  const handleConfirmDelivery = async () => {
+    await act(async () => {
+      const res = await api.supplyContracts.deliver(deliverModal, {
+        delivery_date:  deliverForm.delivery_date || null,
+        received_by:    deliverForm.received_by || null,
+        receiver_title: deliverForm.receiver_title || null,
+        delivery_notes: deliverForm.delivery_notes || null,
+        vehicle_plate:  deliverForm.vehicle_plate || null,
+        vehicle_type:   deliverForm.vehicle_type || null,
+        driver_name:    deliverForm.driver_name || null,
+        driver_license: deliverForm.driver_license || null,
+        driver_phone:   deliverForm.driver_phone || null,
+      })
+      toast(`✅ تم تأكيد التسليم${res.invoice_code ? ` — فاتورة مبيعات ${res.invoice_code} أُنشئت تلقائياً` : ''}`)
+      const cid = deliverModal
+      setDeliverModal(null)
+      openDetail(cid); reload()
+    })
+  }
+
   const handleDeleteSchedule = async (contractId) => {
     await act(async () => {
       await api.supplyContracts.deleteScheduleTemplate(contractId)
@@ -94,7 +126,10 @@ export default function SupplyContracts({ onNavigate }) {
   }
 
   const addLine = () => {
-    if (!newLine.description || !newLine.unit_price) return
+    if (!newLine.description || !newLine.unit_price) {
+      toast('أدخل الوصف والسعر قبل إضافة البند', 'error')
+      return
+    }
     setForm(f => ({ ...f, lines: [...f.lines, { ...newLine }] }))
     setNewLine(EMPTY_LINE)
   }
@@ -411,13 +446,18 @@ export default function SupplyContracts({ onNavigate }) {
             </button>
             {detailData.delivery_confirmed && (
               <button className="btn-secondary"
-                onClick={() => api.print(`/supply-contracts/${detail}/print-delivery`)}>
+                onClick={() => api.print(`/supply-contracts/${detail}/delivery-slip`)}>
                 🚛 وصل التسليم
               </button>
             )}
             {detailData.status === 'draft' && (
               <button className="btn-teal" onClick={() => handleActivate(detail)} disabled={acting}>
                 ✓ تفعيل العقد
+              </button>
+            )}
+            {detailData.status === 'active' && !detailData.delivery_confirmed && (
+              <button className="btn-primary" onClick={() => openDeliverModal(detail)} disabled={acting}>
+                🚛 تأكيد التسليم والاستلام
               </button>
             )}
             {detailData.status === 'active' && (
@@ -446,14 +486,26 @@ export default function SupplyContracts({ onNavigate }) {
             <Input label="تاريخ العقد *" type="date" value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
             <Input label="صالح حتى" type="date" value={form.valid_until} onChange={e => setForm(f => ({ ...f, valid_until: e.target.value }))} />
             <Input label="فترة الضمان (شهر)" type="number" value={form.warranty_months} onChange={e => setForm(f => ({ ...f, warranty_months: e.target.value }))} />
-            <Textarea label="ما يشمله الضمان" value={form.warranty_description || ''} onChange={e => setForm(f => ({ ...f, warranty_description: e.target.value }))} placeholder="وصف تفصيلي لما يغطيه الضمان..." span={2} />
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Textarea label="ما يشمله الضمان" value={form.warranty_description || ''} onChange={e => setForm(f => ({ ...f, warranty_description: e.target.value }))} placeholder="وصف تفصيلي لما يغطيه الضمان..." />
+            </div>
             <Input label="ضريبة %" type="number" value={form.tax_pct} onChange={e => setForm(f => ({ ...f, tax_pct: e.target.value }))} />
             <Input label="خصم (ج.م)" type="number" value={form.discount_amt} onChange={e => setForm(f => ({ ...f, discount_amt: e.target.value }))} />
-            <Textarea label="شروط الدفع" value={form.payment_terms} onChange={e => setForm(f => ({ ...f, payment_terms: e.target.value }))} span={2} />
-            <Textarea label="شروط التسليم" value={form.delivery_terms} onChange={e => setForm(f => ({ ...f, delivery_terms: e.target.value }))} span={2} />
-            <Textarea label="نطاق الأعمال / المواصفات" value={form.scope_of_work} onChange={e => setForm(f => ({ ...f, scope_of_work: e.target.value }))} span={2} />
-            <Textarea label="شروط خاصة" value={form.special_terms} onChange={e => setForm(f => ({ ...f, special_terms: e.target.value }))} span={2} />
-            <Textarea label="ملاحظات" value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} span={2} />
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Textarea label="شروط الدفع" value={form.payment_terms} onChange={e => setForm(f => ({ ...f, payment_terms: e.target.value }))} />
+            </div>
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Textarea label="شروط التسليم" value={form.delivery_terms} onChange={e => setForm(f => ({ ...f, delivery_terms: e.target.value }))} />
+            </div>
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Textarea label="نطاق الأعمال / المواصفات" value={form.scope_of_work} onChange={e => setForm(f => ({ ...f, scope_of_work: e.target.value }))} />
+            </div>
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Textarea label="شروط خاصة" value={form.special_terms} onChange={e => setForm(f => ({ ...f, special_terms: e.target.value }))} />
+            </div>
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Textarea label="ملاحظات" value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
+            </div>
           </FormGrid>
 
           {/* Lines */}
@@ -581,6 +633,45 @@ export default function SupplyContracts({ onNavigate }) {
               {acting ? '...' : '💾 حفظ الخطة'}
             </button>
             <button className="btn" onClick={() => setScheduleModal(null)}>إلغاء</button>
+          </ModalFooter>
+        </Modal>
+      )}
+
+      {/* ═══ Modal: تأكيد التسليم والاستلام ═══ */}
+      {deliverModal && (
+        <Modal title="🚛 تأكيد التسليم والاستلام" onClose={() => setDeliverModal(null)} size="md">
+          <div style={{ marginBottom:12, fontSize:12, color:'var(--text-secondary)',
+            background:'var(--surface)', borderRadius:8, padding:'8px 12px',
+            border:'1px solid var(--border)' }}>
+            سيتم إنشاء فاتورة مبيعات تلقائياً بإجمالي العقد، وتحديث المخزون للبنود المرتبطة بمواد،
+            وتطبيق خطة الأقساط لو موجودة.
+          </div>
+          <FormGrid cols={2}>
+            <Input label="تاريخ التسليم الفعلي *" type="date"
+              value={deliverForm.delivery_date}
+              onChange={e => setDeliverForm(f => ({ ...f, delivery_date: e.target.value }))} />
+            <Input label="اسم المستلم" value={deliverForm.received_by}
+              onChange={e => setDeliverForm(f => ({ ...f, received_by: e.target.value }))} />
+            <Input label="وظيفة / صفة المستلم" value={deliverForm.receiver_title}
+              onChange={e => setDeliverForm(f => ({ ...f, receiver_title: e.target.value }))} />
+            <Input label="رقم لوحة السيارة" value={deliverForm.vehicle_plate}
+              onChange={e => setDeliverForm(f => ({ ...f, vehicle_plate: e.target.value }))} />
+            <Input label="نوع السيارة" value={deliverForm.vehicle_type}
+              onChange={e => setDeliverForm(f => ({ ...f, vehicle_type: e.target.value }))} />
+            <Input label="اسم السائق" value={deliverForm.driver_name}
+              onChange={e => setDeliverForm(f => ({ ...f, driver_name: e.target.value }))} />
+            <Input label="رقم رخصة القيادة" value={deliverForm.driver_license}
+              onChange={e => setDeliverForm(f => ({ ...f, driver_license: e.target.value }))} />
+            <Input label="موبايل السائق" value={deliverForm.driver_phone}
+              onChange={e => setDeliverForm(f => ({ ...f, driver_phone: e.target.value }))} />
+            <Textarea label="ملاحظات الاستلام" value={deliverForm.delivery_notes} span={2}
+              onChange={e => setDeliverForm(f => ({ ...f, delivery_notes: e.target.value }))} />
+          </FormGrid>
+          <ModalFooter>
+            <button className="btn-primary" onClick={handleConfirmDelivery} disabled={acting || !deliverForm.delivery_date}>
+              {acting ? '...' : '✅ تأكيد التسليم'}
+            </button>
+            <button className="btn" onClick={() => setDeliverModal(null)}>إلغاء</button>
           </ModalFooter>
         </Modal>
       )}

@@ -93,15 +93,33 @@ export default function Movements() {
     [matId]
   )
 
-  const selectedMat = useMemo(() => materials?.find(m => m.id == matId), [materials, matId])
+  // بطاقة الرصيد في الشريط العلوي مرتبطة بالمادة المختارة من قائمة الفلترة فوق فقط
+  const topBarMat = useMemo(() => materials?.find(m => m.id == matId), [materials, matId])
+
+  // ── Form state ──────────────────────────────────────────────
+  const [modal, setModal] = useState(false)
+  const [confirmOut, setConfirmOut] = useState(null) // { payload, qty }
+  const [form, setForm] = useState(() => ({
+    movement_type: 'in', withdrawal_unit: 'weight', movement_date: today(),
+    qty: '', unit_cost: '', pieces_count: '1', weight_per_piece: '',
+    destination: '', source: '', work_order_id: '', reference: '', notes: '',
+    material_id: '', plate_length_cm: '', plate_width_cm: '', plate_weight_kg: '',
+    plateDims: [{ id: Date.now(), length: '', width: '' }], plate_pieces_per_dim: '1',
+    bar_length_cm: '', waste_g: '',
+  }))
+
+  // المادة الفعلية بالنسبة للمودال: لو اتفتح من غير فلترة (matId فاضي) واختار
+  // المستخدم مادة من داخل المودال نفسه، كل الحسابات (ألواح/حديد/الرصيد) لازم
+  // تتبع اختيار المودال ده — قبل كده كانت الحسابات دي بتفضل مرتبطة بـ matId
+  // الخارجي بس، فلو المستخدم فتح "+ تسجيل حركة" من غير ما يختار مادة فوق
+  // الأول، كل قيم اللوح/الحديد المحسوبة والتحذيرات كانت بتختفي بصمت.
+  const activeMatId = form.material_id || matId
+  const selectedMat = useMemo(() => materials?.find(m => m.id == activeMatId), [materials, activeMatId])
   const isPlate  = selectedMat?.is_plate || selectedMat?.material_kind === 'plate' || false
   const isBar    = selectedMat?.material_kind === 'bar'
   const density  = selectedMat?.density_kg_m2
   const thickness = selectedMat?.thickness_mm
 
-  // ── Form state ──────────────────────────────────────────────
-  const [modal, setModal] = useState(false)
-  const [confirmOut, setConfirmOut] = useState(null) // { payload, qty }
   const emptyForm = () => ({
     movement_type:   'in',
     withdrawal_unit: isPlate ? 'plate_in' : isBar ? 'bar_count' : 'weight',
@@ -127,7 +145,6 @@ export default function Movements() {
     bar_length_cm: '',
     waste_g: '',
   })
-  const [form, setForm] = useState(emptyForm())
   const openModal = () => { setForm({ ...emptyForm(), material_id: matId }); setModal(true) }
   const f = (field, val) => setForm(prev => ({ ...prev, [field]: val }))
 
@@ -212,11 +229,20 @@ export default function Movements() {
     setModal(false); setConfirmOut(null); reload()
   })
 
+  // ── عكس حركة (بدل حذفها) ───────────────────────────────────────
+  const [confirmReverse, setConfirmReverse] = useState(null) // movement قيد التأكيد
+  const [doReverse, reversing] = useAction(async (m) => {
+    await api.inventory.deleteMovement(m.id)
+    toast('تم عكس الحركة بنجاح')
+    setConfirmReverse(null); reload()
+  })
+
   // ── Save ──────────────────────────────────────────────────────
   const [save, saving] = useAction(async () => {
     const matIdToUse = form.material_id || matId
     if (!matIdToUse)     { toast('اختر المادة',     'error'); return }
     if (!form.unit_cost || Number(form.unit_cost) <= 0) { toast('أدخل سعر وحدة أكبر من صفر', 'error'); return }
+    if (form.movement_type === 'out' && !form.destination) { toast('اختر الوجهة', 'error'); return }
 
     let qty = Number(form.qty || 0)
     let payload = {
@@ -359,22 +385,22 @@ export default function Movements() {
           </select>
         </div>
 
-        {selectedMat && (
+        {topBarMat && (
           <div className="flex-shrink-0 flex flex-col items-end gap-0.5">
             <div className="px-3 py-1.5 rounded-erp text-sm"
                  style={{ background: 'var(--teal-lt)', color: 'var(--teal)' }}>
-              <span className="font-bold">{Number(selectedMat.stock_qty||0).toFixed(3)}</span>
-              <span className="text-xs mr-1">{selectedMat.unit}</span>
+              <span className="font-bold">{Number(topBarMat.stock_qty||0).toFixed(3)}</span>
+              <span className="text-xs mr-1">{topBarMat.unit}</span>
             </div>
-            {density && (
+            {topBarMat.density_kg_m2 && (
               <div className="text-[10px] text-erp-muted">
-                كثافة: {Number(density).toFixed(2)} كجم/م²
-                {thickness ? ` · ${thickness}mm` : ''}
+                كثافة: {Number(topBarMat.density_kg_m2).toFixed(2)} كجم/م²
+                {topBarMat.thickness_mm ? ` · ${topBarMat.thickness_mm}mm` : ''}
               </div>
             )}
-            {selectedMat?.weight_per_meter_kg && (
+            {topBarMat?.weight_per_meter_kg && (
               <div className="text-[10px] text-erp-muted">
-                وزن المتر: {Number(selectedMat.weight_per_meter_kg).toFixed(4)} كجم/م
+                وزن المتر: {Number(topBarMat.weight_per_meter_kg).toFixed(4)} كجم/م
               </div>
             )}
           </div>
@@ -394,17 +420,18 @@ export default function Movements() {
                 <th>التاريخ</th><th>النوع</th><th>الكمية (كجم)</th>
                 <th>تفاصيل</th><th>السعر</th><th>الإجمالي</th>
                 <th>الوجهة / المرجع</th><th>الرصيد</th>
+                {write && <th></th>}
               </tr>
             </thead>
             <tbody>
               {loading && matId && (
-                <tr><td colSpan={8} className="text-center py-10 animate-pulse text-erp-muted">جاري التحميل…</td></tr>
+                <tr><td colSpan={write ? 9 : 8} className="text-center py-10 animate-pulse text-erp-muted">جاري التحميل…</td></tr>
               )}
               {!matId && (
-                <tr><td colSpan={8} className="text-center py-10 text-erp-muted">اختر مادة أولاً</td></tr>
+                <tr><td colSpan={write ? 9 : 8} className="text-center py-10 text-erp-muted">اختر مادة أولاً</td></tr>
               )}
               {matId && !loading && !movs?.length && (
-                <tr><td colSpan={8} className="text-center py-10 text-erp-muted">لا توجد حركات</td></tr>
+                <tr><td colSpan={write ? 9 : 8} className="text-center py-10 text-erp-muted">لا توجد حركات</td></tr>
               )}
               {movs?.map(m => {
                 const isIn = m.movement_type === 'in'
@@ -421,6 +448,8 @@ export default function Movements() {
                       {m.withdrawal_unit === 'bar_length'  && <span className="badge badge-amber mr-1 text-[10px]">بالطول</span>}
                       {m.withdrawal_unit === 'bar_count'   && <span className="badge badge-amber mr-1 text-[10px]">بالأسياخ</span>}
                       {m.withdrawal_unit === 'piece'       && <span className="badge badge-amber mr-1 text-[10px]">قطع</span>}
+                      {m.state === 'reversed' && <span className="badge badge-gray mr-1 text-[10px]">معكوسة</span>}
+                      {m.source_doc_type === 'reversal' && <span className="badge badge-gray mr-1 text-[10px]">حركة عكس</span>}
                     </td>
                     <td className="font-semibold font-mono">
                       {Number(m.qty||0).toFixed(3)}
@@ -459,6 +488,14 @@ export default function Movements() {
                       {!m.reference && !m.notes && '—'}
                     </td>
                     <td className="font-medium font-mono">{Number(m.balance_after||0).toFixed(3)}</td>
+                    {write && (
+                      <td>
+                        {m.state !== 'reversed' && m.source_doc_type !== 'reversal' && (
+                          <button className="btn btn-sm text-xs" title="عكس الحركة"
+                            onClick={() => setConfirmReverse(m)}>↩ عكس</button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 )
               })}
@@ -824,6 +861,19 @@ export default function Movements() {
           ? `${isOverBalance
               ? `⚠️ تحذير: الكمية المطلوبة (${Number(confirmOut.qty).toFixed(3)} كجم) تتجاوز الرصيد الحالي (${stockQty.toFixed(3)} كجم). هل تريد المتابعة؟`
               : `هل تريد سحب ${Number(confirmOut.qty).toFixed(3)} كجم من المخزون؟`}`
+          : ''}
+      />
+
+      {/* ════ Confirm reverse movement ════ */}
+      <ConfirmDialog
+        open={!!confirmReverse}
+        onCancel={() => setConfirmReverse(null)}
+        onConfirm={() => doReverse(confirmReverse)}
+        title="تأكيد عكس الحركة"
+        confirmLabel={reversing ? '…' : 'تأكيد العكس'}
+        danger
+        message={confirmReverse
+          ? `هل تريد عكس هذه الحركة (${confirmReverse.movement_type === 'in' ? 'وارد' : 'صادر'} ${Number(confirmReverse.qty || 0).toFixed(3)} كجم)؟ سيتم إنشاء حركة عكسية تعيد الرصيد لحالته قبلها، وتبقى الحركة الأصلية في السجل بحالة "معكوسة".`
           : ''}
       />
     </div>

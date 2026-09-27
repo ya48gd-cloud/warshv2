@@ -173,3 +173,69 @@ async def test_treasury_summary(cli):
     assert r.status_code == 200
     d = r.json()
     assert "total_balance" in d or "total_cash" in d or "total" in d or isinstance(d, list)
+
+
+# ════════════════ GL SYNC (محطة تدقيق محاسبي) ═════════════════════════
+# إصلاح: تعديل/حذف حركة خزينة يدوية مرتبطة بقيد محاسبي (COA) ما كانش
+# بيعكس/يحدّث القيد المرتبط — فيفضل قيد قديم أو يتيم في دليل الحسابات
+# وميزان المراجعة يبقى غير متوافق مع رصيد الخزينة الفعلي.
+@pytest.mark.asyncio
+async def test_transaction_edit_and_delete_keep_gl_in_sync(cli):
+    ACC_BASE = "/api/v1/accounts"
+
+    await cli.post(f"{ACC_BASE}/chart/seed")
+    accounts = (await cli.get(f"{ACC_BASE}/chart")).json()
+    cash_acc = next(a for a in accounts if a["code"] == "1110")
+    expense_acc = next(a for a in accounts if a["code"] == "5500")
+
+    tr = await cli.post(f"{BASE}/accounts", json={
+        "name": "خزينة GL", "kind": "cash", "opening_balance": 1000.0,
+        "coa_account_id": cash_acc["id"],
+    })
+    assert tr.status_code == 201
+    treasury_id = tr.json()["id"]
+
+    cat = await cli.post(f"{BASE}/categories", json={
+        "name": "فئة GL", "flow": "out", "coa_account_id": expense_acc["id"],
+    })
+    assert cat.status_code == 201
+    category_id = cat.json()["id"]
+
+    txn = await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": treasury_id, "direction": "out", "amount": 100.0,
+        "category_id": category_id, "txn_date": str(date.today()),
+        "description": "مصروف تجريبي",
+    })
+    assert txn.status_code == 201
+    txn_id = txn.json()["id"]
+
+    tb = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    assert tb["totals"]["balanced"] is True
+    expense_row = next(r for r in tb["accounts"] if r["code"] == "5500")
+    assert expense_row["balance"] == 100.0
+
+    # عدّل المبلغ لـ 250 — القيد المحاسبي القديم لازم يتعكس والجديد يتسجل بالمبلغ الجديد فقط
+    upd = await cli.put(f"{BASE}/transactions/{txn_id}", json={
+        "treasury_id": treasury_id, "direction": "out", "amount": 250.0,
+        "category_id": category_id, "txn_date": str(date.today()),
+        "description": "مصروف معدّل",
+    })
+    assert upd.status_code == 200
+
+    tb2 = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    assert tb2["totals"]["balanced"] is True
+    expense_row2 = next(r for r in tb2["accounts"] if r["code"] == "5500")
+    assert expense_row2["balance"] == 250.0, (
+        "رصيد حساب المصروف لازم يعكس 250 فقط بعد التعديل، مش 100 القديمة + 250 الجديدة"
+    )
+
+    # احذف الحركة — القيد بتاعها لازم ينعكس تماماً فيرجع صافي حساب المصروف صفر
+    dele = await cli.delete(f"{BASE}/transactions/{txn_id}")
+    assert dele.status_code == 204
+
+    tb3 = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    assert tb3["totals"]["balanced"] is True
+    expense_rows3 = [r for r in tb3["accounts"] if r["code"] == "5500"]
+    assert not expense_rows3 or expense_rows3[0]["balance"] == 0.0, (
+        "بعد حذف الحركة، صافي حساب المصروف لازم يرجع صفر (مايفضلش قيد يتيم)"
+    )

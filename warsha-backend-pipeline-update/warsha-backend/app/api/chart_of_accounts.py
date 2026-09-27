@@ -25,6 +25,10 @@ router = APIRouter(prefix="/accounts", tags=["accounting_v2"], dependencies=[Dep
 
 # ── Schemas ────────────────────────────────────────────────────
 
+_VALID_ACCOUNT_TYPES = {"asset", "liability", "equity", "revenue", "expense"}
+_VALID_SIDES = {"debit", "credit"}
+
+
 class AccountIn(BaseModel):
     code: str
     name_ar: str
@@ -34,12 +38,41 @@ class AccountIn(BaseModel):
     parent_id: Optional[int] = None
     notes: Optional[str] = None
 
+    @validator("account_type")
+    def _valid_account_type(cls, v):
+        # حماية: حساب بنوع غلط (أو خطأ إملائي) بيختفي بصمت من الميزانية/قائمة الدخل
+        # لأن الأقسام هناك بتفلتر بالضبط على القيم دي — مايكسرش بس بيبوّظ التوازن
+        if v not in _VALID_ACCOUNT_TYPES:
+            raise ValueError(f"account_type يجب أن يكون أحد: {sorted(_VALID_ACCOUNT_TYPES)}")
+        return v
+
+    @validator("normal_balance")
+    def _valid_normal_balance(cls, v):
+        if v not in _VALID_SIDES:
+            raise ValueError("normal_balance يجب أن يكون 'debit' أو 'credit'")
+        return v
+
 
 class EntryLineIn(BaseModel):
     account_id: int
     side: str   # debit | credit
     amount: Decimal
     notes: Optional[str] = None
+
+    @validator("side")
+    def _valid_side(cls, v):
+        # حماية أساسية: لو الـ side مش "debit"/"credit" بالظبط (فرق حالة أحرف مثلاً)،
+        # الـ validator العام "balanced" تحت بيحسبه صفر في الطرفين فيعدي القيد
+        # كـ"متوازن" وهو مش متوازن فعلاً — ويختفي من ميزان المراجعة بصمت.
+        if v not in _VALID_SIDES:
+            raise ValueError("side يجب أن يكون 'debit' أو 'credit'")
+        return v
+
+    @validator("amount")
+    def _positive_amount(cls, v):
+        if v <= 0:
+            raise ValueError("amount يجب أن يكون أكبر من صفر")
+        return v
 
 
 class EntryIn(BaseModel):
@@ -199,6 +232,18 @@ async def update_account(acc_id: int, data: AccountIn, db: AsyncSession = Depend
     acc = await db.get(ChartOfAccount, acc_id)
     if not acc:
         raise HTTPException(404)
+    if data.code != acc.code:
+        # منع كودين لنفس الحساب لنفس الـ tenant — كود مكرر يخلي _get_account_id/
+        # trial-balance يلقوا حسابين بنفس الكود وده بيكسر ربط القيود التلقائية بحساب محدد
+        dup = await db.scalar(
+            select(ChartOfAccount.id).where(
+                ChartOfAccount.code == data.code,
+                ChartOfAccount.tenant_id == acc.tenant_id,
+                ChartOfAccount.id != acc_id,
+            )
+        )
+        if dup:
+            raise HTTPException(400, f"كود الحساب {data.code} مستخدم بالفعل لحساب آخر")
     for k, v in data.model_dump().items():
         setattr(acc, k, v)
     await db.commit()

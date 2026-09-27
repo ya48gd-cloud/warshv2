@@ -75,6 +75,18 @@ class ReceiveIn(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────
 
+async def _tenant_po_query(po_id: int):
+    """أمر شراء مقيّد بالـ tenant الحالي — يمنع أي tenant من قراءة/تعديل
+    أمر شراء تابع لـ tenant تاني بمجرد تخمين الـ id (db.get(PurchaseOrder, id)
+    القديمة كانت بترجع أي أمر بغض النظر عن الـ tenant)."""
+    from app.core.database import current_tenant_id as _ctid_tpq
+    tid = _ctid_tpq.get()
+    q = select(PurchaseOrder).where(PurchaseOrder.id == po_id)
+    if tid is not None:
+        q = q.where(PurchaseOrder.tenant_id == tid)
+    return q
+
+
 async def _next_po_code(db: AsyncSession) -> str:
     count = await db.scalar(select(func.count()).select_from(PurchaseOrder))
     n = (count or 0) + 1
@@ -132,10 +144,14 @@ async def list_purchase_orders(
     supplier_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.core.database import current_tenant_id as _ctid_lpo
+    tid = _ctid_lpo.get()
     q = select(PurchaseOrder).options(
         selectinload(PurchaseOrder.supplier),
         selectinload(PurchaseOrder.lines),
     )
+    if tid is not None:
+        q = q.where(PurchaseOrder.tenant_id == tid)
     if status:
         q = q.where(PurchaseOrder.status == status)
     if supplier_id:
@@ -166,6 +182,10 @@ async def create_purchase_order(data: POIn, db: AsyncSession = Depends(get_db)):
     exists = await db.scalar(select(PurchaseOrder.id).where(PurchaseOrder.code == code))
     if exists:
         raise HTTPException(400, f"كود {code} مستخدم من قبل")
+    if data.supplier_id:
+        sup_check = await db.get(Supplier, data.supplier_id)
+        if not sup_check or sup_check.tenant_id != _tid_po:
+            raise HTTPException(400, "المورد غير موجود")
 
     subtotal = sum(Decimal(str(l.ordered_qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
     tax_amount = subtotal * Decimal(str(data.tax_pct)) / 100
@@ -220,10 +240,10 @@ async def create_purchase_order(data: POIn, db: AsyncSession = Depends(get_db)):
 @router.get("/{po_id}")
 async def get_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
-        select(PurchaseOrder).options(
+        (await _tenant_po_query(po_id)).options(
             selectinload(PurchaseOrder.supplier),
             selectinload(PurchaseOrder.lines).selectinload(PurchaseOrderLine.material),
-        ).where(PurchaseOrder.id == po_id)
+        )
     )
     po = res.scalar_one_or_none()
     if not po:
@@ -235,8 +255,7 @@ async def get_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
 async def update_purchase_order(po_id: int, data: POIn, db: AsyncSession = Depends(get_db)):
     """تعديل أمر شراء — مسموح فقط في حالة مسودة"""
     res = await db.execute(
-        select(PurchaseOrder).options(selectinload(PurchaseOrder.lines))
-        .where(PurchaseOrder.id == po_id)
+        (await _tenant_po_query(po_id)).options(selectinload(PurchaseOrder.lines))
     )
     po = res.scalar_one_or_none()
     if not po:
@@ -252,6 +271,13 @@ async def update_purchase_order(po_id: int, data: POIn, db: AsyncSession = Depen
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
     if data.order_date and data.expected_date and data.expected_date < data.order_date:
         raise HTTPException(400, "تاريخ التوريد المتوقع يجب أن يكون بعد تاريخ الأمر")
+
+    from app.core.database import current_tenant_id as _ctid_upo
+    _tid_upo = _ctid_upo.get() or 1
+    if data.supplier_id:
+        sup_check = await db.get(Supplier, data.supplier_id)
+        if not sup_check or sup_check.tenant_id != _tid_upo:
+            raise HTTPException(400, "المورد غير موجود")
 
     subtotal = sum(Decimal(str(l.ordered_qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
     tax_amount = subtotal * Decimal(str(data.tax_pct)) / 100
@@ -299,7 +325,7 @@ async def update_purchase_order(po_id: int, data: POIn, db: AsyncSession = Depen
 @router.patch("/{po_id}/approve")
 async def approve_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
     """موافقة على أمر الشراء — ينتقل من draft إلى approved"""
-    po = await db.get(PurchaseOrder, po_id)
+    po = (await db.execute(await _tenant_po_query(po_id))).scalar_one_or_none()
     if not po:
         raise HTTPException(404)
     if po.status != "draft":
@@ -312,11 +338,16 @@ async def approve_purchase_order(po_id: int, db: AsyncSession = Depends(get_db))
 
 @router.patch("/{po_id}/cancel")
 async def cancel_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
-    po = await db.get(PurchaseOrder, po_id)
+    po = (await db.execute(await _tenant_po_query(po_id))).scalar_one_or_none()
     if not po:
         raise HTTPException(404)
-    if po.status in ("received",):
-        raise HTTPException(400, "لا يمكن إلغاء أمر مستلم بالكامل")
+    # كان مسموح إلغاء أمر "partial" (مستلم جزئياً) من غير أي عكس لأثره —
+    # الكمية اللي اتستلمت فعلاً رفعت المخزون وأنشأت فاتورة شراء ورفعت رصيد
+    # المورد بالفعل، فإلغاء الأمر بعد كده كان بيسيب حالة متضاربة (أمر
+    # "ملغي" له أثر فعلي في المخزون والحسابات). امنع الإلغاء في الحالتين
+    # زي بعض، نفس ما بيحصل فعلياً مع "received".
+    if po.status in ("received", "partial"):
+        raise HTTPException(400, "لا يمكن إلغاء أمر تم استلام جزء منه بالفعل — الكمية المستلمة أثّرت على المخزون والحسابات")
     po.status = "cancelled"
     await db.commit()
     return {"id": po_id, "status": "cancelled"}
@@ -329,10 +360,10 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
     يحدّث الكميات المستلمة، يرفع المخزون، وينشئ فاتورة شراء اختياريًا.
     """
     res = await db.execute(
-        select(PurchaseOrder).options(
+        (await _tenant_po_query(po_id)).options(
             selectinload(PurchaseOrder.lines),
             selectinload(PurchaseOrder.supplier),
-        ).where(PurchaseOrder.id == po_id)
+        )
     )
     po = res.scalar_one_or_none()
     if not po:
@@ -341,6 +372,12 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
         raise HTTPException(400, "الأمر ملغي")
     if po.status == "received":
         raise HTTPException(400, "الأمر مستلم بالكامل بالفعل")
+    if po.status == "draft":
+        # كان ممكن تستلم أمر شراء لسه "مسودة" — يعني تتخطى خطوة الموافقة
+        # بالكامل (approve كان اختياري فعلياً رغم وجوده كخطوة في الـ workflow).
+        # المفروض الاستلام ميتمش غير لأمر معتمد (approved) أو مستلم جزئياً
+        # بالفعل (partial).
+        raise HTTPException(400, "لا يمكن استلام أمر شراء لم تتم الموافقة عليه بعد")
 
     from app.core.database import current_tenant_id as _ctid_recv
     _tid_recv = _ctid_recv.get() or 1
@@ -461,7 +498,7 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
 
 @router.delete("/{po_id}")
 async def delete_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
-    po = await db.get(PurchaseOrder, po_id)
+    po = (await db.execute(await _tenant_po_query(po_id))).scalar_one_or_none()
     if not po:
         raise HTTPException(404)
     if po.status not in ("draft", "cancelled"):
@@ -476,11 +513,17 @@ async def delete_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/dashboard/summary")
 async def po_dashboard(db: AsyncSession = Depends(get_db)):
-    total = await db.scalar(select(func.count()).select_from(PurchaseOrder))
-    draft = await db.scalar(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.status == "draft"))
-    approved = await db.scalar(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.status == "approved"))
-    partial = await db.scalar(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.status == "partial"))
-    total_value = await db.scalar(select(func.coalesce(func.sum(PurchaseOrder.total), 0)))
+    from app.core.database import current_tenant_id as _ctid_pod
+    tid = _ctid_pod.get()
+
+    def _scoped(q):
+        return q.where(PurchaseOrder.tenant_id == tid) if tid is not None else q
+
+    total = await db.scalar(_scoped(select(func.count()).select_from(PurchaseOrder)))
+    draft = await db.scalar(_scoped(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.status == "draft")))
+    approved = await db.scalar(_scoped(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.status == "approved")))
+    partial = await db.scalar(_scoped(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.status == "partial")))
+    total_value = await db.scalar(_scoped(select(func.coalesce(func.sum(PurchaseOrder.total), 0))))
     return {
         "total_orders": total or 0,
         "draft": draft or 0,
@@ -790,9 +833,9 @@ table.totals-tbl{{width:260px;border-collapse:collapse;}}
 async def print_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
     """طباعة أمر التوريد"""
     res = await db.execute(
-        select(PurchaseOrder)
-        .options(selectinload(PurchaseOrder.supplier), selectinload(PurchaseOrder.lines))
-        .where(PurchaseOrder.id == po_id)
+        (await _tenant_po_query(po_id)).options(
+            selectinload(PurchaseOrder.supplier), selectinload(PurchaseOrder.lines)
+        )
     )
     po = res.scalar_one_or_none()
     if not po:
@@ -805,9 +848,9 @@ async def print_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
 async def print_grn(po_id: int, db: AsyncSession = Depends(get_db)):
     """طباعة سند استلام البضاعة (GRN)"""
     res = await db.execute(
-        select(PurchaseOrder)
-        .options(selectinload(PurchaseOrder.supplier), selectinload(PurchaseOrder.lines))
-        .where(PurchaseOrder.id == po_id)
+        (await _tenant_po_query(po_id)).options(
+            selectinload(PurchaseOrder.supplier), selectinload(PurchaseOrder.lines)
+        )
     )
     po = res.scalar_one_or_none()
     if not po:

@@ -3,20 +3,53 @@ import { useState, useEffect } from "react";
 const SA_API = (import.meta.env.VITE_API_URL || "http://localhost:8000") + "/api/v1/super-admin";
 const CAT_API = (import.meta.env.VITE_API_URL || "http://localhost:8000") + "/api/v1/catalog";
 
-function saFetch(path, method = "GET", body = null, token = "") {
-  return fetch(SA_API + path, {
-    method,
-    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: body ? JSON.stringify(body) : null,
-  }).then((r) => r.json());
+// إصلاح: النسخة القديمة كانت تعمل .then(r => r.json()) بدون أي معالجة —
+// أي خطأ شبكة، أو استجابة بدون JSON (500 من الخادم، انقطاع الاتصال...)
+// كان بيرمي استثناء غير ملتقط في الدوال المستدعية (خصوصاً اللي مفيهاش
+// try/catch أصلاً)، فتفضل شاشة "جاري التحميل..." أو الأزرار عالقة للأبد.
+// دلوقتي: أي فشل شبكة/تحليل بيرجع { detail } بدل ما يرمي، وأي 401 بيبعت
+// حدث لتسجيل خروج تلقائي من لوحة Super Admin (نفس فكرة session-expired
+// في باقي التطبيق).
+async function saFetch(path, method = "GET", body = null, token = "") {
+  let res;
+  try {
+    res = await fetch(SA_API + path, {
+      method,
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body ? JSON.stringify(body) : null,
+    });
+  } catch {
+    return { detail: "تعذر الاتصال بالخادم" };
+  }
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent("erp:sa-session-expired"));
+  }
+  try {
+    return await res.json();
+  } catch {
+    return res.ok ? {} : { detail: `خطأ في الخادم (${res.status})` };
+  }
 }
 
-function catFetch(path, method = "GET", body = null, token = "") {
-  return fetch(CAT_API + path, {
-    method,
-    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: body ? JSON.stringify(body) : null,
-  }).then((r) => r.json());
+async function catFetch(path, method = "GET", body = null, token = "") {
+  let res;
+  try {
+    res = await fetch(CAT_API + path, {
+      method,
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body ? JSON.stringify(body) : null,
+    });
+  } catch {
+    return { detail: "تعذر الاتصال بالخادم" };
+  }
+  if (res.status === 401) {
+    window.dispatchEvent(new CustomEvent("erp:sa-session-expired"));
+  }
+  try {
+    return await res.json();
+  } catch {
+    return res.ok ? {} : { detail: `خطأ في الخادم (${res.status})` };
+  }
 }
 
 const ICONS = { 'حديد وصلب':'🔩','ألمونيوم':'🪨','نحاس':'🟡','بلاستيك وبولي':'🟠','كيماويات':'🧪','كهرباء':'⚡','موتورات':'⚙️','أدوات':'🔧','عام':'📦' };
@@ -55,6 +88,15 @@ export default function SuperAdmin() {
     if (token && tab === "catalog") loadCatalog();
   }, [catQ]);
 
+  // إصلاح: جلسة Super Admin (sa_token) لم تكن تُعالَج عند انتهائها/رفضها —
+  // أي طلب يرجع 401 كان بيفضل يفشل بصمت. دلوقتي أي 401 من saFetch/catFetch
+  // بيبعت الحدث ده فنسجل خروج تلقائي ونرجّع المستخدم لشاشة الدخول.
+  useEffect(() => {
+    const h = () => logout();
+    window.addEventListener("erp:sa-session-expired", h);
+    return () => window.removeEventListener("erp:sa-session-expired", h);
+  }, []);
+
   async function login(e) {
     e.preventDefault();
     setLoginErr("");
@@ -72,20 +114,30 @@ export default function SuperAdmin() {
   }
 
   async function loadWorkshops() {
+    // إصلاح: setLoading(false) كان بعد الـ await مباشرة بدون finally —
+    // أي خطأ (شبكة، JSON غير صالح) كان يوقف التنفيذ وتفضل الشاشة "جاري
+    // التحميل..." للأبد. saFetch نفسه بقى مايرميش استثناء، لكن نضيف
+    // finally دفاعياً برضه.
     setLoading(true);
-    const res = await saFetch("/workshops", "GET", null, token);
-    setLoading(false);
-    if (Array.isArray(res)) setWorkshops(res);
+    try {
+      const res = await saFetch("/workshops", "GET", null, token);
+      if (Array.isArray(res)) setWorkshops(res);
+      else if (res?.detail) setMsg(`❌ ${res.detail}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function toggleWorkshop(id) {
-    await saFetch(`/workshops/${id}/toggle`, "PUT", null, token);
+    const res = await saFetch(`/workshops/${id}/toggle`, "PUT", null, token);
+    if (res?.detail && !res?.message) { setMsg(`❌ ${res.detail}`); return; }
     loadWorkshops();
   }
 
   async function deleteWorkshop(id, name) {
     if (!confirm(`هل أنت متأكد من حذف ورشة "${name}"؟ هذا الإجراء لا يمكن التراجع عنه.`)) return;
-    await saFetch(`/workshops/${id}`, "DELETE", null, token);
+    const res = await saFetch(`/workshops/${id}`, "DELETE", null, token);
+    if (res?.detail && !res?.message) { setMsg(`❌ ${res.detail}`); return; }
     loadWorkshops();
   }
 
@@ -111,20 +163,25 @@ export default function SuperAdmin() {
 
   // ── Catalog functions ──────────────────────────────────────
   async function loadCatalog() {
+    // إصلاح: كان بيستخدم fetch مباشرة (بدون التحقق من 401) بدل catFetch
+    // الموحّدة — يعني لو التوكن انتهى هنا تحديدًا، الصفحة كانت تفشل بصمت
+    // بدون أي تسجيل خروج تلقائي زي باقي الأماكن.
     setCatLoading(true);
-    const params = new URLSearchParams();
-    if (catQ) params.append("q", catQ);
-    params.append("limit", "200");
-    const res = await fetch(`${CAT_API}?${params}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    }).then(r => r.json()).catch(() => {
-      window.dispatchEvent(new CustomEvent('erp:toast', {
-        detail: { msg: 'تعذّر تحميل الكتالوج', type: 'warn' },
-      }))
-      return []
-    });
-    setCatLoading(false);
-    if (Array.isArray(res)) setCatItems(res);
+    try {
+      const params = new URLSearchParams();
+      if (catQ) params.append("q", catQ);
+      params.append("limit", "200");
+      const res = await catFetch(`?${params}`, "GET", null, token);
+      if (Array.isArray(res)) {
+        setCatItems(res);
+      } else {
+        window.dispatchEvent(new CustomEvent('erp:toast', {
+          detail: { msg: res?.detail || 'تعذّر تحميل الكتالوج', type: 'warn' },
+        }))
+      }
+    } finally {
+      setCatLoading(false);
+    }
   }
 
   function openAddItem() {
@@ -161,7 +218,8 @@ export default function SuperAdmin() {
 
   async function deleteItem(id, name) {
     if (!confirm(`حذف "${name}" من الكتالوج؟`)) return;
-    await catFetch(`/${id}`, "DELETE", null, token);
+    const res = await catFetch(`/${id}`, "DELETE", null, token);
+    if (res?.detail && !res?.message) { setCatMsg(`❌ ${res.detail}`); return; }
     loadCatalog();
   }
 

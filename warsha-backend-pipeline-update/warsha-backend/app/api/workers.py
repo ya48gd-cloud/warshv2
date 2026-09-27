@@ -14,12 +14,18 @@ from app.models.models import Worker, PayrollRun, PayrollLine, Attendance, Worke
 router = APIRouter(prefix="/workers", tags=["workers"], dependencies=[Depends(require_any)])
 
 
-async def _next_worker_code(db: AsyncSession) -> str:
-    count = await db.scalar(select(func.count()).select_from(Worker))
+async def _next_worker_code(db: AsyncSession, tenant_id: int) -> str:
+    # لازم يتحسب لكل مستأجر (tenant) على حدة — غير كده تظهر أكواد غريبة/غير
+    # متسلسلة لأي عميل جديد بمجرد وجود عملاء آخرين بعدد عمال أكبر.
+    count = await db.scalar(
+        select(func.count()).select_from(Worker).where(Worker.tenant_id == tenant_id)
+    )
     n = (count or 0) + 1
     while True:
         code = f"EMP-{n:04d}"
-        exists = await db.scalar(select(Worker.id).where(Worker.code == code))
+        exists = await db.scalar(
+            select(Worker.id).where(Worker.code == code, Worker.tenant_id == tenant_id)
+        )
         if not exists:
             return code
         n += 1
@@ -51,12 +57,15 @@ def wd(w): return {"id":w.id,"code":w.code,"name":w.name,"job_title":w.job_title
 
 @router.get("")
 async def list_workers(db: AsyncSession = Depends(get_db)):
-    r = await db.execute(select(Worker).where(Worker.is_active==True).order_by(Worker.name))
+    from app.core.database import current_tenant_id as _ctid_lw
+    tid = _ctid_lw.get() or 1
+    r = await db.execute(select(Worker).where(Worker.is_active==True, Worker.tenant_id==tid).order_by(Worker.name))
     return [wd(w) for w in r.scalars().all()]
 
 @router.get("/next-code")
 async def get_next_worker_code(db: AsyncSession = Depends(get_db)):
-    return {"code": await _next_worker_code(db)}
+    from app.core.database import current_tenant_id as _ctid_nc
+    return {"code": await _next_worker_code(db, _ctid_nc.get() or 1)}
 
 
 @router.post("", status_code=201)
@@ -66,18 +75,20 @@ async def create_worker(data: WorkerIn, db: AsyncSession = Depends(get_db)):
     if data.hire_date and data.contract_end_date and data.contract_end_date < data.hire_date:
         raise HTTPException(400, "تاريخ نهاية العقد يجب أن يكون بعد تاريخ التعيين")
     from app.core.database import current_tenant_id as _ctid_wrk
+    tid = _ctid_wrk.get() or 1
     d = data.model_dump()
-    d['code'] = d.get('code') or await _next_worker_code(db)
+    d['code'] = d.get('code') or await _next_worker_code(db, tid)
     # base_weekly_wage = daily_wage × 6 تلقائياً
     d['base_weekly_wage'] = data.daily_wage * 6
-    d['tenant_id'] = _ctid_wrk.get() or 1
+    d['tenant_id'] = tid
     w = Worker(**d)
     db.add(w); await db.commit(); await db.refresh(w); return wd(w)
 
 @router.put("/{wid}")
 async def update_worker(wid: int, data: WorkerIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_uw
     w = await db.get(Worker, wid)
-    if not w: raise HTTPException(404)
+    if not w or w.tenant_id != (_ctid_uw.get() or 1): raise HTTPException(404)
     if data.daily_wage is None or data.daily_wage <= 0:
         raise HTTPException(400, "الأجر اليومي يجب أن يكون أكبر من صفر")
     if data.hire_date and data.contract_end_date and data.contract_end_date < data.hire_date:
@@ -91,8 +102,9 @@ async def update_worker(wid: int, data: WorkerIn, db: AsyncSession = Depends(get
 
 @router.delete("/{wid}")
 async def deactivate(wid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dw
     w = await db.get(Worker, wid)
-    if not w: raise HTTPException(404)
+    if not w or w.tenant_id != (_ctid_dw.get() or 1): raise HTTPException(404)
     w.is_active = False; await db.commit(); return {"message":"تم التعطيل"}
 
 # ── Advances ───────────────────────────────────────────────────
@@ -126,8 +138,9 @@ async def add_advance(data: AdvanceIn, db: AsyncSession = Depends(get_db)):
 
 @router.delete("/advances/{aid}")
 async def del_advance(aid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_da
     a = await db.get(WorkerAdvance, aid)
-    if not a: raise HTTPException(404)
+    if not a or a.tenant_id != (_ctid_da.get() or 1): raise HTTPException(404)
     from app.models.models import TreasuryTransaction, Treasury
     txn = (await db.execute(
         select(TreasuryTransaction).where(
@@ -145,7 +158,11 @@ async def del_advance(aid: int, db: AsyncSession = Depends(get_db)):
 # ── Payroll ────────────────────────────────────────────────────
 @router.get("/payroll")
 async def list_payroll(db: AsyncSession = Depends(get_db)):
-    r = await db.execute(select(PayrollRun).order_by(PayrollRun.week_start.desc()).limit(20))
+    from app.core.database import current_tenant_id as _ctid_lp
+    tid = _ctid_lp.get() or 1
+    r = await db.execute(
+        select(PayrollRun).where(PayrollRun.tenant_id == tid).order_by(PayrollRun.week_start.desc()).limit(20)
+    )
     runs = r.scalars().all()
     # احسب عدد العمال لكل كشف
     result = []
@@ -181,29 +198,36 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
     - لو العامل كان حضوره on_project يوم ما → يتحسب بأجر المشروع (daily_rate)
     - لو كان حضوره present في الورشة → يتحسب بأجر الأساسي (daily_wage)
     """
+    from app.core.database import current_tenant_id as _ctid_gen
+    tid = _ctid_gen.get() or 1
     run = await db.get(PayrollRun, run_id)
-    if not run: raise HTTPException(404)
+    if not run or run.tenant_id != tid: raise HTTPException(404)
     if run.status == "paid":
         raise HTTPException(400, "لا يمكن إعادة توليد كشف مصروف بالفعل")
 
-    workers = (await db.execute(select(Worker).where(Worker.is_active==True))).scalars().all()
+    workers = (await db.execute(
+        select(Worker).where(Worker.is_active==True, Worker.tenant_id==tid)
+    )).scalars().all()
 
     # جلب كل سجلات الحضور في الأسبوع
     att_recs = (await db.execute(
         select(Attendance).where(
             Attendance.date >= run.week_start,
             Attendance.date <= run.week_end,
+            Attendance.tenant_id == tid,
         )
     )).scalars().all()
 
     # جلب أعضاء المشاريع الخارجية النشطة لمعرفة الأجر اليومي
     # ext_project_id → worker_id → daily_rate
-    ext_members = (await db.execute(select(ExtProjectMember))).scalars().all()
+    ext_members = (await db.execute(
+        select(ExtProjectMember).where(ExtProjectMember.tenant_id == tid)
+    )).scalars().all()
     project_rates: dict[tuple, Decimal] = {
         (m.project_id, m.worker_id): m.daily_rate for m in ext_members
     }
 
-    # بناء att_map: worker_id → {days_workshop, days_project, gross_project}
+    # بناء att_map: worker_id → {days_workshop, days_project, gross_project, overtime_hours}
     att_map: dict[int, dict] = {}
     for a in att_recs:
         if a.worker_id not in att_map:
@@ -211,7 +235,10 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
                 "days_workshop": Decimal("0"),
                 "days_project": Decimal("0"),
                 "gross_project": Decimal("0"),
+                "overtime_hours": Decimal("0"),
             }
+        # ساعات العمل الإضافي تُحسب بصرف النظر عن حالة اليوم (تُدفع بأجر الورشة الأساسي)
+        att_map[a.worker_id]["overtime_hours"] += (a.overtime_hours or Decimal("0"))
         if a.status == "present":
             att_map[a.worker_id]["days_workshop"] += Decimal("1")
         elif a.status == "half":
@@ -232,7 +259,7 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
 
     # السلف والمكافآت
     adv_recs = (await db.execute(
-        select(WorkerAdvance).where(WorkerAdvance.is_settled == False)
+        select(WorkerAdvance).where(WorkerAdvance.is_settled == False, WorkerAdvance.tenant_id == tid)
     )).scalars().all()
     adv_map: dict[int, dict] = {}
     for a in adv_recs:
@@ -243,7 +270,7 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
 
     # حذف البنود القديمة وإعادة الحساب
     old = (await db.execute(
-        select(PayrollLine).where(PayrollLine.payroll_run_id == run_id)
+        select(PayrollLine).where(PayrollLine.payroll_run_id == run_id, PayrollLine.tenant_id == tid)
     )).scalars().all()
     for l in old: await db.delete(l)
 
@@ -255,9 +282,12 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
             "days_workshop": Decimal("0"),
             "days_project": Decimal("0"),
             "gross_project": Decimal("0"),
+            "overtime_hours": Decimal("0"),
         })
-        # الأجر الأساسي × أيام الورشة + أجر المشروع × أيام المشروع
-        gross_workshop = (w.daily_wage or Decimal("0")) * info["days_workshop"]
+        # الأجر الأساسي × أيام الورشة + أجر الساعات الإضافية (بسعر الساعة = يومية/8) + أجر المشروع × أيام المشروع
+        overtime_hours = info.get("overtime_hours", Decimal("0"))
+        overtime_pay   = (w.daily_wage or Decimal("0")) * overtime_hours / Decimal("8")
+        gross_workshop = (w.daily_wage or Decimal("0")) * info["days_workshop"] + overtime_pay
         gross_project  = info["gross_project"]
         gross          = gross_workshop + gross_project
         total_days     = info["days_workshop"] + info["days_project"]
@@ -271,10 +301,12 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
         if info["days_project"] > 0:
             notes = (f"ورشة: {float(info['days_workshop'])} يوم × {float(w.daily_wage)} ج"
                      f" | مشاريع: {float(info['days_project'])} يوم × {float(gross_project/info['days_project'] if info['days_project'] else 0):.0f} ج")
+        if overtime_hours > 0:
+            ot_note = f"إضافي: {float(overtime_hours)} ساعة × {float((w.daily_wage or Decimal('0'))/8):.2f} ج = {float(overtime_pay):.2f} ج"
+            notes = f"{notes} | {ot_note}" if notes else ot_note
 
-        from app.core.database import current_tenant_id as _ctid_pl
         db.add(PayrollLine(
-            tenant_id=_ctid_pl.get() or 1,
+            tenant_id=tid,
             payroll_run_id=run_id, worker_id=w.id,
             days_worked=total_days,
             gross_amount=gross, bonus=ai["b"], deductions=deductible,
@@ -296,6 +328,8 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
             "worker": w.name,
             "days_workshop": float(info["days_workshop"]),
             "days_project": float(info["days_project"]),
+            "overtime_hours": float(overtime_hours),
+            "overtime_pay": float(overtime_pay),
             "gross_workshop": float(gross_workshop),
             "gross_project": float(gross_project),
             "total_gross": float(gross),
@@ -318,8 +352,10 @@ async def pay_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
     صرف الرواتب: يُنفَّذ بعد توليد الكشف ومراجعته.
     يسجل القيد المحاسبي وحركة الخزنة (صادر) ويعلّم الكشف كمصروف.
     """
+    from app.core.database import current_tenant_id as _ctid_pr
+    _tid_pr = _ctid_pr.get() or 1
     run = await db.get(PayrollRun, run_id)
-    if not run: raise HTTPException(404)
+    if not run or run.tenant_id != _tid_pr: raise HTTPException(404)
     if run.status == "paid":
         raise HTTPException(400, "هذا الكشف مصروف بالفعل")
 
@@ -330,8 +366,6 @@ async def pay_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, "لا يمكن صرف كشف لم يتم توليده بعد")
 
     import datetime as _dt
-    from app.core.database import current_tenant_id as _ctid_pr
-    _tid_pr = _ctid_pr.get() or 1
     run_code = f"PAY-{run_id}-{run.week_start}"
     pay_date = run.week_end or _dt.date.today()
 
@@ -377,8 +411,9 @@ async def pay_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/payroll/{run_id}")
 async def get_payroll_detail(run_id: int, db: AsyncSession = Depends(get_db)):
     """تفاصيل كشف الرواتب — العمال + الأيام + الإجمالي + الصافي"""
+    from app.core.database import current_tenant_id as _ctid_gpd
     run = await db.get(PayrollRun, run_id)
-    if not run: raise HTTPException(404)
+    if not run or run.tenant_id != (_ctid_gpd.get() or 1): raise HTTPException(404)
     lines_r = await db.execute(
         select(PayrollLine)
         .options(selectinload(PayrollLine.worker))
@@ -414,8 +449,9 @@ async def get_payroll_detail(run_id: int, db: AsyncSession = Depends(get_db)):
 @router.delete("/payroll/{run_id}")
 async def delete_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
     from sqlalchemy import select as sa_select
+    from app.core.database import current_tenant_id as _ctid_dpr
     run = await db.get(PayrollRun, run_id)
-    if not run: raise HTTPException(404)
+    if not run or run.tenant_id != (_ctid_dpr.get() or 1): raise HTTPException(404)
     if run.status == "paid": raise HTTPException(400, "لا يمكن حذف كشف مصروف")
     # أعد تفعيل السلف المرتبطة
     settled_advances = (await db.execute(
@@ -433,8 +469,10 @@ async def delete_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{wid}/profile")
 async def worker_profile(wid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_wp
+    tid = _ctid_wp.get() or 1
     w = await db.get(Worker, wid)
-    if not w: raise HTTPException(404)
+    if not w or w.tenant_id != tid: raise HTTPException(404)
     advances = (await db.execute(
         select(WorkerAdvance).where(WorkerAdvance.worker_id == wid).order_by(WorkerAdvance.date.desc())
     )).scalars().all()

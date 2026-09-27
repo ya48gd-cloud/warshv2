@@ -888,6 +888,29 @@ async def test_credit_limit_zero_means_no_limit(cli):
 
 
 @pytest.mark.asyncio
+async def test_credit_limit_enforced_on_invoice_update(cli):
+    """إصلاح: تعديل فاتورة (PUT) كان الطريق الوحيد لتجاوز حد الائتمان من غير
+    أي تحقق — عميل حده 1000 وعنده فاتورة 500 لا يمكن تعديلها لتصبح 1500."""
+    r = await cli.post(CUST_BASE, json={"name": "عميل حد تعديل", "phone": "0504444444", "credit_limit": 1000.0})
+    cid = r.json()["id"]
+    inv = _inv_payload(cid)
+    inv["lines"] = [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 500.0}]
+    r1 = await cli.post(f"{BASE}/invoices", json=inv)
+    assert r1.status_code == 201, r1.text
+    iid = r1.json()["id"]
+
+    upd = _inv_payload(cid)
+    upd["lines"] = [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 1500.0}]
+    r2 = await cli.put(f"{BASE}/invoices/{iid}", json=upd)
+    assert r2.status_code == 400
+    assert "حد الائتمان" in r2.json()["detail"]
+
+    # اتأكد إن الفاتورة القديمة والرصيد ما اتغيّروش بعد الرفض
+    inv_after = (await cli.get(f"{BASE}/invoices/{iid}")).json()
+    assert inv_after["total"] == 500.0
+
+
+@pytest.mark.asyncio
 async def test_credit_limit_allows_invoice_within_limit(cli):
     """عميل حد ائتمانه 5000 ورصيده 0 → فاتورة 3000 مقبولة."""
     r = await cli.post(CUST_BASE, json={"name": "عميل مسموح", "phone": "0503333333", "credit_limit": 5000.0})
@@ -1205,3 +1228,74 @@ async def test_patch_installment_due_date_resyncs_invoice(cli):
     assert inv["due_date"] == new_d, (
         f"توقعنا due_date={new_d} بعد تعديل القسط، لقينا {inv['due_date']}"
     )
+
+
+# ════════════════ CREDIT NOTES ↔ INVOICE INTEGRATION ═════════════════════════
+# إصلاح ثغرة تكامل: إصدار إشعار دائن على فاتورة كان يخفّض رصيد العميل فقط من
+# غير ما يمس paid_amount/status بتاعت الفاتورة نفسها، فتفضل الفاتورة تظهر
+# "غير مدفوعة" بكامل قيمتها في كل التقارير رغم إن العميل رجّع البضاعة.
+CN_BASE = "/api/v1/credit-notes"
+
+
+@pytest.mark.asyncio
+async def test_credit_note_issue_settles_linked_invoice(cli):
+    cid = await _make_customer(cli)
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))
+    iid = r.json()["id"]
+    assert r.json()["total"] == 500.0
+
+    cn_payload = {
+        "customer_id": cid,
+        "invoice_id": iid,
+        "date": str(date.today()),
+        "return_type": "partial",
+        "lines": [{"description": "بند 1", "qty": 1, "unit": "قطعة", "unit_price": 200.0}],
+    }
+    r_cn = await cli.post(CN_BASE, json=cn_payload)
+    assert r_cn.status_code == 201, r_cn.text
+    cn_id = r_cn.json()["id"]
+    assert r_cn.json()["total"] == 200.0
+
+    r_issue = await cli.patch(f"{CN_BASE}/{cn_id}/issue")
+    assert r_issue.status_code == 200, r_issue.text
+    assert r_issue.json()["applied_to_invoice"] == 200.0
+
+    inv = (await cli.get(f"{BASE}/invoices/{iid}")).json()
+    assert inv["paid_amount"] == 200.0
+    assert inv["remaining"] == 300.0
+    assert inv["status"] == "partial"
+
+    # إلغاء الإشعار يعكس التسوية على الفاتورة
+    r_cancel = await cli.patch(f"{CN_BASE}/{cn_id}/cancel")
+    assert r_cancel.status_code == 200, r_cancel.text
+
+    inv2 = (await cli.get(f"{BASE}/invoices/{iid}")).json()
+    assert inv2["paid_amount"] == 0.0
+    assert inv2["status"] == "unpaid"
+
+
+@pytest.mark.asyncio
+async def test_credit_note_issue_already_fully_paid_invoice_only_affects_balance(cli):
+    """لو الفاتورة متسددة بالكامل بالفعل، إصدار إشعار دائن مايزودش paid_amount
+    فوق الإجمالي — يأثر على رصيد العميل بس (يبقى المتجر مديون له)."""
+    cid = await _make_customer(cli)
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))
+    iid = r.json()["id"]
+    await cli.post(f"{BASE}/invoices/{iid}/payment", json={"amount": 500.0})
+
+    cn_payload = {
+        "customer_id": cid,
+        "invoice_id": iid,
+        "date": str(date.today()),
+        "return_type": "full",
+        "lines": [{"description": "بند 1", "qty": 1, "unit": "قطعة", "unit_price": 500.0}],
+    }
+    r_cn = await cli.post(CN_BASE, json=cn_payload)
+    cn_id = r_cn.json()["id"]
+    r_issue = await cli.patch(f"{CN_BASE}/{cn_id}/issue")
+    assert r_issue.status_code == 200
+    assert r_issue.json()["applied_to_invoice"] == 0.0
+
+    inv = (await cli.get(f"{BASE}/invoices/{iid}")).json()
+    assert inv["paid_amount"] == 500.0
+    assert inv["status"] == "paid"

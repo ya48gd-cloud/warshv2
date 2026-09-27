@@ -93,7 +93,10 @@ async def list_root_equipment(db: AsyncSession = Depends(get_db)):
 @router.get("/list-all")
 async def list_all_equipment(db: AsyncSession = Depends(get_db)):
     """Flat list of all equipment — used by dropdowns."""
-    result = await db.execute(select(Equipment).order_by(Equipment.level, Equipment.id))
+    from app.core.database import current_tenant_id as _ctid_lae
+    result = await db.execute(
+        select(Equipment).where(Equipment.tenant_id == (_ctid_lae.get() or 1)).order_by(Equipment.level, Equipment.id)
+    )
     eqs = result.scalars().all()
     return [{"id": e.id, "code": e.code, "name_ar": e.name_ar,
              "name_en": e.name_en, "level": e.level, "parent_id": e.parent_id,
@@ -110,7 +113,11 @@ async def list_all_equipment(db: AsyncSession = Depends(get_db)):
 @router.get("/categories/list")
 async def list_equipment_categories(db: AsyncSession = Depends(get_db)):
     from sqlalchemy import func
-    result = await db.execute(select(EquipmentCategory).order_by(EquipmentCategory.name_ar))
+    from app.core.database import current_tenant_id as _ctid_lec
+    tid = _ctid_lec.get() or 1
+    result = await db.execute(
+        select(EquipmentCategory).where(EquipmentCategory.tenant_id == tid).order_by(EquipmentCategory.name_ar)
+    )
     cats = result.scalars().all()
     out = []
     for c in cats:
@@ -125,10 +132,12 @@ async def create_equipment_category(data: dict, db: AsyncSession = Depends(get_d
     name_ar = (data.get("name_ar") or "").strip()
     if not name_ar:
         raise HTTPException(400, "اسم التصنيف مطلوب")
-    existing = await db.execute(select(EquipmentCategory).where(EquipmentCategory.name_ar == name_ar))
+    tid = current_tenant_id.get() or 1
+    existing = await db.execute(
+        select(EquipmentCategory).where(EquipmentCategory.name_ar == name_ar, EquipmentCategory.tenant_id == tid)
+    )
     if existing.scalar_one_or_none():
         raise HTTPException(409, "التصنيف موجود بالفعل")
-    tid = current_tenant_id.get() or 1
     cat = EquipmentCategory(tenant_id=tid, name_ar=name_ar, name_en=(data.get("name_en") or name_ar).strip())
     db.add(cat)
     await db.commit()
@@ -139,8 +148,9 @@ async def create_equipment_category(data: dict, db: AsyncSession = Depends(get_d
 @router.delete("/categories/{category_id}", status_code=204)
 async def delete_equipment_category(category_id: int, db: AsyncSession = Depends(get_db)):
     from sqlalchemy import func
+    from app.core.database import current_tenant_id as _ctid_dec
     cat = await db.get(EquipmentCategory, category_id)
-    if not cat:
+    if not cat or cat.tenant_id != (_ctid_dec.get() or 1):
         raise HTTPException(404, "التصنيف غير موجود")
     cnt = await db.execute(select(func.count()).select_from(Equipment).where(Equipment.category_id == category_id))
     if (cnt.scalar() or 0) > 0:
@@ -172,8 +182,9 @@ async def get_equipment_tree(eq_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.put("/{eq_id}")
 async def update_equipment(eq_id: int, data: EquipmentCreate, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ue
     eq = await db.get(Equipment, eq_id)
-    if not eq:
+    if not eq or eq.tenant_id != (_ctid_ue.get() or 1):
         raise HTTPException(404, "Equipment not found")
     try:
         payload = data.model_dump(exclude_unset=False)
@@ -209,8 +220,9 @@ async def update_equipment(eq_id: int, data: EquipmentCreate, db: AsyncSession =
 
 @router.patch("/{eq_id}/description")
 async def update_equipment_description(eq_id: int, body: dict, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ued
     eq = await db.get(Equipment, eq_id)
-    if not eq:
+    if not eq or eq.tenant_id != (_ctid_ued.get() or 1):
         raise HTTPException(404, "Equipment not found")
     eq.description = body.get("description") or None
     await db.commit()
@@ -221,8 +233,9 @@ async def update_equipment_description(eq_id: int, body: dict, db: AsyncSession 
 async def delete_equipment(eq_id: int, db: AsyncSession = Depends(get_db)):
     import os
     from pathlib import Path
+    from app.core.database import current_tenant_id as _ctid_de
     eq = await db.get(Equipment, eq_id)
-    if not eq:
+    if not eq or eq.tenant_id != (_ctid_de.get() or 1):
         raise HTTPException(404, "Equipment not found")
 
     # Delete CAD files from disk

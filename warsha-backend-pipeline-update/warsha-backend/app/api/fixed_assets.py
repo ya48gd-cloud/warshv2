@@ -225,6 +225,8 @@ async def record_depreciation(asset_id: int, data: DepreciationIn, db: AsyncSess
         source="fixed_asset_depreciation",
         source_id=asset_id,
         posted=True,
+        period_year=data.period_year,
+        period_month=data.period_month,
     )
     db.add(entry)
     await db.flush()

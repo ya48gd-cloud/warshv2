@@ -19,7 +19,7 @@ from app.models.models import (
     WorkOrderMember, Worker,
 )
 from app.services.production import (
-    auto_reserve_materials, issue_material,
+    auto_reserve_materials, reserve_single_material, issue_material,
     record_scrap, complete_work_order, run_mrp, get_smart_alerts,
     get_scrap_inventory, create_scrap_sale,
     get_equipment_pipeline, get_equipment_pipeline_detail,
@@ -65,6 +65,11 @@ class ScrapSaleIn(BaseModel):
     lines:          List[ScrapSaleLineIn]
 
 
+class ManualReserveIn(BaseModel):
+    material_id: int
+    qty:         Decimal
+
+
 class BinLocationIn(BaseModel):
     code:        str
     name_ar:     Optional[str] = None
@@ -80,8 +85,9 @@ class BinLocationIn(BaseModel):
 @router.get("/alerts")
 async def production_alerts(db: AsyncSession = Depends(get_db)):
     """تنبيهات الإنتاج الذكية — يرجّع list دايماً"""
+    from app.core.database import current_tenant_id as _ctid_alerts
     try:
-        result = await get_smart_alerts(db)
+        result = await get_smart_alerts(db, _ctid_alerts.get() or 1)
         return result if isinstance(result, list) else []
     except Exception:
         return []
@@ -132,10 +138,27 @@ async def production_pipeline_backfill(dry_run: bool = True, db: AsyncSession = 
 @router.post("/reserve/{work_order_id}")
 async def reserve_materials(
     work_order_id: int,
+    data: Optional[ManualReserveIn] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """حجز مواد أوتوماتيك من BOM عند بدء أمر الإنتاج"""
-    result = await auto_reserve_materials(db, work_order_id)
+    """
+    حجز مواد لأمر الإنتاج.
+
+    محطة 27 (تصليح جذري): كان هذا الـendpoint نسخة مطابقة تمامًا لـ
+    /auto-reserve/{id} — بيتجاهل أي جسم مُرسَل ويعيد حجز كل بنود BOM من
+    الصفر (ويمسح أي حجوزات سابقة، حتى لو اتصرف منها شيء فعليًا)، بينما
+    شاشة "الحجز اليدوي" في الواجهة كانت بترسل {material_id, qty} تُتجاهل
+    بالكامل — عقد مكسور بين الواجهة والـbackend.
+
+    الآن: جسم فيه material_id/qty → حجز يدوي لهذه المادة بالذات بالكمية
+    المطلوبة، من غير أي أثر على حجوزات باقي المواد لنفس الأمر. من غير
+    جسم (أو جسم فاضي) → نفس السلوك القديم (حجز كل بنود BOM دفعة واحدة)
+    توافقًا خلفيًا مع أي استدعاء موجود بالفعل بيعتمد على السلوك ده.
+    """
+    if data is not None:
+        result = await reserve_single_material(db, work_order_id, data.material_id, data.qty)
+    else:
+        result = await auto_reserve_materials(db, work_order_id)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
@@ -235,7 +258,8 @@ async def record_scrap_endpoint(data: ScrapIn, db: AsyncSession = Depends(get_db
 @router.get("/scrap/inventory")
 async def scrap_inventory_endpoint(db: AsyncSession = Depends(get_db)):
     """مخزون الهالك المتاح للبيع (مجمّع لكل مادة)"""
-    return await get_scrap_inventory(db)
+    from app.core.database import current_tenant_id as _ctid_sci_ep
+    return await get_scrap_inventory(db, _ctid_sci_ep.get() or 1)
 
 
 @router.post("/scrap-sales")
@@ -385,19 +409,22 @@ async def scrap_report(db: AsyncSession = Depends(get_db)):
 @router.get("/mrp/suggestions")
 async def get_mrp_suggestions(db: AsyncSession = Depends(get_db)):
     """اقتراحات المشتريات من محرك MRP"""
-    return await run_mrp(db)
+    from app.core.database import current_tenant_id as _ctid_mrp_ep1
+    return await run_mrp(db, _ctid_mrp_ep1.get() or 1)
 
 
 @router.get("/mrp")
 async def get_mrp_alias(db: AsyncSession = Depends(get_db)):
     """Alias for /mrp/suggestions"""
-    return await run_mrp(db)
+    from app.core.database import current_tenant_id as _ctid_mrp_ep2
+    return await run_mrp(db, _ctid_mrp_ep2.get() or 1)
 
 
 @router.post("/mrp/run")
 async def run_mrp_endpoint(db: AsyncSession = Depends(get_db)):
     """تشغيل محرك MRP وإرجاع الاقتراحات"""
-    return await run_mrp(db)
+    from app.core.database import current_tenant_id as _ctid_mrp_ep3
+    return await run_mrp(db, _ctid_mrp_ep3.get() or 1)
 
 
 @router.post("/mrp/{suggestion_id}/approve")

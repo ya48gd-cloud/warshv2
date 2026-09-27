@@ -554,12 +554,20 @@ function DimensionsTab({ eq, write }) {
   const toast = useToast()
   const { data, loading, reload } = useApi(() => api.get(`/equipment/${eq.id}`), [eq.id])
   const [form, setForm] = useState({ dim_key: '', dim_value: '', unit: 'mm' })
+  const [confirmDimDel, setConfirmDimDel] = useState(null)
 
   const [addDim, adding] = useAction(async () => {
     if (!form.dim_key || !form.dim_value) { toast('اسم وقيمة المقاس مطلوبان', 'error'); return }
     await api.post(`/equipment/${eq.id}/dimensions?dim_key=${encodeURIComponent(form.dim_key)}&dim_value=${encodeURIComponent(form.dim_value)}&unit=${encodeURIComponent(form.unit)}`, {})
     toast('تمت الإضافة')
     setForm({ dim_key: '', dim_value: '', unit: 'mm' })
+    reload()
+  })
+
+  const [delDim] = useAction(async (id) => {
+    await api.equipment.deleteDimension(id)
+    toast('تم الحذف')
+    setConfirmDimDel(null)
     reload()
   })
 
@@ -587,21 +595,32 @@ function DimensionsTab({ eq, write }) {
       )}
       <div className="card p-0 overflow-hidden">
         <table className="erp-table">
-          <thead><tr><th>المقاس</th><th>القيمة</th><th>الوحدة</th></tr></thead>
+          <thead><tr><th>المقاس</th><th>القيمة</th><th>الوحدة</th>{write && <th></th>}</tr></thead>
           <tbody>
             {!dims.length && (
-              <tr><td colSpan={3} className="text-center text-erp-muted py-8">لا توجد مقاسات</td></tr>
+              <tr><td colSpan={write ? 4 : 3} className="text-center text-erp-muted py-8">لا توجد مقاسات</td></tr>
             )}
             {dims.map(d => (
               <tr key={d.id}>
                 <td className="font-medium">{d.dim_key}</td>
                 <td className="font-semibold">{d.dim_value}</td>
                 <td className="text-erp-muted text-xs">{d.unit}</td>
+                {write && (
+                  <td><button className="btn btn-sm btn-danger text-xs" onClick={() => setConfirmDimDel(d)}>🗑</button></td>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      <ConfirmDialog
+        open={!!confirmDimDel}
+        onClose={() => setConfirmDimDel(null)}
+        onConfirm={() => delDim(confirmDimDel?.id)}
+        title="حذف مقاس"
+        message={`حذف مقاس "${confirmDimDel?.dim_key}"؟`}
+        danger
+      />
     </div>
   )
 }
@@ -639,11 +658,12 @@ function CADTab({ eq }) {
   }
 
   const del = async (id) => {
-    const token = sessionStorage.getItem('erp_token')
     try {
-      await fetch(`/api/v1/cad/${id}`, { method:'DELETE', headers:{Authorization:`Bearer ${token}`} })
+      await api.delete(`/cad/${id}`)
       toast('تم حذف الملف')
-    } catch { toast('فشل الحذف', 'error') }
+    } catch (err) {
+      toast(err?.message || 'فشل الحذف', 'error')
+    }
     setConfirmCadDel(null)
     reload()
   }

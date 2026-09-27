@@ -43,6 +43,19 @@ class WRIn(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+def _add_months(d: date, months: int) -> date:
+    """يضيف عدد شهور لتاريخ مع التعامل الآمن مع نهايات الشهور (مثلاً 31 يناير
+    + شهر = 28/29 فبراير، مش خطأ ValueError زي ما كان بيحصل مع date.replace())."""
+    import calendar
+    if not months:
+        return d
+    total_month_index = d.month - 1 + months
+    year = d.year + total_month_index // 12
+    month = total_month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
 async def _next_code(db: AsyncSession) -> str:
     count = await db.scalar(select(func.count()).select_from(WarrantyCertificate))
     n = (count or 0) + 1
@@ -128,10 +141,7 @@ async def create_cert(data: WRIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
     code = await _next_code(db)
-    end = data.warranty_start.replace(
-        year=data.warranty_start.year + data.warranty_months // 12,
-        month=((data.warranty_start.month - 1 + data.warranty_months % 12) % 12) + 1,
-    ) if data.warranty_months else data.warranty_start
+    end = _add_months(data.warranty_start, data.warranty_months or 0)
 
     w = WarrantyCertificate(
         tenant_id=tid,

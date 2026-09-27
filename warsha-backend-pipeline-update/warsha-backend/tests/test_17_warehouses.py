@@ -98,6 +98,30 @@ async def test_update_warehouse(cli):
 
 
 @pytest.mark.asyncio
+async def test_update_default_warehouse_name_allowed_but_code_locked(cli):
+    """اسم مخزن أساسي ينفع يتعدّل، لكن كوده (RAW/WIP/...) لازم يفضل ثابت —
+    كود تاني في النظام (get_or_create_warehouse_bin وغيره) بيدوّر عليه بالاسم
+    الحرفي، فتغييره هيسيب مواقع تخزين يتيمة من غير حد يلاحظ."""
+    warehouses = (await cli.get(BASE)).json()
+    raw_wh = next(w for w in warehouses if w["code"] == "RAW")
+
+    # تغيير الاسم بس (نفس الكود) لازم يعدي عادي
+    r_name = await cli.put(f"{BASE}/{raw_wh['id']}", json={
+        "code": "RAW", "name_ar": "اسم جديد للخامات", "warehouse_type": raw_wh["warehouse_type"],
+    })
+    assert r_name.status_code == 200
+    assert r_name.json()["name_ar"] == "اسم جديد للخامات"
+
+    # محاولة تغيير الكود نفسه لازم تترفض
+    r_code = await cli.put(f"{BASE}/{raw_wh['id']}", json={
+        "code": "RAWX", "name_ar": "اسم جديد للخامات", "warehouse_type": raw_wh["warehouse_type"],
+    })
+    assert r_code.status_code == 400
+    still_there = (await cli.get(BASE)).json()
+    assert any(w["code"] == "RAW" for w in still_there)
+
+
+@pytest.mark.asyncio
 async def test_warehouses_isolated_per_tenant(cli, cli2):
     """مخزن مخصّص اتعمل لـ tenant1 مايظهرش عند tenant2."""
     await cli.post(BASE, json={"code": "ONLY_T1", "name_ar": "خاص بالمستأجر 1"})

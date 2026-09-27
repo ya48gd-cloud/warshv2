@@ -455,6 +455,12 @@ function VisitsTab({ order, write, onReload }) {
     onReload()
   })
 
+  const [removeAssignment] = useAction(async (assignmentId) => {
+    await api.fieldService.removeAssignment(order.id, assignmentId)
+    toast('تم إلغاء التعيين')
+    onReload()
+  })
+
   return (
     <div className="flex flex-col gap-4">
 
@@ -473,6 +479,14 @@ function VisitsTab({ order, write, onReload }) {
                 <div key={a.id} className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs"
                   style={{ background:'var(--blue-lt)', color:'var(--blue)' }}>
                   👷 {a.worker_name}
+                  {write && order.status !== 'completed' && order.status !== 'cancelled' && (
+                    <button
+                      className="text-xs leading-none"
+                      style={{ color:'var(--red)' }}
+                      title="إلغاء التعيين"
+                      onClick={() => { if (window.confirm(`إلغاء تعيين "${a.worker_name}"؟`)) removeAssignment(a.id) }}
+                    >✕</button>
+                  )}
                 </div>
               ))}
             </div>

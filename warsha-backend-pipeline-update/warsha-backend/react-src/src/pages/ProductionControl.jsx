@@ -271,6 +271,10 @@ function WOStagesCard({ wo }) {
                 <div className="flex flex-col gap-2">
                   {stageList.map((s, i) => {
                     const isCutting = s.stage_name.includes('قطع')
+                    // الباك-إند يمنع بدء مرحلة قبل إنهاء/تخطّي كل ما يسبقها بالترتيب (400 error).
+                    // بدل ما نسيب المستخدم يضغط "بدء" ويشوف رسالة خطأ بعد استدعاء الشبكة،
+                    // نعطّل الزر مقدماً ونوضّح السبب.
+                    const canStart = stageList.slice(0, i).every(st => st.status === 'done' || st.status === 'skipped')
                     return (
                     <div key={s.id} className="flex flex-col gap-2">
                     <div
@@ -302,8 +306,11 @@ function WOStagesCard({ wo }) {
                         )}
                         {s.status === 'pending' && (
                           <button className="btn btn-sm text-xs"
-                            style={{ background: 'var(--teal-lt)', color: 'var(--teal)' }}
-                            onClick={() => handleStart(s.id)} disabled={acting}>▶ بدء</button>
+                            style={canStart
+                              ? { background: 'var(--teal-lt)', color: 'var(--teal)' }
+                              : { background: 'var(--border)', color: 'var(--text-secondary)', cursor: 'not-allowed' }}
+                            onClick={() => handleStart(s.id)} disabled={acting || !canStart}
+                            title={canStart ? '' : 'أنهِ أو تخطَّ المراحل السابقة أولاً'}>▶ بدء</button>
                         )}
                         {s.status === 'in_progress' && (
                           <button className="btn btn-sm text-xs"
@@ -405,6 +412,10 @@ export default function ProductionControl() {
 
   const handleCreateSchedule = () => act(async () => {
     if (!schForm.work_order_id) { toast('اختر أمر الإنتاج', 'error'); return }
+    // الباك-إند يرفض التاريخين لو فاضيين (كلاهما مطلوب) أو لو النهاية قبل البداية —
+    // كنا بنسيب الرسالة الخام تظهر من الـ API. تحقق مبكر بدل رسالة validation مربكة.
+    if (!schForm.scheduled_start || !schForm.scheduled_end) { toast('حدد تاريخ البدء وتاريخ الانتهاء المخططين', 'error'); return }
+    if (schForm.scheduled_end < schForm.scheduled_start) { toast('تاريخ الانتهاء يجب أن يكون بعد تاريخ البدء', 'error'); return }
     await api.schedule.create({
       ...schForm,
       work_order_id: Number(schForm.work_order_id),
@@ -436,6 +447,18 @@ export default function ProductionControl() {
   })
 
   const handleCreateQC = () => act(async () => {
+    // نفس التحقق المطبّق في الباك-إند (production_v2.QCIn.totals_match) — نتحقق منه هنا
+    // مبكراً بدل ما نسيب رسالة pydantic خام (أرقام/أسماء حقول إنجليزية) تظهر للمستخدم.
+    const qtyInspected = Number(qcForm.qty_inspected)
+    const qtyPassed     = Number(qcForm.qty_passed)
+    const qtyFailed     = Number(qcForm.qty_failed || 0)
+    const qtyRework     = Number(qcForm.qty_rework || 0)
+    if (!qcForm.qty_inspected || !(qtyInspected > 0)) { toast('أدخل الكمية المفحوصة', 'error'); return }
+    if (qcForm.qty_passed === '' || qcForm.qty_passed == null || qtyPassed < 0) { toast('أدخل الكمية المقبولة', 'error'); return }
+    if (qtyPassed + qtyFailed + qtyRework > qtyInspected + 0.001) {
+      toast('مجموع الكميات (قبول + رفض + إعادة عمل) لا يجب أن يتجاوز الكمية المفحوصة', 'error')
+      return
+    }
     const r = await api.qc.create({
       ...qcForm,
       work_order_id: qcForm.work_order_id ? Number(qcForm.work_order_id) : null,
@@ -643,9 +666,9 @@ export default function ProductionControl() {
             {allWOs?.map(wo => <option key={wo.id} value={wo.id}>{wo.code}</option>)}
           </Select>
           <FormGrid cols={2}>
-            <Input label="تاريخ البدء" type="date" value={schForm.scheduled_start}
+            <Input label="تاريخ البدء *" type="date" value={schForm.scheduled_start}
               onChange={e => setSchForm(f => ({ ...f, scheduled_start: e.target.value }))} />
-            <Input label="تاريخ الانتهاء" type="date" value={schForm.scheduled_end}
+            <Input label="تاريخ الانتهاء *" type="date" value={schForm.scheduled_end}
               onChange={e => setSchForm(f => ({ ...f, scheduled_end: e.target.value }))} />
           </FormGrid>
           <Input label="الأولوية (1=أعلى)" type="number" min="1" max="10"
@@ -680,9 +703,9 @@ export default function ProductionControl() {
             <option value="outgoing">فحص تسليم</option>
           </Select>
           <FormGrid cols={2}>
-            <Input label="الكمية المفحوصة" type="number" value={qcForm.qty_inspected}
+            <Input label="الكمية المفحوصة *" type="number" value={qcForm.qty_inspected}
               onChange={e => setQcForm(f => ({ ...f, qty_inspected: e.target.value }))} />
-            <Input label="الكمية المقبولة" type="number" value={qcForm.qty_passed}
+            <Input label="الكمية المقبولة *" type="number" value={qcForm.qty_passed}
               onChange={e => setQcForm(f => ({ ...f, qty_passed: e.target.value }))} />
           </FormGrid>
           <FormGrid cols={2}>

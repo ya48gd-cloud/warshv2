@@ -2,6 +2,7 @@
  * إعدادات النظام — صفحة مدمجة (Users + WorkshopProfile)
  */
 import { useState } from 'react'
+import { useAuth } from '../store/auth'
 import Users from './Users'
 import WorkshopProfile from './WorkshopProfile'
 
@@ -11,27 +12,34 @@ const TABS = [
 ]
 
 export default function SettingsHub() {
+  const { user: me } = useAuth()
   const [activeTab, setActiveTab] = useState('users')
+
+  // إصلاح: تبويب "بروفايل الورشة" كان ظاهراً وقابلاً للتعديل لكل الأدوار
+  // (حتى "مشاهد" read-only) رغم أن هذه بيانات على مستوى الورشة كلها —
+  // نعرضه للمديرين فقط، ونمنع البقاء على تبويب غير متاح لو تغيّر الدور.
+  const tabs = me?.role === 'admin' ? TABS : TABS.filter(t => t.key !== 'workshop')
+  const currentTab = tabs.some(t => t.key === activeTab) ? activeTab : tabs[0]?.key
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex gap-1 border-b border-erp-border pb-0">
-        {TABS.map(tab => (
+        {tabs.map(t => (
           <button
-            key={tab.key}
+            key={t.key}
             className="px-4 py-2 text-sm font-medium transition-colors"
-            style={activeTab === tab.key
+            style={currentTab === t.key
               ? { color: 'var(--teal)', borderBottom: '2px solid var(--teal)' }
               : { color: 'var(--erp-muted)', borderBottom: '2px solid transparent' }}
-            onClick={() => setActiveTab(tab.key)}
+            onClick={() => setActiveTab(t.key)}
           >
-            {tab.label}
+            {t.label}
           </button>
         ))}
       </div>
 
-      {activeTab === 'users'    && <Users />}
-      {activeTab === 'workshop' && <WorkshopProfile />}
+      {currentTab === 'users'    && <Users />}
+      {currentTab === 'workshop' && <WorkshopProfile />}
     </div>
   )
 }

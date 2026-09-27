@@ -197,7 +197,10 @@ export const api = {
 
   // ── Auth ──────────────────────────────────────────────────────
   login:          (u, p, tenantSlug) => request('POST', '/auth/login', { username: u, password: p, tenant_slug: tenantSlug || null }),
-  signup:         (payload)          => request('POST', '/auth/signup', payload),
+  // ملاحظة: /auth/signup أصبح مغلقاً في الباك (403 — "التسجيل متاح فقط عبر Super Admin").
+  // إنشاء الورش الجديدة يتم فعلياً عبر /auth/signup-internal (نفس الشكل)، لذا نستخدمه هنا
+  // حتى تعمل صفحة Signup.jsx لو أُعيد ربطها بالتوجيه مستقبلاً.
+  signup:         (payload)          => request('POST', '/auth/signup-internal', payload),
   me:             ()     => request('GET',  '/auth/me'),
   changePassword: (o, n) => request('POST', '/auth/change-password', { old_password: o, new_password: n }),
 
@@ -263,6 +266,8 @@ export const api = {
     categories:     ()   => request('GET',    '/equipment/categories/list'),
     createCategory: (b)  => request('POST',   '/equipment/categories', b),
     deleteCategory: (id) => request('DELETE', `/equipment/categories/${id}`),
+    // إضافة صغيرة: كانت مفقودة رغم وجود مسار الحذف بالباك-إند — راجع تقرير المراجعة
+    deleteDimension: (id) => request('DELETE', `/equipment/dimension/${id}`),
   },
 
   // ── Accounting / Work Orders ───────────────────────────────────
@@ -428,6 +433,8 @@ export const api = {
     deleteOrder:       (id)     => request('DELETE', `/field-service/orders/${id}`),
     updateOrderStatus: (id, b)  => request('PATCH',  `/field-service/orders/${id}/status`, b),
     assignWorkers:     (id, b)  => request('POST',   `/field-service/orders/${id}/assign`, b),
+    // إضافة صغيرة: إلغاء تعيين فني — المسار موجود بالباك-إند لكن لم يكن مربوطاً بالواجهة
+    removeAssignment:  (id, aid) => request('DELETE', `/field-service/orders/${id}/assign/${aid}`),
     recordVisit:       (id, b)  => request('POST',   `/field-service/orders/${id}/visit`, b),
     getVisits:         (id)     => request('GET',    `/field-service/orders/${id}/visits`),
     assets:            (cid)    => request('GET',    `/field-service/assets${cid ? `?customer_id=${cid}` : ''}`),

@@ -11,12 +11,13 @@ import { Input, Select, Textarea, FormGrid } from '../components/ui/Field'
 import SearchInput from '../components/ui/SearchInput'
 import { PageSpinner } from '../components/ui/Spinner'
 
+// ملحوظة: الباك-إند لا يُصدر أبداً حالة "overdue" (فقط draft/received/paid/partial)
+// — أُزيلت من هنا لأنها كانت خياراً ميتاً في فلتر الحالة (يرجع نتائج فارغة دائماً).
 const PURCHASE_STATUS = {
   draft:    { label: 'مسودة',    badge: 'badge-gray'  },
   received: { label: 'مستلمة',   badge: 'badge-blue'  },
   paid:     { label: 'مدفوعة',   badge: 'badge-green' },
   partial:  { label: 'جزئي',     badge: 'badge-amber' },
-  overdue:  { label: 'متأخرة',   badge: 'badge-red'   },
 }
 
 const EMPTY_LINE = { description: '', qty: '', unit: 'قطعة', unit_cost: '', material_id: '', update_stock: true, update_cost: true }
@@ -284,7 +285,7 @@ export default function Purchases() {
                               style={{ background: 'var(--teal-lt)', color: 'var(--teal)' }}
                               onClick={() => {
                                 setViewInv(inv)
-                                setPayForm({ amount: remaining.toFixed(2), notes: '' })
+                                setPayForm({ amount: remaining.toFixed(2), notes: '', wht_amount: '' })
                                 setModal('payment')
                               }}
                             >💰 دفع</button>
@@ -598,7 +599,7 @@ export default function Purchases() {
               >🖨️ طباعة</button>
               {write && (viewInv.total||0) - (viewInv.paid_amount||0) > 0.01 && (
                 <button className="btn btn-primary btn-sm" onClick={() => {
-                  setPayForm({ amount: ((viewInv.total||0)-(viewInv.paid_amount||0)).toFixed(2), notes: '' })
+                  setPayForm({ amount: ((viewInv.total||0)-(viewInv.paid_amount||0)).toFixed(2), notes: '', wht_amount: '' })
                   setModal('payment')
                 }}>💰 تسجيل دفعة</button>
               )}

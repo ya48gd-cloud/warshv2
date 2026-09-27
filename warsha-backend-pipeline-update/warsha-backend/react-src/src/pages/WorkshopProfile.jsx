@@ -4,6 +4,7 @@
  */
 import { useState, useEffect } from 'react'
 import { useToast } from '../store/toast'
+import { useAuth } from '../store/auth'
 import api, { bgErr } from '../api/client'
 import { PageSpinner } from '../components/ui/Spinner'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
@@ -23,6 +24,7 @@ const DEFAULT_FORM = {
 
 export default function WorkshopProfile() {
   const toast = useToast()
+  const { user: me } = useAuth()
   const [form, setForm]                 = useState(DEFAULT_FORM)
   const [hasLogo, setHasLogo]           = useState(false)
   const [logoData, setLogoData]         = useState(null)   // base64 data:URI من الداتابيز
@@ -132,6 +134,19 @@ export default function WorkshopProfile() {
     } finally {
       setDeletingLogo(false)
     }
+  }
+
+  // بيانات الورشة (الاسم، الشعار، البيانات الضريبية...) تخص كل الورشة —
+  // إصلاح: كانت هذه الصفحة بلا أي تحقق من الدور رغم أن الـ backend نفسه
+  // (workshop.py) يسمح لأي مستخدم مسجّل (حتى "مشاهد" read-only) بتعديلها
+  // أو حذف اللوجو. نمنع ذلك في الواجهة على الأقل بنفس نمط صفحة المستخدمين.
+  if (me?.role !== 'admin') {
+    return (
+      <div className="flex flex-col items-center justify-center h-64 gap-3 text-erp-muted">
+        <span className="text-5xl">🔒</span>
+        <p className="font-medium">هذه الصفحة للمديرين فقط</p>
+      </div>
+    )
   }
 
   if (loading) return <PageSpinner />

@@ -136,6 +136,50 @@ async def test_receive_purchase_order_updates_stock(cli):
 
 
 @pytest.mark.asyncio
+async def test_receive_rejects_draft_purchase_order(cli):
+    """لا يجوز استلام أمر شراء لم تتم الموافقة عليه بعد (bypass لخطوة approve)."""
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    r = await cli.post(BASE, json=_po_payload(sid, mid))
+    po_id = r.json()["id"]
+
+    pr = await cli.get(f"{BASE}/{po_id}")
+    line_id = pr.json()["lines"][0]["id"]
+
+    r2 = await cli.post(f"{BASE}/{po_id}/receive", json={
+        "receive_date": str(date.today()),
+        "lines": [{"line_id": line_id, "received_qty": 5}],
+        "create_invoice": False,
+    })
+    assert r2.status_code == 400, r2.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_blocked_after_partial_receive(cli):
+    """لا يجوز إلغاء أمر شراء استُلم منه جزء بالفعل (المخزون/الفاتورة تأثّرا فعلياً)."""
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    r = await cli.post(BASE, json=_po_payload(sid, mid))
+    po_id = r.json()["id"]
+    await cli.patch(f"{BASE}/{po_id}/approve")
+
+    pr = await cli.get(f"{BASE}/{po_id}")
+    line_id = pr.json()["lines"][0]["id"]
+
+    # استلام جزئي فقط (10 من أصل 20)
+    r2 = await cli.post(f"{BASE}/{po_id}/receive", json={
+        "receive_date": str(date.today()),
+        "lines": [{"line_id": line_id, "received_qty": 10}],
+        "create_invoice": False,
+    })
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "partial"
+
+    r3 = await cli.patch(f"{BASE}/{po_id}/cancel")
+    assert r3.status_code == 400, r3.text
+
+
+@pytest.mark.asyncio
 async def test_receive_creates_invoice_when_flag_true(cli):
     sid = await _make_supplier(cli)
     mid = await _make_material(cli)

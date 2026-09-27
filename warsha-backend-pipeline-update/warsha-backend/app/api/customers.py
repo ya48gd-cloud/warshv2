@@ -865,8 +865,16 @@ async def update_order_status(order_id: int, status: str, db: AsyncSession = Dep
                 warranty_months = proj.warranty_months
 
             delivery_date = o.delivery_date or date.today()
-            warranty_end = date(delivery_date.year + (delivery_date.month - 1 + warranty_months) // 12,
-                                 (delivery_date.month - 1 + warranty_months) % 12 + 1, 1)
+            # إصلاح: كان بيثبّت تاريخ الانتهاء على أول الشهر دايمًا (يفقد يوم
+            # التسليم)، فلو التسليم في آخر الشهر كان الضمان بينتهي قبل موعده
+            # الصحيح بيومين لغاية ٣٠ يوم. نحافظ على نفس يوم الشهر (مع تقريب
+            # آمن لآخر يوم في الشهر لو الشهر الهدف أقصر).
+            import calendar as _cal
+            _total_months = delivery_date.month - 1 + warranty_months
+            _end_year = delivery_date.year + _total_months // 12
+            _end_month = _total_months % 12 + 1
+            _end_day = min(delivery_date.day, _cal.monthrange(_end_year, _end_month)[1])
+            warranty_end = date(_end_year, _end_month, _end_day)
 
             asset = CustomerAsset(
                 tenant_id=o.tenant_id,

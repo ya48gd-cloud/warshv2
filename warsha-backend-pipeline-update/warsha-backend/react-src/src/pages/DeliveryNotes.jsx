@@ -53,6 +53,7 @@ export default function DeliveryNotes() {
   const [form,       setForm]       = useState(EMPTY_FORM)
   const [newLine,    setNewLine]     = useState(EMPTY_LINE)
   const [confirmDel, setConfirmDel] = useState(null)
+  const [confirmCancel, setConfirmCancel] = useState(null)
   const [acting,     setActing]     = useState(false)
   const [activeTab,  setActiveTab]  = useState('basic')
 
@@ -128,6 +129,14 @@ export default function DeliveryNotes() {
     setOrders(prev => prev.filter(o => o.id !== id))
     setDetail(null)
     toast('تم الحذف')
+  })
+
+  // الباك اند بيسمح بإلغاء الأمر من draft أو confirmed (قبل التسليم الفعلي)
+  const handleCancel = (o) => act(async () => {
+    const updated = await api.deliveryOrders.setStatus(o.id, 'cancelled')
+    setOrders(prev => prev.map(x => x.id === o.id ? updated : x))
+    setDetail(updated)
+    toast('تم إلغاء الأمر')
   })
 
   const handlePrint = async (o) => {
@@ -429,6 +438,11 @@ tbody tr:last-child td{border-bottom:none;}
             {detail.status === 'confirmed' && (
               <button className="btn-teal" onClick={() => handleDeliver(detail)} disabled={acting}>🚛 تسجيل التسليم</button>
             )}
+            {(detail.status === 'draft' || detail.status === 'confirmed') && (
+              <button className="btn-danger" onClick={() => setConfirmCancel(detail)} disabled={acting}>
+                ❌ إلغاء الأمر
+              </button>
+            )}
             {(detail.status === 'draft' || detail.status === 'cancelled') && (
               <button className="btn-danger" onClick={() => { setConfirmDel(detail.id); setDetail(null) }} disabled={acting}>
                 🗑️ حذف
@@ -601,6 +615,13 @@ tbody tr:last-child td{border-bottom:none;}
         message="هل تريد حذف أمر التوريد هذا نهائياً؟"
         onConfirm={() => { handleDelete(confirmDel); setConfirmDel(null) }}
         onCancel={() => setConfirmDel(null)}
+      />
+
+      <ConfirmDialog
+        open={!!confirmCancel}
+        message={`هل تريد إلغاء أمر التوريد "${confirmCancel?.code}"؟`}
+        onConfirm={() => { handleCancel(confirmCancel); setConfirmCancel(null) }}
+        onCancel={() => setConfirmCancel(null)}
       />
     </div>
   )

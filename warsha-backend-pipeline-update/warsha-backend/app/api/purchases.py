@@ -30,12 +30,21 @@ router = APIRouter(prefix="/purchases", tags=["purchases"], dependencies=[Depend
 print_router = APIRouter(prefix="/purchases", tags=["purchases_print"], dependencies=[Depends(require_any)])
 
 
-async def _next_supplier_code(db: AsyncSession) -> str:
-    count = await db.scalar(select(func.count()).select_from(Supplier))
+async def _next_supplier_code(db: AsyncSession, tid: Optional[int] = None) -> str:
+    """يولّد كود مورد تلقائي — مُقيّد بنفس الـ tenant (uq_supplier_tenant_code
+    فريد على (tenant_id, code) مش على code وحده، فلازم العدّ والفحص يبقوا
+    بنفس النطاق بدل ما يتخطوا أكواد متاحة فعلاً بسبب مورد لـ tenant تاني)."""
+    q_count = select(func.count()).select_from(Supplier)
+    if tid is not None:
+        q_count = q_count.where(Supplier.tenant_id == tid)
+    count = await db.scalar(q_count)
     n = (count or 0) + 1
     while True:
         code = f"SUP-{n:04d}"
-        exists = await db.scalar(select(Supplier.id).where(Supplier.code == code))
+        q_exists = select(Supplier.id).where(Supplier.code == code)
+        if tid is not None:
+            q_exists = q_exists.where(Supplier.tenant_id == tid)
+        exists = await db.scalar(q_exists)
         if not exists:
             return code
         n += 1
@@ -183,22 +192,26 @@ def inv_dict(inv: PurchaseInvoice) -> dict:
 
 @router.get("/suppliers")
 async def list_suppliers(db: AsyncSession = Depends(get_db)):
-    res = await db.execute(
-        select(Supplier).where(Supplier.is_active == True).order_by(Supplier.name)
-    )
+    from app.core.database import current_tenant_id as _ctid_ls
+    tid = _ctid_ls.get()
+    q = select(Supplier).where(Supplier.is_active == True).order_by(Supplier.name)
+    if tid is not None:
+        q = q.where(Supplier.tenant_id == tid)
+    res = await db.execute(q)
     return [supplier_dict(s) for s in res.scalars().all()]
 
 
 @router.get("/suppliers/next-code")
 async def get_next_supplier_code(db: AsyncSession = Depends(get_db)):
-    return {"code": await _next_supplier_code(db)}
+    from app.core.database import current_tenant_id as _ctid_nc
+    return {"code": await _next_supplier_code(db, _ctid_nc.get())}
 
 
 @router.post("/suppliers", status_code=201)
 async def create_supplier(data: SupplierIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_sup
     d = data.model_dump()
-    d['code'] = d.get('code') or await _next_supplier_code(db)
+    d['code'] = d.get('code') or await _next_supplier_code(db, _ctid_sup.get())
     d['tenant_id'] = _ctid_sup.get() or 1
     s = Supplier(**d)
     db.add(s)
@@ -207,16 +220,28 @@ async def create_supplier(data: SupplierIn, db: AsyncSession = Depends(get_db)):
     return supplier_dict(s)
 
 
+async def _get_tenant_supplier(db: AsyncSession, sid: int) -> Optional[Supplier]:
+    """جلب مورد مقيّد بالـ tenant الحالي — يمنع أي tenant من قراءة/تعديل
+    مورد تابع لـ tenant تاني عن طريق تخمين الـ id (كانت db.get(Supplier, sid)
+    بترجع أي مورد بغض النظر عن الـ tenant، وده تسريب بيانات بين المستأجرين)."""
+    from app.core.database import current_tenant_id as _ctid_gs
+    tid = _ctid_gs.get()
+    q = select(Supplier).where(Supplier.id == sid)
+    if tid is not None:
+        q = q.where(Supplier.tenant_id == tid)
+    return (await db.execute(q)).scalar_one_or_none()
+
+
 @router.get("/suppliers/{sid}")
 async def get_supplier(sid: int, db: AsyncSession = Depends(get_db)):
-    s = await db.get(Supplier, sid)
+    s = await _get_tenant_supplier(db, sid)
     if not s: raise HTTPException(404)
     return supplier_dict(s)
 
 
 @router.put("/suppliers/{sid}")
 async def update_supplier(sid: int, data: SupplierIn, db: AsyncSession = Depends(get_db)):
-    s = await db.get(Supplier, sid)
+    s = await _get_tenant_supplier(db, sid)
     if not s: raise HTTPException(404)
     d = data.model_dump()
     if not d.get("code"):
@@ -230,7 +255,7 @@ async def update_supplier(sid: int, data: SupplierIn, db: AsyncSession = Depends
 
 @router.delete("/suppliers/{sid}")
 async def delete_supplier(sid: int, db: AsyncSession = Depends(get_db)):
-    s = await db.get(Supplier, sid)
+    s = await _get_tenant_supplier(db, sid)
     if not s: raise HTTPException(404)
     s.is_active = False
     await db.commit()
@@ -240,7 +265,7 @@ async def delete_supplier(sid: int, db: AsyncSession = Depends(get_db)):
 @router.get("/suppliers/{sid}/statement")
 async def supplier_statement(sid: int, db: AsyncSession = Depends(get_db)):
     """كشف حساب مورد"""
-    s = await db.get(Supplier, sid)
+    s = await _get_tenant_supplier(db, sid)
     if not s: raise HTTPException(404)
     res = await db.execute(
         select(PurchaseInvoice)
@@ -300,7 +325,7 @@ async def supplier_ledger(sid: int, date_from: Optional[date] = None,
                           date_to: Optional[date] = None, db: AsyncSession = Depends(get_db)):
     """كشف حساب تفصيلي للمورد من تاريخ لتاريخ — فواتير + مدفوعات مرتّبة زمنياً"""
     from app.models.models import SupplierPayment
-    s = await db.get(Supplier, sid)
+    s = await _get_tenant_supplier(db, sid)
     if not s: raise HTTPException(404, "المورد غير موجود")
 
     # الرصيد الافتتاحي = صافي كل الحركات قبل date_from
@@ -362,11 +387,15 @@ async def list_purchase_invoices(
     supplier_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.core.database import current_tenant_id as _ctid_lpi
+    tid = _ctid_lpi.get()
     q = select(PurchaseInvoice).options(
         selectinload(PurchaseInvoice.supplier),
         selectinload(PurchaseInvoice.lines),
         selectinload(PurchaseInvoice.attachments),
     )
+    if tid is not None:
+        q = q.where(PurchaseInvoice.tenant_id == tid)
     if status:
         q = q.where(PurchaseInvoice.status == status)
     if supplier_id:
@@ -396,6 +425,10 @@ async def create_purchase_invoice(data: PurchaseInvoiceIn, db: AsyncSession = De
     # لكل الفاتورة، بدل ما نعدّل stock_qty يدويًا من غير أي أثر في StockQuant
     from app.services.inventory_ledger import is_import_supplier, get_or_create_warehouse_bin, post_receipt
     supplier_for_loc = await db.get(Supplier, data.supplier_id)
+    # تحقق إن المورد فعلاً تابع لنفس الـ tenant — منع إسناد فاتورة لمورد تابع
+    # لـ tenant تاني عن طريق تمرير supplier_id تخميني (تسريب/عبث بين المستأجرين)
+    if supplier_for_loc and supplier_for_loc.tenant_id != _tid_pi:
+        raise HTTPException(400, "المورد غير موجود")
     wh_code = "IMPORTED" if is_import_supplier(supplier_for_loc) else "RAW"
 
     subtotal = sum(Decimal(str(l.qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
@@ -479,13 +512,22 @@ async def create_purchase_invoice(data: PurchaseInvoiceIn, db: AsyncSession = De
             "subtotal": float(inv.subtotal), "total": float(inv.total)}
 
 
+async def _tenant_invoice_query(iid: int):
+    from app.core.database import current_tenant_id as _ctid_tiq
+    tid = _ctid_tiq.get()
+    q = select(PurchaseInvoice).where(PurchaseInvoice.id == iid)
+    if tid is not None:
+        q = q.where(PurchaseInvoice.tenant_id == tid)
+    return q
+
+
 @router.get("/invoices/{iid}")
 async def get_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
-        select(PurchaseInvoice)
-        .options(selectinload(PurchaseInvoice.supplier),
-                 selectinload(PurchaseInvoice.lines).selectinload(PurchaseInvoiceLine.material))
-        .where(PurchaseInvoice.id == iid)
+        (await _tenant_invoice_query(iid)).options(
+            selectinload(PurchaseInvoice.supplier),
+            selectinload(PurchaseInvoice.lines).selectinload(PurchaseInvoiceLine.material),
+        )
     )
     inv = res.scalar_one_or_none()
     if not inv: raise HTTPException(404)
@@ -519,8 +561,7 @@ async def get_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
 @router.put("/invoices/{iid}")
 async def update_purchase_invoice(iid: int, data: PurchaseInvoiceIn, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
-        select(PurchaseInvoice).options(selectinload(PurchaseInvoice.lines))
-        .where(PurchaseInvoice.id == iid)
+        (await _tenant_invoice_query(iid)).options(selectinload(PurchaseInvoice.lines))
     )
     inv = res.scalar_one_or_none()
     if not inv: raise HTTPException(404)
@@ -594,7 +635,10 @@ async def update_purchase_invoice(iid: int, data: PurchaseInvoiceIn, db: AsyncSe
     await db.flush()
 
     # الموقع الجديد بيتحدد حسب المورد الجديد على الفاتورة (ممكن يكون اتغيّر)
-    new_wh_code = "IMPORTED" if is_import_supplier(await db.get(Supplier, data.supplier_id) if data.supplier_id else None) else "RAW"
+    new_supplier = await db.get(Supplier, data.supplier_id) if data.supplier_id else None
+    if new_supplier and new_supplier.tenant_id != _tid_upd:
+        raise HTTPException(400, "المورد غير موجود")
+    new_wh_code = "IMPORTED" if is_import_supplier(new_supplier) else "RAW"
     new_bin = await get_or_create_warehouse_bin(db, _tid_upd, new_wh_code)
 
     for line_data in data.lines:
@@ -642,7 +686,7 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
     دفعة عامة لمورد — مرتبطة بفاتورة (invoice_id) أو "تحت الحساب" بدون فاتورة.
     لو invoice_id محدد، يتم تطبيقها على الفاتورة بنفس منطق /invoices/{iid}/payment.
     """
-    sup = await db.get(Supplier, data.supplier_id)
+    sup = await _get_tenant_supplier(db, data.supplier_id)
     if not sup:
         raise HTTPException(404, "المورد غير موجود")
 
@@ -658,7 +702,7 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
     invoice_amount = Decimal("0")
     excess = amount
     if data.invoice_id:
-        inv = await db.get(PurchaseInvoice, data.invoice_id)
+        inv = (await db.execute(await _tenant_invoice_query(data.invoice_id))).scalar_one_or_none()
         if not inv:
             raise HTTPException(404, "فاتورة الشراء غير موجودة")
         remaining = inv.total - inv.paid_amount
@@ -743,7 +787,7 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
 @router.post("/invoices/{iid}/payment")
 async def record_purchase_payment(iid: int, data: PaymentIn, db: AsyncSession = Depends(get_db),
                                   current_user: dict = Depends(get_current_user)):
-    inv = await db.get(PurchaseInvoice, iid)
+    inv = (await db.execute(await _tenant_invoice_query(iid))).scalar_one_or_none()
     if not inv: raise HTTPException(404)
     amount = Decimal(str(data.amount))
     pay_date = data.payment_date or date.today()
@@ -813,9 +857,7 @@ async def record_purchase_payment(iid: int, data: PaymentIn, db: AsyncSession = 
 @router.delete("/invoices/{iid}")
 async def delete_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
-        select(PurchaseInvoice)
-        .options(selectinload(PurchaseInvoice.lines))
-        .where(PurchaseInvoice.id == iid)
+        (await _tenant_invoice_query(iid)).options(selectinload(PurchaseInvoice.lines))
     )
     inv = res.scalar_one_or_none()
     if not inv: raise HTTPException(404)
@@ -872,7 +914,7 @@ async def upload_attachment(
     notes: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    inv = await db.get(PurchaseInvoice, iid)
+    inv = (await db.execute(await _tenant_invoice_query(iid))).scalar_one_or_none()
     if not inv: raise HTTPException(404)
 
     ext = _validate_image_attachment(file)
@@ -903,9 +945,18 @@ async def upload_attachment(
     }
 
 
+async def _get_tenant_attachment(db: AsyncSession, att_id: int) -> Optional[FileAttachment]:
+    from app.core.database import current_tenant_id as _ctid_ga
+    tid = _ctid_ga.get()
+    q = select(FileAttachment).where(FileAttachment.id == att_id)
+    if tid is not None:
+        q = q.where(FileAttachment.tenant_id == tid)
+    return (await db.execute(q)).scalar_one_or_none()
+
+
 @router.get("/attachments/{att_id}/download")
 async def download_attachment(att_id: int, db: AsyncSession = Depends(get_db)):
-    att = await db.get(FileAttachment, att_id)
+    att = await _get_tenant_attachment(db, att_id)
     if not att: raise HTTPException(404)
     path = UPLOAD_DIR / att.stored_name
     if not path.exists(): raise HTTPException(404, "الملف غير موجود على القرص")
@@ -914,7 +965,7 @@ async def download_attachment(att_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.delete("/attachments/{att_id}")
 async def delete_attachment(att_id: int, db: AsyncSession = Depends(get_db)):
-    att = await db.get(FileAttachment, att_id)
+    att = await _get_tenant_attachment(db, att_id)
     if not att: raise HTTPException(404)
     path = UPLOAD_DIR / att.stored_name
     if path.exists():
@@ -965,12 +1016,15 @@ async def upload_generic_attachment(
 @router.get("/attachments")
 async def list_attachments(entity_type: str, entity_id: int, db: AsyncSession = Depends(get_db)):
     """جلب كل مرفقات كيان معين"""
-    res = await db.execute(
-        select(FileAttachment).where(
-            FileAttachment.entity_type == entity_type,
-            FileAttachment.entity_id == entity_id,
-        ).order_by(FileAttachment.created_at)
+    from app.core.database import current_tenant_id as _ctid_la
+    tid = _ctid_la.get()
+    q = select(FileAttachment).where(
+        FileAttachment.entity_type == entity_type,
+        FileAttachment.entity_id == entity_id,
     )
+    if tid is not None:
+        q = q.where(FileAttachment.tenant_id == tid)
+    res = await db.execute(q.order_by(FileAttachment.created_at))
     return [{
         "id": a.id, "original_name": a.original_name,
         "stored_name": a.stored_name, "file_size": a.file_size,
@@ -984,10 +1038,10 @@ async def list_attachments(entity_type: str, entity_id: int, db: AsyncSession = 
 @print_router.get("/invoices/{iid}/print", response_class=HTMLResponse)
 async def print_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     res = await db.execute(
-        select(PurchaseInvoice)
-        .options(selectinload(PurchaseInvoice.supplier),
-                 selectinload(PurchaseInvoice.lines).selectinload(PurchaseInvoiceLine.material))
-        .where(PurchaseInvoice.id == iid)
+        (await _tenant_invoice_query(iid)).options(
+            selectinload(PurchaseInvoice.supplier),
+            selectinload(PurchaseInvoice.lines).selectinload(PurchaseInvoiceLine.material),
+        )
     )
     inv = res.scalar_one_or_none()
     if not inv: raise HTTPException(404)
@@ -1107,22 +1161,33 @@ async def purchases_dashboard(db: AsyncSession = Depends(get_db)):
     """ملخص المشتريات"""
     from sqlalchemy import extract
     from datetime import date as dt
+    from app.core.database import current_tenant_id as _ctid_dash
     today = dt.today()
+    tid = _ctid_dash.get()
 
-    total_suppliers = await db.scalar(select(func.count()).select_from(Supplier).where(Supplier.is_active == True))
-    total_invoices  = await db.scalar(select(func.count()).select_from(PurchaseInvoice))
-    total_value     = await db.scalar(select(func.coalesce(func.sum(PurchaseInvoice.total), 0)))
-    unpaid_value    = await db.scalar(
-        select(func.coalesce(func.sum(PurchaseInvoice.total - PurchaseInvoice.paid_amount), 0))
+    sup_q = select(func.count()).select_from(Supplier).where(Supplier.is_active == True)
+    inv_count_q = select(func.count()).select_from(PurchaseInvoice)
+    inv_total_q = select(func.coalesce(func.sum(PurchaseInvoice.total), 0))
+    unpaid_q = select(func.coalesce(func.sum(PurchaseInvoice.total - PurchaseInvoice.paid_amount), 0)) \
         .where(PurchaseInvoice.status.in_(["received", "partial"]))
+    mtd_q = select(func.coalesce(func.sum(PurchaseInvoice.total), 0)).where(
+        extract('month', PurchaseInvoice.date) == today.month,
+        extract('year', PurchaseInvoice.date) == today.year,
     )
-    mtd_value = await db.scalar(
-        select(func.coalesce(func.sum(PurchaseInvoice.total), 0))
-        .where(
-            extract('month', PurchaseInvoice.date) == today.month,
-            extract('year', PurchaseInvoice.date) == today.year,
-        )
-    )
+    if tid is not None:
+        # بدون فلترة الـ tenant هنا كانت اللوحة بترجّع أرقام مجمّعة من كل
+        # المستأجرين مع بعض (تسريب بيانات تجاري بين tenants مختلفين)
+        sup_q       = sup_q.where(Supplier.tenant_id == tid)
+        inv_count_q = inv_count_q.where(PurchaseInvoice.tenant_id == tid)
+        inv_total_q = inv_total_q.where(PurchaseInvoice.tenant_id == tid)
+        unpaid_q    = unpaid_q.where(PurchaseInvoice.tenant_id == tid)
+        mtd_q       = mtd_q.where(PurchaseInvoice.tenant_id == tid)
+
+    total_suppliers = await db.scalar(sup_q)
+    total_invoices  = await db.scalar(inv_count_q)
+    total_value     = await db.scalar(inv_total_q)
+    unpaid_value    = await db.scalar(unpaid_q)
+    mtd_value       = await db.scalar(mtd_q)
 
     return {
         "total_suppliers": total_suppliers,

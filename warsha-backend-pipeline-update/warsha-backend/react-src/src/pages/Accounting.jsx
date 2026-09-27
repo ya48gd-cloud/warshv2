@@ -219,7 +219,10 @@ export default function Accounting() {
     })
   }
 
-  const egp = (n) => Number(n).toLocaleString('ar-EG', { minimumFractionDigits:2 })
+  // numberingSystem: 'latn' لضمان أرقام غربية (زي باقي الشاشات) بدل الأرقام الهندية
+  // العربية اللي ممكن تظهر حسب لغة المتصفح، و maximumFractionDigits ثابت على 2
+  // عشان ما نعرضش كسور غير مقصودة (مثلاً 12.345 بدل 12.35)
+  const egp = (n) => Number(n || 0).toLocaleString('ar-EG', { minimumFractionDigits:2, maximumFractionDigits:2, numberingSystem:'latn' })
 
   return (
     <div className="p-4 max-w-6xl mx-auto" dir="rtl">

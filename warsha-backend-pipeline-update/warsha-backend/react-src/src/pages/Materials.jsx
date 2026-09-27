@@ -556,9 +556,6 @@ export default function Materials() {
         </ModalFooter>
       </Modal>
 
-      <ConfirmDialog open={!!deleteTarget} onClose={() => setDeleteTarget(null)} onConfirm={doDelete}
-        title="حذف مادة" message={`حذف "${deleteTarget?.name_ar}"؟`} danger />
-
       {/* مودال إدارة الأصناف */}
       {catModal && (
         <Modal open onClose={() => { setCatModal(false); setNewCatName('') }} title="إدارة الأصناف">

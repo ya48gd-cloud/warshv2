@@ -505,18 +505,26 @@ async def low_stock_alerts(db: AsyncSession = Depends(get_db)):
 
     items = await InventoryService.low_stock_alerts(db)
     cutoff = date.today() - timedelta(days=90)
-    result = []
-    for m in items:
-        # حساب متوسط الاستهلاك اليومي من حركات الصادر خلال 90 يوم
-        usage_res = await db.execute(
-            select(sqlfunc.coalesce(sqlfunc.sum(StockMovement.qty), 0))
+
+    # متوسط الاستهلاك اليومي لكل المواد قليلة المخزون في استعلام واحد
+    # (GROUP BY) بدل استعلام منفصل لكل مادة جوه اللوب (N+1).
+    usage_map: dict[int, float] = {}
+    ids = [m.id for m in items]
+    if ids:
+        usage_rows = await db.execute(
+            select(StockMovement.material_id, sqlfunc.coalesce(sqlfunc.sum(StockMovement.qty), 0))
             .where(
-                StockMovement.material_id == m.id,
+                StockMovement.material_id.in_(ids),
                 StockMovement.movement_type == "out",
                 StockMovement.movement_date >= cutoff,
             )
+            .group_by(StockMovement.material_id)
         )
-        total_out = float(usage_res.scalar() or 0)
+        usage_map = {mid: float(total) for mid, total in usage_rows.all()}
+
+    result = []
+    for m in items:
+        total_out = usage_map.get(m.id, 0.0)
         daily_usage = round(total_out / 90, 4) if total_out > 0 else None
 
         result.append({
@@ -537,7 +545,17 @@ async def update_material_price(material_id: int, new_price: float,
     """تحديث سعر المادة — يُحدِّث BOM تلقائياً عبر الـ trigger"""
     mat = await db.get(Material, mat_id := material_id)
     if not mat: raise HTTPException(404, "Material not found")
+    if new_price < 0:
+        raise HTTPException(400, "السعر لا يمكن أن يكون سالباً")
+    old_price = mat.unit_cost
     mat.unit_cost = new_price
+    # سجّل التغيير في MaterialPriceHistory — الموديل موجود ومربوط بعلاقة
+    # على Material من قبل، لكن محدّش كان بيكتب فيه فعليًا في أي مكان في
+    # النظام (تأكدنا بالبحث الشامل)، فسعر المادة كان بيتغير من غير أي أثر تاريخي.
+    db.add(MaterialPriceHistory(
+        tenant_id=mat.tenant_id, material_id=mat.id,
+        old_price=old_price, new_price=new_price,
+    ))
     await db.commit()
     return {"id": mat.id, "code": mat.code, "new_price": float(mat.unit_cost)}
 
@@ -548,16 +566,20 @@ async def list_categories(db: AsyncSession = Depends(get_db)):
     from app.models.models import MaterialCategory
     result = await db.execute(select(MaterialCategory).order_by(MaterialCategory.name_ar))
     cats = result.scalars().all()
-    out = []
-    for c in cats:
-        cnt = await db.execute(
-            select(func.count()).select_from(Material).where(Material.category_id == c.id)
-        )
-        out.append({
+    # عدد المواد لكل الفئات في استعلام واحد (GROUP BY) بدل استعلام منفصل
+    # لكل فئة (N+1) — كان بيعمل استعلام إضافي جوه اللوب لكل صف.
+    counts_res = await db.execute(
+        select(Material.category_id, func.count())
+        .group_by(Material.category_id)
+    )
+    counts = {cid: cnt for cid, cnt in counts_res.all()}
+    return [
+        {
             "id": c.id, "name_ar": c.name_ar, "name_en": c.name_en,
-            "material_count": cnt.scalar() or 0,
-        })
-    return out
+            "material_count": counts.get(c.id, 0),
+        }
+        for c in cats
+    ]
 
 
 class CategoryCreate(BaseModel):
@@ -936,6 +958,7 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
 
     from app.core.database import current_tenant_id as _ctid_cc
     from app.services.production import record_scrap
+    from app.services.inventory_ledger import post_issue, _next_movement_no
     tid = _ctid_cc.get() or 1
 
     res = None
@@ -952,16 +975,22 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
     total_issued_cost = Decimal("0")
 
     # 1) خصم الكمية المستهلكة من المخزون الأساسي (ألواح/أسياخ قياسية كاملة)
+    #    عبر post_issue — المصدر الوحيد المفروض لحركات "out" في كل النظام —
+    #    بدل تعديل stock_qty يدويًا وإنشاء StockMovement خام. قبل هذا الإصلاح
+    #    كان الكود بيعمل max(0, stock_qty - qty) فيمتص أي عجز في الصمت بدل
+    #    ما يرفض الطلب، ومكنش بيفحص المتاح الفعلي (المحجوز لأوامر تانية)،
+    #    ومكنش بيدي movement_no تسلسلي ولا يزامن StockQuant — فيسبب عدم
+    #    تطابق دائم مع /materials/{id}/stock-check.
     if data.consumed_qty_from_main_stock and data.consumed_qty_from_main_stock > 0:
         qty = data.consumed_qty_from_main_stock
-        mat.stock_qty = max(Decimal("0"), mat.stock_qty - qty)
-        cost = qty * mat.unit_cost
-        db.add(StockMovement(
-            tenant_id=tid, material_id=mat.id, movement_type="out",
-            qty=qty, unit_cost=mat.unit_cost, total_cost=cost,
+        movement = await post_issue(
+            db, material=mat, qty=qty, unit_cost=mat.unit_cost,
+            movement_date=date.today(),
             reference="مخطط تقطيع", notes="استهلاك ألواح/أسياخ قياسية لعملية تقطيع",
-            movement_date=date.today(), work_order_id=data.work_order_id,
-        ))
+            work_order_id=data.work_order_id,
+            source_doc_type="cutting_plan", source_doc_id=data.work_order_id,
+        )
+        cost = movement.total_cost
         result["main_stock_deducted"] = float(qty)
         total_issued_qty += qty
         total_issued_cost += cost
@@ -988,11 +1017,18 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
         issued_now = min(total_issued_qty, res.reserved_qty - res.issued_qty)
         cost_now = (issued_now / total_issued_qty) * total_issued_cost if total_issued_qty else Decimal("0")
         wo = await db.get(WorkOrder, res.work_order_id)
+        # ملحوظة: هذه حركة تسجيلية (audit trail) للكمية اللي اتخصمت بالفعل
+        # أعلاه (من المخزون الأساسي في 1، أو من عناصر النسالة في 2) — من
+        # عمد ميتمّش خصم Material.stock_qty هنا تاني لتفادي الخصم المزدوج
+        # (زي ما التعليق الأصلي بيوضّح). لكن لازم برضه ياخد movement_no
+        # تسلسلي زي كل حركة تانية في النظام (كان بيتسجّل NULL قبل كده).
         db.add(StockMovement(
             tenant_id=tid, material_id=mat.id, movement_type="out",
             qty=issued_now, unit_cost=mat.unit_cost, total_cost=cost_now,
             reference=f"{wo.code}-CUT" if wo else "مخطط تقطيع", notes="استهلاك نسالة عبر مخطط التقطيع",
             movement_date=date.today(), work_order_id=res.work_order_id,
+            movement_no=await _next_movement_no(db, tid),
+            source_doc_type="cutting_plan_reservation", source_doc_id=res.id,
         ))
         db.add(CostLine(
             tenant_id=tid, work_order_id=res.work_order_id, cost_type="material",

@@ -9,7 +9,8 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
-from app.core.database import get_db, AsyncSessionLocal
+from fastapi import HTTPException
+from app.core.database import get_db, AsyncSessionLocal, current_tenant_id
 from app.api.auth import require_any
 from app.models.models import (
     Material, StockMovement, WorkOrder, CostLine,
@@ -22,7 +23,21 @@ from app.services.production import get_smart_alerts, run_mrp
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], dependencies=[Depends(require_any)])
 
 
+def _tid() -> int:
+    """يجلب tenant_id الحالي من ContextVar أو يرفع 401.
+
+    CRITICAL: كل استعلامات الداشبورد هنا كانت بدون فلتر tenant_id إطلاقاً —
+    يعني أي مستخدم مسجّل دخول كان بيشوف أرقام (مخزون/مبيعات/رواتب...) كل
+    الورش مجمّعة مع بعض بدل ورشته بس. تم إصلاحه بإضافة هذا الفلتر لكل استعلام.
+    """
+    tid = current_tenant_id.get()
+    if tid is None:
+        raise HTTPException(401, "غير مسموح")
+    return tid
+
+
 async def _get_kpis(db: AsyncSession) -> dict:
+    tid = _tid()
     today = date.today()
     month_start = today.replace(day=1)
     last_month_start = (month_start - timedelta(days=1)).replace(day=1)
@@ -30,6 +45,7 @@ async def _get_kpis(db: AsyncSession) -> dict:
     # 1. أوامر الإنتاج النشطة
     active_wo = (await db.execute(
         select(func.count(WorkOrder.id)).where(
+            WorkOrder.tenant_id == tid,
             WorkOrder.status.in_(['in_progress', 'draft'])
         )
     )).scalar() or 0
@@ -37,12 +53,14 @@ async def _get_kpis(db: AsyncSession) -> dict:
     # 2. قيمة المخزون (stock_qty × unit_cost)
     stock_value_row = (await db.execute(
         select(func.sum(Material.stock_qty * Material.unit_cost))
+        .where(Material.tenant_id == tid)
     )).scalar()
     stock_value = float(stock_value_row or 0)
 
     # 3. المبيعات هذا الشهر
     sales_month = (await db.execute(
         select(func.sum(Invoice.total)).where(
+            Invoice.tenant_id == tid,
             Invoice.date >= month_start,
             Invoice.status != 'cancelled',
         )
@@ -52,6 +70,7 @@ async def _get_kpis(db: AsyncSession) -> dict:
     # مبيعات الشهر السابق (للمقارنة)
     sales_last_month = (await db.execute(
         select(func.sum(Invoice.total)).where(
+            Invoice.tenant_id == tid,
             Invoice.date >= last_month_start,
             Invoice.date < month_start,
         )
@@ -62,6 +81,7 @@ async def _get_kpis(db: AsyncSession) -> dict:
     # 4. المستحقات للتحصيل
     receivables = (await db.execute(
         select(func.sum(Invoice.total - Invoice.paid_amount)).where(
+            Invoice.tenant_id == tid,
             Invoice.status.in_(['unpaid', 'partial'])
         )
     )).scalar()
@@ -70,6 +90,7 @@ async def _get_kpis(db: AsyncSession) -> dict:
     # 5. مواد تحتاج طلبية
     low_stock_count = (await db.execute(
         select(func.count(Material.id)).where(
+            Material.tenant_id == tid,
             Material.stock_qty <= Material.reorder_level,
             Material.reorder_level > 0,
         )
@@ -77,12 +98,13 @@ async def _get_kpis(db: AsyncSession) -> dict:
 
     # 6. إجمالي العمال النشطين
     active_workers = (await db.execute(
-        select(func.count(Worker.id)).where(Worker.is_active == True)
+        select(func.count(Worker.id)).where(Worker.tenant_id == tid, Worker.is_active == True)
     )).scalar() or 0
 
     # 7. تكلفة الهالك هذا الشهر
     scrap_cost = (await db.execute(
         select(func.sum(ScrapRecord.total_cost)).where(
+            ScrapRecord.tenant_id == tid,
             ScrapRecord.recorded_at >= month_start,
         )
     )).scalar()
@@ -91,6 +113,7 @@ async def _get_kpis(db: AsyncSession) -> dict:
     # 8. أوامر إنتاج منتهية هذا الشهر
     completed_wo = (await db.execute(
         select(func.count(WorkOrder.id)).where(
+            WorkOrder.tenant_id == tid,
             WorkOrder.status == 'done',
             WorkOrder.end_date >= month_start,
         )
@@ -109,9 +132,10 @@ async def _get_kpis(db: AsyncSession) -> dict:
 
 
 async def _get_active_work_orders(db: AsyncSession) -> list:
+    tid = _tid()
     wos = (await db.execute(
         select(WorkOrder).options(selectinload(WorkOrder.equipment))
-        .where(WorkOrder.status.in_(['in_progress', 'draft']))
+        .where(WorkOrder.tenant_id == tid, WorkOrder.status.in_(['in_progress', 'draft']))
         .order_by(WorkOrder.start_date).limit(10)
     )).scalars().all()
 
@@ -124,11 +148,13 @@ async def _get_active_work_orders(db: AsyncSession) -> list:
         # عدد الحجوزات المكتملة
         total_res = (await db.execute(
             select(func.count(MaterialReservation.id)).where(
+                MaterialReservation.tenant_id == tid,
                 MaterialReservation.work_order_id == wo.id
             )
         )).scalar() or 0
         issued_res = (await db.execute(
             select(func.count(MaterialReservation.id)).where(
+                MaterialReservation.tenant_id == tid,
                 MaterialReservation.work_order_id == wo.id,
                 MaterialReservation.status == 'fully_issued',
             )
@@ -150,8 +176,10 @@ async def _get_active_work_orders(db: AsyncSession) -> list:
 
 
 async def _get_low_stock(db: AsyncSession) -> list:
+    tid = _tid()
     mats = (await db.execute(
         select(Material).where(
+            Material.tenant_id == tid,
             Material.stock_qty <= Material.reorder_level,
             Material.reorder_level > 0,
         ).order_by(Material.stock_qty / (Material.reorder_level + Decimal("0.01")))
@@ -174,6 +202,7 @@ async def _get_low_stock(db: AsyncSession) -> list:
 
 async def _get_production_chart(db: AsyncSession) -> dict:
     """إنتاجية آخر 6 أشهر"""
+    tid = _tid()
     rows = []
     today = date.today()
     for i in range(5, -1, -1):
@@ -182,6 +211,7 @@ async def _get_production_chart(db: AsyncSession) -> dict:
 
         count = (await db.execute(
             select(func.count(WorkOrder.id)).where(
+                WorkOrder.tenant_id == tid,
                 WorkOrder.status == 'done',
                 WorkOrder.end_date >= month_date,
                 WorkOrder.end_date < next_month,
@@ -190,6 +220,7 @@ async def _get_production_chart(db: AsyncSession) -> dict:
 
         cost = (await db.execute(
             select(func.sum(WorkOrder.actual_cost)).where(
+                WorkOrder.tenant_id == tid,
                 WorkOrder.status == 'done',
                 WorkOrder.end_date >= month_date,
                 WorkOrder.end_date < next_month,
@@ -209,6 +240,7 @@ async def _get_production_chart(db: AsyncSession) -> dict:
 
 async def _get_cashflow_chart(db: AsyncSession) -> dict:
     """التدفق النقدي الحقيقي آخر 30 يوم — من تحصيلات العملاء ومدفوعات الموردين"""
+    tid = _tid()
     today = date.today()
 
     # تحصيلات من العملاء (inflow) — CustomerPayment
@@ -217,7 +249,7 @@ async def _get_cashflow_chart(db: AsyncSession) -> dict:
             CustomerPayment.payment_date,
             func.sum(CustomerPayment.amount).label("total"),
         )
-        .where(CustomerPayment.payment_date >= today - timedelta(days=29))
+        .where(CustomerPayment.tenant_id == tid, CustomerPayment.payment_date >= today - timedelta(days=29))
         .group_by(CustomerPayment.payment_date)
     )).all()
     inflow_map = {str(r.payment_date): float(r.total or 0) for r in inflow_rows}
@@ -228,7 +260,7 @@ async def _get_cashflow_chart(db: AsyncSession) -> dict:
             SupplierPayment.payment_date,
             func.sum(SupplierPayment.amount).label("total"),
         )
-        .where(SupplierPayment.payment_date >= today - timedelta(days=29))
+        .where(SupplierPayment.tenant_id == tid, SupplierPayment.payment_date >= today - timedelta(days=29))
         .group_by(SupplierPayment.payment_date)
     )).all()
     outflow_map = {str(r.payment_date): float(r.total or 0) for r in outflow_rows}
@@ -252,10 +284,12 @@ async def _get_cashflow_chart(db: AsyncSession) -> dict:
 
 async def _get_cost_distribution(db: AsyncSession) -> dict:
     """توزيع التكاليف هذا الشهر"""
+    tid = _tid()
     month_start = date.today().replace(day=1)
     rows = (await db.execute(
         select(CostLine.cost_type, func.sum(CostLine.total_cost))
         .where(
+            CostLine.tenant_id == tid,
             CostLine.work_order_id.is_not(None),
             CostLine.created_at >= month_start,
         )

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.api.auth import require_any, current_tenant_id
+from app.api.auth import require_any, require_admin, current_tenant_id
 from app.models.models import WorkshopProfile
 
 router = APIRouter(prefix="/workshop", tags=["workshop"], dependencies=[Depends(require_any)])
@@ -106,7 +106,11 @@ async def get_profile(db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/profile")
-async def update_profile(data: WorkshopProfileIn, db: AsyncSession = Depends(get_db)):
+async def update_profile(
+    data: WorkshopProfileIn,
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+):
     prof = await _get_or_create(db)
     for k, v in data.model_dump().items():
         setattr(prof, k, v)
@@ -116,7 +120,11 @@ async def update_profile(data: WorkshopProfileIn, db: AsyncSession = Depends(get
 
 
 @router.post("/profile/logo")
-async def upload_logo(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def upload_logo(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+):
     if file.content_type not in ALLOWED_LOGO_TYPES:
         raise HTTPException(400, "نوع الملف غير مدعوم — استخدم PNG أو JPG أو WEBP أو SVG")
     content = await file.read()
@@ -169,7 +177,10 @@ async def get_logo(db: AsyncSession = Depends(get_db)):
 
 
 @router.delete("/profile/logo")
-async def delete_logo(db: AsyncSession = Depends(get_db)):
+async def delete_logo(
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+):
     prof = await _get_or_create(db)
     if prof.logo_stored_name:
         path = LOGO_DIR / prof.logo_stored_name

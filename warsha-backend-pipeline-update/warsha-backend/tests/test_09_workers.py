@@ -140,6 +140,41 @@ async def test_generate_payroll_from_attendance(cli):
 
 
 @pytest.mark.asyncio
+async def test_generate_payroll_includes_overtime_pay(cli):
+    """Regression: overtime_hours recorded on attendance must be paid out in the
+    generated payroll line (daily_wage/8 per hour) — it used to be silently
+    dropped by generate_from_attendance even though the weekly summary showed it."""
+    rw = await cli.post(BASE, json=_worker("عامل إضافي"))
+    wid = rw.json()["id"]
+    daily_wage = rw.json()["daily_wage"]
+
+    week_start = date.today() - timedelta(days=date.today().weekday())
+    week_end = week_start + timedelta(days=6)
+
+    await cli.post("/api/v1/attendance", json={
+        "worker_id": wid,
+        "attendance_date": str(week_start),
+        "status": "present",
+        "overtime_hours": 4,
+    })
+
+    rp = await cli.post(f"{BASE}/payroll", json={
+        "week_start": str(week_start), "week_end": str(week_end),
+    })
+    run_id = rp.json()["id"]
+
+    r = await cli.post(f"{BASE}/payroll/{run_id}/generate")
+    assert r.status_code in (200, 201)
+    lines = r.json()["lines"]
+    line = next(l for l in lines if l["worker"] == "عامل إضافي")
+    expected_overtime_pay = daily_wage * 4 / 8
+    assert line["overtime_hours"] == 4
+    assert abs(line["overtime_pay"] - expected_overtime_pay) < 0.01
+    expected_gross = daily_wage * 1 + expected_overtime_pay  # 1 present day + OT
+    assert abs(line["total_gross"] - expected_gross) < 0.01
+
+
+@pytest.mark.asyncio
 async def test_get_payroll_detail(cli):
     week_start = date.today() - timedelta(days=date.today().weekday() + 7)
     week_end = week_start + timedelta(days=6)

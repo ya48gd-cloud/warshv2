@@ -80,7 +80,11 @@ export function AuthProvider({ children }) {
     api.me()
       .then(u => { setUser(u); sessionStorage.setItem('erp_role', u.role) })
       .catch(() => {
+        // إصلاح: كان بيمسح erp_token بس ويسيب erp_role/erp_tenant_id —
+        // نفس logout() لازم يمسح الثلاثة عشان الجلسة تتنضف بالكامل.
         sessionStorage.removeItem('erp_token')
+        sessionStorage.removeItem('erp_role')
+        sessionStorage.removeItem('erp_tenant_id')
         // مفيش استخدام لـ useToast هنا (ده Provider نفسه بيلف التطبيق كله) —
         // بنستخدم نفس الحدث العام اللي بيسمعه ToastProvider في أي حتة تانية
         window.dispatchEvent(new CustomEvent('erp:toast', {

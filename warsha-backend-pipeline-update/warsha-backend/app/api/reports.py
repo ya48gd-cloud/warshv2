@@ -6,12 +6,12 @@ from datetime import date, timedelta, datetime, time
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import select, func, and_, extract, case
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, current_tenant_id
 from app.api.auth import require_any
 from app.services.invoice_due import get_invoice_due_status
 from app.models.models import (
@@ -26,6 +26,20 @@ from app.models.models import (
 )
 
 router = APIRouter(prefix="/reports", tags=["reports"], dependencies=[Depends(require_any)])
+
+
+def _tid() -> int:
+    """يجلب tenant_id الحالي من ContextVar أو يرفع 401.
+
+    CRITICAL: كل استعلام في هذا الملف لازم يتقيّد بالـ tenant الحالي —
+    بدون هذا الفلتر أي تقرير بيرجع بيانات كل الورش مجمّعة مع بعض (تسريب
+    بيانات بين المستأجرين). راجع تقرير الأمان: هذا كان مفقوداً من كل
+    تقرير هنا تقريباً قبل هذا الإصلاح.
+    """
+    tid = current_tenant_id.get()
+    if tid is None:
+        raise HTTPException(401, "غير مسموح")
+    return tid
 
 
 # ══════════════════════════════════════════════════════════════
@@ -51,27 +65,31 @@ async def inventory_reconciliation_report(
     (بترقيم المشروع الحالي) كانت بتصلحها واحدة واحدة؛ التقرير ده بيوريك
     فين لسه فيه فجوات من النوع ده من غير ما تدوّر عليها يدوي.
     """
+    tid = _tid()
     TOLERANCE = Decimal("0.01")
 
-    materials = (await db.execute(select(Material))).scalars().all()
+    materials = (await db.execute(select(Material).where(Material.tenant_id == tid))).scalars().all()
 
     quant_totals = dict((await db.execute(
         select(StockQuant.material_id, func.coalesce(func.sum(StockQuant.qty), 0))
+        .where(StockQuant.tenant_id == tid)
         .group_by(StockQuant.material_id)
     )).all())
 
     batch_totals = dict((await db.execute(
         select(StockBatch.material_id, func.coalesce(func.sum(StockBatch.qty_remaining), 0))
-        .where(StockBatch.status == "active")
+        .where(StockBatch.status == "active", StockBatch.tenant_id == tid)
         .group_by(StockBatch.material_id)
     )).all())
 
     sheet_rows = (await db.execute(
         select(SheetStockItem.material_id, SheetStockItem.length_cm,
                SheetStockItem.width_cm, SheetStockItem.qty)
+        .where(SheetStockItem.tenant_id == tid)
     )).all()
     bar_rows = (await db.execute(
         select(BarStockItem.material_id, BarStockItem.length_cm, BarStockItem.qty)
+        .where(BarStockItem.tenant_id == tid)
     )).all()
 
     results = []
@@ -181,6 +199,7 @@ async def inventory_reconciliation_report(
 @router.get("/inventory/value")
 async def inventory_value_report(db: AsyncSession = Depends(get_db)):
     """قيمة المخزون الإجمالية مقسمة بالفئة"""
+    tid = _tid()
     res = await db.execute(
         select(
             MaterialCategory.name_ar,
@@ -188,6 +207,7 @@ async def inventory_value_report(db: AsyncSession = Depends(get_db)):
             func.coalesce(func.sum(Material.stock_qty * Material.unit_cost), 0).label("total_value"),
         )
         .join(Material, Material.category_id == MaterialCategory.id)
+        .where(MaterialCategory.tenant_id == tid, Material.tenant_id == tid)
         .group_by(MaterialCategory.id, MaterialCategory.name_ar)
         .order_by(func.sum(Material.stock_qty * Material.unit_cost).desc())
     )
@@ -214,12 +234,14 @@ async def inventory_movement_report(
     db: AsyncSession = Depends(get_db),
 ):
     """تقرير حركة المخزون في فترة زمنية"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
 
     q = select(StockMovement).options(selectinload(StockMovement.material)).where(
+        StockMovement.tenant_id == tid,
         StockMovement.movement_date >= date_from,
         StockMovement.movement_date <= date_to,
     )
@@ -260,11 +282,13 @@ async def slow_moving_report(
     db: AsyncSession = Depends(get_db),
 ):
     """المواد الراكدة — لم يكن فيها أي حركة خلال N يوم"""
+    tid = _tid()
     cutoff = date.today() - timedelta(days=days)
 
     active_ids_res = await db.execute(
         select(StockMovement.material_id).where(
-            StockMovement.movement_date >= cutoff
+            StockMovement.tenant_id == tid,
+            StockMovement.movement_date >= cutoff,
         ).distinct()
     )
     active_ids = {r[0] for r in active_ids_res}
@@ -272,7 +296,7 @@ async def slow_moving_report(
     all_res = await db.execute(
         select(Material)
         .options(selectinload(Material.category))
-        .where(Material.stock_qty > 0)
+        .where(Material.tenant_id == tid, Material.stock_qty > 0)
         .order_by((Material.stock_qty * Material.unit_cost).desc())
     )
     all_mats = all_res.scalars().all()
@@ -299,22 +323,25 @@ async def slow_moving_report(
 @router.get("/inventory/summary")
 async def inventory_summary(db: AsyncSession = Depends(get_db)):
     """ملخص شامل للمخزون"""
-    total_items   = await db.scalar(select(func.count()).select_from(Material))
+    tid = _tid()
+    total_items   = await db.scalar(select(func.count()).select_from(Material).where(Material.tenant_id == tid))
     low_stock     = await db.scalar(
         select(func.count()).select_from(Material)
-        .where(Material.stock_qty <= Material.reorder_level, Material.reorder_level > 0)
+        .where(Material.tenant_id == tid, Material.stock_qty <= Material.reorder_level, Material.reorder_level > 0)
     )
     out_of_stock  = await db.scalar(
-        select(func.count()).select_from(Material).where(Material.stock_qty <= 0)
+        select(func.count()).select_from(Material).where(Material.tenant_id == tid, Material.stock_qty <= 0)
     )
     total_value   = await db.scalar(
         select(func.coalesce(func.sum(Material.stock_qty * Material.unit_cost), 0))
+        .where(Material.tenant_id == tid)
     )
 
     # حركة الشهر الحالي
     today = date.today()
     mtd_in = await db.scalar(
         select(func.coalesce(func.sum(StockMovement.total_cost), 0)).where(
+            StockMovement.tenant_id == tid,
             StockMovement.movement_type == "in",
             extract("month", StockMovement.movement_date) == today.month,
             extract("year", StockMovement.movement_date) == today.year,
@@ -322,6 +349,7 @@ async def inventory_summary(db: AsyncSession = Depends(get_db)):
     )
     mtd_out = await db.scalar(
         select(func.coalesce(func.sum(StockMovement.total_cost), 0)).where(
+            StockMovement.tenant_id == tid,
             StockMovement.movement_type == "out",
             extract("month", StockMovement.movement_date) == today.month,
             extract("year", StockMovement.movement_date) == today.year,
@@ -332,7 +360,7 @@ async def inventory_summary(db: AsyncSession = Depends(get_db)):
     top_res = await db.execute(
         select(Material)
         .options(selectinload(Material.category))
-        .where(Material.stock_qty > 0)
+        .where(Material.tenant_id == tid, Material.stock_qty > 0)
         .order_by((Material.stock_qty * Material.unit_cost).desc())
     )
     top_materials = top_res.scalars().all()
@@ -361,6 +389,7 @@ async def inventory_transactions(
     db: AsyncSession = Depends(get_db),
 ):
     """سجل كل حركات المخزون مع التفاصيل"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -370,6 +399,7 @@ async def inventory_transactions(
         select(StockMovement)
         .options(selectinload(StockMovement.material))
         .where(
+            StockMovement.tenant_id == tid,
             StockMovement.movement_date >= date_from,
             StockMovement.movement_date <= date_to,
         )
@@ -401,6 +431,7 @@ async def production_summary(
     db: AsyncSession = Depends(get_db),
 ):
     """ملخص الإنتاج في فترة"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -410,6 +441,7 @@ async def production_summary(
     dt_from = datetime.combine(date_from, time.min)
     dt_to   = datetime.combine(date_to,   time.max)
     q = select(WorkOrder).where(
+        WorkOrder.tenant_id == tid,
         WorkOrder.created_at >= dt_from,
         WorkOrder.created_at <= dt_to,
     )
@@ -454,10 +486,11 @@ async def scrap_analysis(
     db: AsyncSession = Depends(get_db),
 ):
     """تحليل الهالك بالسبب والمادة"""
+    tid = _tid()
     q = select(ScrapRecord).options(
         selectinload(ScrapRecord.material),
         selectinload(ScrapRecord.work_order),
-    )
+    ).where(ScrapRecord.tenant_id == tid)
     if date_from:
         q = q.where(ScrapRecord.recorded_at >= date_from)
     if date_to:
@@ -499,6 +532,7 @@ async def profitability_report(
     db: AsyncSession = Depends(get_db),
 ):
     """تقرير الربحية التفصيلي — حسب أمر الإنتاج / العميل / المعدة"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -511,6 +545,7 @@ async def profitability_report(
         selectinload(WorkOrder.equipment),
         selectinload(WorkOrder.customer_order).selectinload(CustomerOrder.customer),
     ).where(
+        WorkOrder.tenant_id == tid,
         WorkOrder.created_at >= dt_from,
         WorkOrder.created_at <= dt_to,
     )
@@ -522,7 +557,7 @@ async def profitability_report(
     if wo_ids:
         rev_res = await db.execute(
             select(Invoice.work_order_id, func.coalesce(func.sum(Invoice.total), 0))
-            .where(Invoice.work_order_id.in_(wo_ids))
+            .where(Invoice.tenant_id == tid, Invoice.work_order_id.in_(wo_ids))
             .group_by(Invoice.work_order_id)
         )
         revenue_by_wo = {r[0]: float(r[1]) for r in rev_res.all()}
@@ -595,6 +630,7 @@ async def sales_summary(
     db: AsyncSession = Depends(get_db),
 ):
     """ملخص المبيعات في فترة"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -602,7 +638,7 @@ async def sales_summary(
 
     inv_res = await db.execute(
         select(Invoice).options(selectinload(Invoice.customer))
-        .where(Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
         .order_by(Invoice.date.desc())
     )
     invoices = inv_res.scalars().all()
@@ -636,9 +672,11 @@ async def sales_summary(
 @router.get("/sales/aging")
 async def receivables_aging(db: AsyncSession = Depends(get_db)):
     """تقرير Aging للمديونيات — مقسمة بعمر الدين (يراعي خطط الأقساط)"""
+    tid = _tid()
     today = date.today()
     unpaid_res = await db.execute(
         select(Invoice).options(selectinload(Invoice.customer)).where(
+            Invoice.tenant_id == tid,
             Invoice.status.in_(["unpaid", "partial"]),
             Invoice.total > Invoice.paid_amount,
         ).order_by(Invoice.due_date)
@@ -694,6 +732,7 @@ async def upcoming_installments(
     db: AsyncSession = Depends(get_db),
 ):
     """الأقساط المستحقة خلال N يوم جاية (لسه متسددتش بالكامل) — تنبيه بالأقساط القادمة."""
+    tid = _tid()
     today = date.today()
     horizon = today + timedelta(days=days)
     r = await db.execute(
@@ -702,6 +741,7 @@ async def upcoming_installments(
             selectinload(InvoicePaymentSchedule.invoice).selectinload(Invoice.customer),
         )
         .where(
+            InvoicePaymentSchedule.tenant_id == tid,
             InvoicePaymentSchedule.status.in_(["pending", "partial"]),
             InvoicePaymentSchedule.due_date >= today,
             InvoicePaymentSchedule.due_date <= horizon,
@@ -721,6 +761,7 @@ async def upcoming_installments(
 @router.get("/sales/installments/overdue")
 async def overdue_installments(db: AsyncSession = Depends(get_db)):
     """الأقساط اللي فات ميعاد استحقاقها ولسه متسددتش بالكامل — متابعة التأخر."""
+    tid = _tid()
     today = date.today()
     r = await db.execute(
         select(InvoicePaymentSchedule)
@@ -728,6 +769,7 @@ async def overdue_installments(db: AsyncSession = Depends(get_db)):
             selectinload(InvoicePaymentSchedule.invoice).selectinload(Invoice.customer),
         )
         .where(
+            InvoicePaymentSchedule.tenant_id == tid,
             InvoicePaymentSchedule.status.in_(["pending", "partial"]),
             InvoicePaymentSchedule.due_date < today,
         )
@@ -774,8 +816,10 @@ async def all_open_installments(
     جميع الأقساط المفتوحة في view موحد للصفحة المركزية.
     filter: overdue | week | month | all
     """
+    tid = _tid()
     today = date.today()
-    cond = [InvoicePaymentSchedule.status.in_(["pending", "partial", "overdue"])]
+    cond = [InvoicePaymentSchedule.tenant_id == tid,
+            InvoicePaymentSchedule.status.in_(["pending", "partial", "overdue"])]
 
     if filter == "overdue":
         cond.append(InvoicePaymentSchedule.due_date < today)
@@ -810,9 +854,11 @@ async def all_open_installments(
 @router.get("/sales/installments/badge")
 async def installments_badge(db: AsyncSession = Depends(get_db)):
     """عدد الأقساط المتأخرة للـ Badge في الـ Sidebar — سريع جداً."""
+    tid = _tid()
     today = date.today()
     r = await db.execute(
         select(func.count()).select_from(InvoicePaymentSchedule).where(
+            InvoicePaymentSchedule.tenant_id == tid,
             InvoicePaymentSchedule.status.in_(["pending", "partial", "overdue"]),
             InvoicePaymentSchedule.due_date < today,
         )
@@ -828,6 +874,7 @@ async def sales_by_customer(
     db: AsyncSession = Depends(get_db),
 ):
     """مبيعات مقسمة بالعميل"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -841,7 +888,9 @@ async def sales_by_customer(
             func.coalesce(func.sum(Invoice.paid_amount), 0).label("paid"),
         )
         .outerjoin(Invoice, and_(Invoice.customer_id == Customer.id,
+                                 Invoice.tenant_id == tid,
                                  Invoice.date >= date_from, Invoice.date <= date_to))
+        .where(Customer.tenant_id == tid)
         .group_by(Customer.id, Customer.name)
         .having(func.count(Invoice.id) > 0)
         .order_by(func.sum(Invoice.total).desc())
@@ -867,6 +916,7 @@ async def purchases_summary(
     db: AsyncSession = Depends(get_db),
 ):
     """ملخص المشتريات في فترة"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -874,7 +924,7 @@ async def purchases_summary(
 
     res = await db.execute(
         select(PurchaseInvoice).options(selectinload(PurchaseInvoice.supplier))
-        .where(PurchaseInvoice.date >= date_from, PurchaseInvoice.date <= date_to)
+        .where(PurchaseInvoice.tenant_id == tid, PurchaseInvoice.date >= date_from, PurchaseInvoice.date <= date_to)
         .order_by(PurchaseInvoice.date.desc())
     )
     invoices = res.scalars().all()
@@ -905,6 +955,7 @@ async def purchases_by_supplier(
     db: AsyncSession = Depends(get_db),
 ):
     """مشتريات مقسمة بالمورد"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -918,7 +969,7 @@ async def purchases_by_supplier(
             func.coalesce(func.sum(PurchaseInvoice.paid_amount), 0).label("paid"),
         )
         .outerjoin(Supplier, Supplier.id == PurchaseInvoice.supplier_id)
-        .where(PurchaseInvoice.date >= date_from, PurchaseInvoice.date <= date_to)
+        .where(PurchaseInvoice.tenant_id == tid, PurchaseInvoice.date >= date_from, PurchaseInvoice.date <= date_to)
         .group_by(func.coalesce(PurchaseInvoice.supplier_name, Supplier.name, "غير محدد"))
         .order_by(func.sum(PurchaseInvoice.total).desc())
     )
@@ -943,6 +994,7 @@ async def workers_summary(
     db: AsyncSession = Depends(get_db),
 ):
     """ملخص العمالة والرواتب في فترة"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -950,6 +1002,7 @@ async def workers_summary(
 
     payroll_res = await db.execute(
         select(PayrollRun).where(
+            PayrollRun.tenant_id == tid,
             PayrollRun.week_start >= date_from,
             PayrollRun.week_end <= date_to,
         )
@@ -958,13 +1011,16 @@ async def workers_summary(
     total_gross = sum(float(p.total_gross) for p in payrolls)
     total_net   = sum(float(p.total_net) for p in payrolls)
 
-    total_workers = await db.scalar(select(func.count()).select_from(Worker).where(Worker.is_active == True))
+    total_workers = await db.scalar(
+        select(func.count()).select_from(Worker).where(Worker.tenant_id == tid, Worker.is_active == True)
+    )
 
     att_res = await db.execute(
         select(
             Attendance.status,
             func.count().label("cnt"),
         ).where(
+            Attendance.tenant_id == tid,
             Attendance.date >= date_from,
             Attendance.date <= date_to,
         ).group_by(Attendance.status)
@@ -988,12 +1044,15 @@ async def labor_performance_report(
     db: AsyncSession = Depends(get_db),
 ):
     """تقرير أداء العمالة: الحضور، الساعات المخططة والفعلية، تكلفة العمالة والرواتب"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
 
-    workers = (await db.execute(select(Worker).where(Worker.is_active == True))).scalars().all()
+    workers = (await db.execute(
+        select(Worker).where(Worker.tenant_id == tid, Worker.is_active == True)
+    )).scalars().all()
 
     # ── الحضور ──
     att_res = await db.execute(
@@ -1002,6 +1061,7 @@ async def labor_performance_report(
             Attendance.status,
             func.count().label("cnt"),
         ).where(
+            Attendance.tenant_id == tid,
             Attendance.date >= date_from, Attendance.date <= date_to,
         ).group_by(Attendance.worker_id, Attendance.status)
     )
@@ -1018,7 +1078,7 @@ async def labor_performance_report(
             func.coalesce(func.sum(WorkOrderMember.actual_hours), 0).label("actual_hours"),
             func.coalesce(func.sum(WorkOrderMember.actual_hours * WorkOrderMember.hourly_rate), 0).label("labor_cost"),
         ).join(WorkOrder, WorkOrder.id == WorkOrderMember.work_order_id)
-         .where(WorkOrder.created_at >= date_from, WorkOrder.created_at <= date_to)
+         .where(WorkOrder.tenant_id == tid, WorkOrder.created_at >= date_from, WorkOrder.created_at <= date_to)
          .group_by(WorkOrderMember.worker_id)
     )
     wom = {r.worker_id: r for r in wom_res}
@@ -1030,7 +1090,7 @@ async def labor_performance_report(
             func.coalesce(func.sum(PayrollLine.gross_amount), 0).label("gross"),
             func.coalesce(func.sum(PayrollLine.net_amount), 0).label("net"),
         ).join(PayrollRun, PayrollRun.id == PayrollLine.payroll_run_id)
-         .where(PayrollRun.week_start >= date_from, PayrollRun.week_end <= date_to)
+         .where(PayrollRun.tenant_id == tid, PayrollRun.week_start >= date_from, PayrollRun.week_end <= date_to)
          .group_by(PayrollLine.worker_id)
     )
     payroll = {r.worker_id: r for r in payroll_res}
@@ -1096,44 +1156,46 @@ async def labor_performance_report(
 # PERIOD COMPARISON — مقارنة الفترات
 # ══════════════════════════════════════════════════════════════
 
-async def _period_kpis(db: AsyncSession, date_from: date, date_to: date) -> dict:
-    """يحسب أهم مؤشرات الأداء لفترة معيّنة"""
+async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: date) -> dict:
+    """يحسب أهم مؤشرات الأداء لفترة معيّنة (مقصورة على tenant الحالي)"""
     sales_total = float(await db.scalar(
         select(func.coalesce(func.sum(Invoice.total), 0))
-        .where(Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
     ) or 0)
     collected = float(await db.scalar(
         select(func.coalesce(func.sum(Invoice.paid_amount), 0))
-        .where(Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
     ) or 0)
     invoices_count = await db.scalar(
         select(func.count()).select_from(Invoice)
-        .where(Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
     ) or 0
     purchases_total = float(await db.scalar(
         select(func.coalesce(func.sum(PurchaseInvoice.total), 0))
-        .where(PurchaseInvoice.date >= date_from, PurchaseInvoice.date <= date_to)
+        .where(PurchaseInvoice.tenant_id == tid, PurchaseInvoice.date >= date_from, PurchaseInvoice.date <= date_to)
     ) or 0)
 
     dt_from = datetime.combine(date_from, time.min)
     dt_to = datetime.combine(date_to, time.max)
     production_cost = float(await db.scalar(
         select(func.coalesce(func.sum(WorkOrder.actual_cost), 0))
-        .where(WorkOrder.status == "done", WorkOrder.created_at >= dt_from, WorkOrder.created_at <= dt_to)
+        .where(WorkOrder.tenant_id == tid, WorkOrder.status == "done",
+               WorkOrder.created_at >= dt_from, WorkOrder.created_at <= dt_to)
     ) or 0)
     completed_work_orders = await db.scalar(
         select(func.count()).select_from(WorkOrder)
-        .where(WorkOrder.status == "done", WorkOrder.created_at >= dt_from, WorkOrder.created_at <= dt_to)
+        .where(WorkOrder.tenant_id == tid, WorkOrder.status == "done",
+               WorkOrder.created_at >= dt_from, WorkOrder.created_at <= dt_to)
     ) or 0
 
     cashflow_in = float(await db.scalar(
         select(func.coalesce(func.sum(TreasuryTransaction.amount), 0))
-        .where(TreasuryTransaction.direction == "in",
+        .where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.direction == "in",
                TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
     ) or 0)
     cashflow_out = float(await db.scalar(
         select(func.coalesce(func.sum(TreasuryTransaction.amount), 0))
-        .where(TreasuryTransaction.direction == "out",
+        .where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.direction == "out",
                TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
     ) or 0)
 
@@ -1169,6 +1231,7 @@ async def period_comparison_report(
     db: AsyncSession = Depends(get_db),
 ):
     """مقارنة أهم المؤشرات بين فترتين — الفترة السابقة تُحسب تلقائيًا بنفس طول الفترة الحالية إن لم تُحدَّد"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
@@ -1179,8 +1242,8 @@ async def period_comparison_report(
         compare_to = date_from - timedelta(days=1)
         compare_from = compare_to - timedelta(days=period_len - 1)
 
-    current = await _period_kpis(db, date_from, date_to)
-    previous = await _period_kpis(db, compare_from, compare_to)
+    current = await _period_kpis(db, tid, date_from, date_to)
+    previous = await _period_kpis(db, tid, compare_from, compare_to)
 
     metrics = [
         ("sales_total", "إجمالي المبيعات"),
@@ -1215,22 +1278,28 @@ async def period_comparison_report(
 @router.get("/dashboard")
 async def executive_dashboard(db: AsyncSession = Depends(get_db)):
     """داشبورد تنفيذي شامل لجميع الأقسام"""
+    tid = _tid()
     today = date.today()
     month_start = today.replace(day=1)
 
     # Inventory KPIs
     inv_value = await db.scalar(
         select(func.coalesce(func.sum(Material.stock_qty * Material.unit_cost), 0))
+        .where(Material.tenant_id == tid)
     )
     low_stock = await db.scalar(
         select(func.count()).select_from(Material)
-        .where(Material.stock_qty <= Material.reorder_level, Material.reorder_level > 0)
+        .where(Material.tenant_id == tid, Material.stock_qty <= Material.reorder_level, Material.reorder_level > 0)
     )
 
     # Production KPIs
-    open_wos    = await db.scalar(select(func.count()).select_from(WorkOrder).where(WorkOrder.status == "in_progress"))
+    open_wos    = await db.scalar(
+        select(func.count()).select_from(WorkOrder)
+        .where(WorkOrder.tenant_id == tid, WorkOrder.status == "in_progress")
+    )
     mtd_wo_cost = await db.scalar(
         select(func.coalesce(func.sum(WorkOrder.actual_cost), 0)).where(
+            WorkOrder.tenant_id == tid,
             extract("month", WorkOrder.created_at) == today.month,
             WorkOrder.status == "done",
         )
@@ -1239,29 +1308,29 @@ async def executive_dashboard(db: AsyncSession = Depends(get_db)):
     # Sales KPIs
     mtd_sales = await db.scalar(
         select(func.coalesce(func.sum(Invoice.total), 0)).where(
-            Invoice.date >= month_start
+            Invoice.tenant_id == tid, Invoice.date >= month_start
         )
     )
     mtd_collected = await db.scalar(
         select(func.coalesce(func.sum(Invoice.paid_amount), 0)).where(
-            Invoice.date >= month_start
+            Invoice.tenant_id == tid, Invoice.date >= month_start
         )
     )
     total_receivable = await db.scalar(
         select(func.coalesce(func.sum(Invoice.total - Invoice.paid_amount), 0)).where(
-            Invoice.status.in_(["unpaid", "partial"])
+            Invoice.tenant_id == tid, Invoice.status.in_(["unpaid", "partial"])
         )
     )
 
     # Purchases KPIs
     mtd_purchases = await db.scalar(
         select(func.coalesce(func.sum(PurchaseInvoice.total), 0)).where(
-            PurchaseInvoice.date >= month_start
+            PurchaseInvoice.tenant_id == tid, PurchaseInvoice.date >= month_start
         )
     )
     total_payable = await db.scalar(
         select(func.coalesce(func.sum(PurchaseInvoice.total - PurchaseInvoice.paid_amount), 0)).where(
-            PurchaseInvoice.status.in_(["received", "partial"])
+            PurchaseInvoice.tenant_id == tid, PurchaseInvoice.status.in_(["received", "partial"])
         )
     )
 
@@ -1301,13 +1370,14 @@ async def cashflow_report(
     db: AsyncSession = Depends(get_db),
 ):
     """تقرير الخزينة والتدفقات النقدية: الداخل/الخارج لكل فترة + تجميع حسب الفئة"""
+    tid = _tid()
     if not date_from:
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
 
     # ── الأرصدة الحالية للخزن ──
-    treas_q = select(Treasury).where(Treasury.is_active == True)
+    treas_q = select(Treasury).where(Treasury.tenant_id == tid, Treasury.is_active == True)
     if treasury_id:
         treas_q = treas_q.where(Treasury.id == treasury_id)
     treasuries = (await db.execute(treas_q)).scalars().all()
@@ -1318,7 +1388,7 @@ async def cashflow_report(
         func.coalesce(func.sum(
             case((TreasuryTransaction.direction == "in", TreasuryTransaction.amount), else_=-TreasuryTransaction.amount)
         ), 0)
-    ).where(TreasuryTransaction.txn_date < date_from)
+    ).where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.txn_date < date_from)
     if treasury_id:
         prior_q = prior_q.where(TreasuryTransaction.treasury_id == treasury_id)
     opening_balance += float(await db.scalar(prior_q) or 0)
@@ -1326,14 +1396,17 @@ async def cashflow_report(
     # ── الحركات في الفترة ──
     txn_q = (
         select(TreasuryTransaction)
-        .where(TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
+        .where(TreasuryTransaction.tenant_id == tid,
+               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
         .order_by(TreasuryTransaction.txn_date)
     )
     if treasury_id:
         txn_q = txn_q.where(TreasuryTransaction.treasury_id == treasury_id)
     txns = (await db.execute(txn_q)).scalars().all()
 
-    cats = {c.id: c.name for c in (await db.execute(select(TreasuryCategory))).scalars().all()}
+    cats = {c.id: c.name for c in (await db.execute(
+        select(TreasuryCategory).where(TreasuryCategory.tenant_id == tid)
+    )).scalars().all()}
 
     # ── تجميع حسب الفترة ──
     def period_key(d: date) -> str:
@@ -1400,6 +1473,7 @@ async def cashflow_report(
 @router.get("/analytics/monthly-sales")
 async def monthly_sales_breakdown(db: AsyncSession = Depends(get_db)):
     """مبيعات شهرية للـ 12 شهر الماضية — للوحة التحليلات"""
+    tid = _tid()
     from datetime import date as dt
     import calendar
 
@@ -1420,7 +1494,7 @@ async def monthly_sales_breakdown(db: AsyncSession = Depends(get_db)):
 
         total = await db.scalar(
             select(func.coalesce(func.sum(Invoice.total), 0))
-            .where(Invoice.date >= mo_start, Invoice.date <= mo_end)
+            .where(Invoice.tenant_id == tid, Invoice.date >= mo_start, Invoice.date <= mo_end)
         )
         results.append({"month": f"{year}-{month:02d}", "total": float(total or 0)})
 
@@ -1430,10 +1504,11 @@ async def monthly_sales_breakdown(db: AsyncSession = Depends(get_db)):
 @router.get("/analytics/production-by-type")
 async def production_by_type(db: AsyncSession = Depends(get_db)):
     """هامش الربح حسب نوع أمر الإنتاج — للوحة التحليلات"""
+    tid = _tid()
     from app.models.models import WorkOrder
 
     res = await db.execute(
-        select(WorkOrder).where(WorkOrder.status == "done")
+        select(WorkOrder).where(WorkOrder.tenant_id == tid, WorkOrder.status == "done")
     )
     work_orders = res.scalars().all()
 
@@ -1475,12 +1550,14 @@ export_router     = APIRouter(prefix="/reports/export", tags=["reports_export"],
 @aging_print_router.get("/sales/aging/print", response_class=HTMLResponse)
 async def print_aging_report(db: AsyncSession = Depends(get_db)):
     """طباعة تقرير مديونيات العملاء — Aging Report"""
+    tid = _tid()
     from datetime import date as _date
     import html as _h
     today = _date.today()
 
     unpaid_res = await db.execute(
         select(Invoice).options(selectinload(Invoice.customer)).where(
+            Invoice.tenant_id == tid,
             Invoice.status.in_(["unpaid", "partial"]),
             Invoice.total > Invoice.paid_amount,
         ).order_by(Invoice.due_date)
@@ -1489,11 +1566,7 @@ async def print_aging_report(db: AsyncSession = Depends(get_db)):
 
     # Fetch company
     from app.models.models import WorkshopProfile
-    from app.core.database import current_tenant_id
-    tid = current_tenant_id.get()
-    q = select(WorkshopProfile)
-    if tid is not None:
-        q = q.where(WorkshopProfile.tenant_id == tid)
+    q = select(WorkshopProfile).where(WorkshopProfile.tenant_id == tid)
     prof_res = await db.execute(q.limit(1))
     prof = prof_res.scalar_one_or_none()
     cname = _h.escape(prof.name if prof else "ورشة معدات الاعلاف")
@@ -1677,8 +1750,9 @@ def _csv_response(rows: list[list], headers: list[str], filename: str) -> Stream
 
 @export_router.get("/materials")
 async def export_materials(db: AsyncSession = Depends(get_db)):
+    tid = _tid()
     rows = (await db.execute(
-        select(Material).order_by(Material.code)
+        select(Material).where(Material.tenant_id == tid).order_by(Material.code)
     )).scalars().all()
     headers = ['الكود', 'الاسم', 'الفئة', 'الوحدة', 'الكمية', 'حد الطلب', 'سعر الوحدة', 'قيمة المخزون']
     data = [[
@@ -1691,8 +1765,10 @@ async def export_materials(db: AsyncSession = Depends(get_db)):
 
 @export_router.get("/invoices")
 async def export_invoices(db: AsyncSession = Depends(get_db)):
+    tid = _tid()
     rows = (await db.execute(
-        select(Invoice).options(selectinload(Invoice.customer)).order_by(Invoice.date.desc())
+        select(Invoice).options(selectinload(Invoice.customer))
+        .where(Invoice.tenant_id == tid).order_by(Invoice.date.desc())
     )).scalars().all()
     headers = ['الكود', 'العميل', 'التاريخ', 'تاريخ الاستحقاق', 'الإجمالي', 'المدفوع', 'المتبقي', 'الحالة']
     data = [[
@@ -1710,7 +1786,10 @@ async def export_invoices(db: AsyncSession = Depends(get_db)):
 
 @export_router.get("/customers")
 async def export_customers(db: AsyncSession = Depends(get_db)):
-    rows = (await db.execute(select(Customer).order_by(Customer.name))).scalars().all()
+    tid = _tid()
+    rows = (await db.execute(
+        select(Customer).where(Customer.tenant_id == tid).order_by(Customer.name)
+    )).scalars().all()
     headers = ['الاسم', 'الهاتف', 'البريد', 'العنوان', 'الرصيد']
     data = [[
         c.name, c.phone or '', c.email or '', c.address or '',
@@ -1721,8 +1800,10 @@ async def export_customers(db: AsyncSession = Depends(get_db)):
 
 @export_router.get("/work-orders")
 async def export_work_orders(db: AsyncSession = Depends(get_db)):
+    tid = _tid()
     rows = (await db.execute(
-        select(WorkOrder).options(selectinload(WorkOrder.equipment)).order_by(WorkOrder.created_at.desc())
+        select(WorkOrder).options(selectinload(WorkOrder.equipment))
+        .where(WorkOrder.tenant_id == tid).order_by(WorkOrder.created_at.desc())
     )).scalars().all()
     headers = ['الكود', 'المعدة', 'الحالة', 'التكلفة المخططة', 'التكلفة الفعلية', 'الانحراف', 'تاريخ البدء', 'تاريخ الانتهاء']
     data = [[
@@ -1815,8 +1896,10 @@ async def export_period_comparison(
 
 @export_router.get("/quotations")
 async def export_quotations(db: AsyncSession = Depends(get_db)):
+    tid = _tid()
     rows = (await db.execute(
-        select(Quotation).options(selectinload(Quotation.customer)).order_by(Quotation.date.desc())
+        select(Quotation).options(selectinload(Quotation.customer))
+        .where(Quotation.tenant_id == tid).order_by(Quotation.date.desc())
     )).scalars().all()
     headers = ['الرقم', 'العميل', 'التاريخ', 'صالح حتى', 'الإجمالي', 'الحالة']
     data = [[
@@ -1880,10 +1963,13 @@ async def payment_history(
     db: AsyncSession = Depends(get_db),
 ):
     """سجل موحد لجميع المدفوعات — عملاء وموردين"""
+    tid = _tid()
     results = []
 
     # ── دفعات العملاء ──────────────────────────────────────────
-    cq = select(CustomerPayment).options(selectinload(CustomerPayment.customer))
+    cq = select(CustomerPayment).options(selectinload(CustomerPayment.customer)).where(
+        CustomerPayment.tenant_id == tid
+    )
     if date_from:
         cq = cq.where(CustomerPayment.payment_date >= date_from)
     if date_to:
@@ -1914,7 +2000,7 @@ async def payment_history(
     else:
         sq = select(SupplierPayment, Supplier).join(
             Supplier, Supplier.id == SupplierPayment.supplier_id, isouter=True
-        )
+        ).where(SupplierPayment.tenant_id == tid)
         if date_from:
             sq = sq.where(SupplierPayment.payment_date >= date_from)
         if date_to:
@@ -1944,7 +2030,8 @@ async def payment_history(
     user_map: dict = {}
     if user_ids:
         users_rows = (await db.execute(
-            select(User.id, User.full_name, User.username).where(User.id.in_(user_ids))
+            select(User.id, User.full_name, User.username)
+            .where(User.tenant_id == tid, User.id.in_(user_ids))
         )).all()
         user_map = {u.id: (u.full_name or u.username) for u in users_rows}
     for r in results:

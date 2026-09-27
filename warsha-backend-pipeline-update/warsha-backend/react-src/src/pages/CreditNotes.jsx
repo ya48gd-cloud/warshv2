@@ -159,7 +159,7 @@ export default function CreditNotes() {
       resetForm()
       load()
     } catch (e) {
-      addToast(e?.detail || 'خطأ في الحفظ', 'error')
+      addToast(e?.message || 'خطأ في الحفظ', 'error')
     } finally { setSaving(false) }
   }
 
@@ -177,7 +177,7 @@ export default function CreditNotes() {
       addToast('تم إصدار الإشعار وخصم المبلغ من رصيد العميل', 'success')
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   /* ── cancel ── */
@@ -187,7 +187,7 @@ export default function CreditNotes() {
       addToast('تم إلغاء الإشعار', 'info')
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   /* ── delete ── */
@@ -198,7 +198,7 @@ export default function CreditNotes() {
       setConfirmDel(null)
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ في الحذف', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في الحذف', 'error') }
   }
 
   /* ── from invoice ── */
@@ -208,7 +208,7 @@ export default function CreditNotes() {
       await api.creditNotes.fromInvoice(invId)
       addToast('تم إنشاء إشعار مرتجع كامل من الفاتورة', 'success')
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   /* ── print ── */

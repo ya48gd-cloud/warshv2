@@ -17,13 +17,20 @@ class EquipmentService:
         payload = data.model_dump()
         # نحقن tenant_id تلقائياً من context
         payload['tenant_id'] = _ctid_eq.get() or 1
-        # توليد الكود تلقائياً إن لم يُذكر
+        # توليد الكود تلقائياً إن لم يُذكر — لازم يتحسب لكل tenant على حدة
+        # (uq_equipment_tenant_code هو القيد الفعلي)، غير كده أول معدة لعميل
+        # جديد بتاخد كود غريب بمجرد وجود عملاء تانيين بعدد معدات أكبر.
         if not payload.get("code"):
-            count = await db.scalar(select(_func.count()).select_from(Equipment))
+            tid_for_code = payload["tenant_id"]
+            count = await db.scalar(
+                select(_func.count()).select_from(Equipment).where(Equipment.tenant_id == tid_for_code)
+            )
             n = (count or 0) + 1
             while True:
                 candidate = f"EQ-{n:04d}"
-                exists = await db.scalar(select(Equipment.id).where(Equipment.code == candidate))
+                exists = await db.scalar(
+                    select(Equipment.id).where(Equipment.code == candidate, Equipment.tenant_id == tid_for_code)
+                )
                 if not exists:
                     break
                 n += 1
@@ -59,9 +66,10 @@ class EquipmentService:
 
     @staticmethod
     async def list_root_equipment(db: AsyncSession):
+        from app.core.database import current_tenant_id as _ctid_lre
         result = await db.execute(
             select(Equipment)
-            .where(Equipment.parent_id.is_(None))
+            .where(Equipment.parent_id.is_(None), Equipment.tenant_id == (_ctid_lre.get() or 1))
             .order_by(Equipment.id)
         )
         return result.scalars().all()
@@ -78,6 +86,7 @@ class EquipmentService:
 
     @staticmethod
     async def get_equipment(db: AsyncSession, eq_id: int):
+        from app.core.database import current_tenant_id as _ctid_ge
         result = await db.execute(
             select(Equipment)
             .options(
@@ -85,7 +94,7 @@ class EquipmentService:
                 selectinload(Equipment.dimensions),
                 selectinload(Equipment.cost_lines),
             )
-            .where(Equipment.id == eq_id)
+            .where(Equipment.id == eq_id, Equipment.tenant_id == (_ctid_ge.get() or 1))
         )
         return result.scalar_one_or_none()
 
@@ -140,7 +149,7 @@ class EquipmentService:
         tid = _ctid_dup.get() or 1
 
         src = await db.get(Equipment, eq_id)
-        if src is None:
+        if src is None or src.tenant_id != tid:
             raise ValueError("المعدة غير موجودة")
 
         exists = await db.scalar(select(Equipment.id).where(Equipment.tenant_id == tid, Equipment.code == new_code))
@@ -238,10 +247,11 @@ class EquipmentService:
     @staticmethod
     async def add_bom_line(db: AsyncSession, data: BOMLineCreate) -> BOMLine:
         from app.core.database import current_tenant_id as _ctid_bom
+        tid_bom = _ctid_bom.get() or 1
         payload = data.model_dump()
-        payload['tenant_id'] = _ctid_bom.get() or 1
+        payload['tenant_id'] = tid_bom
         equipment = await db.get(Equipment, data.equipment_id)
-        if equipment is None:
+        if equipment is None or equipment.tenant_id != tid_bom:
             raise ValueError("المعدة غير موجودة — لا يمكن إضافة BOM")
         material = await db.get(Material, data.material_id)
         if material is None:
@@ -696,8 +706,9 @@ class EquipmentService:
     @staticmethod
     async def add_cost_line(db: AsyncSession, equipment_id: int, cost_type: str,
                             description: str, cost_per_unit: Decimal) -> EquipmentCostLine:
+        from app.core.database import current_tenant_id as _ctid_acl
         equipment = await db.get(Equipment, equipment_id)
-        if equipment is None:
+        if equipment is None or equipment.tenant_id != (_ctid_acl.get() or 1):
             raise ValueError("المعدة غير موجودة")
         line = EquipmentCostLine(
             equipment_id=equipment_id,

@@ -360,6 +360,24 @@ async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
     if cust:
         cust.balance = (cust.balance or Decimal("0")) - Decimal(str(cn.total))
 
+    # إصلاح ثغرة تكامل: الإشعار الدائن المرتبط بفاتورة كان يخفّض رصيد العميل
+    # الإجمالي بس، من غير ما يلمس الفاتورة نفسها — فتفضل الفاتورة "غير مدفوعة"
+    # بكامل قيمتها الأصلية في كل التقارير (remaining/status) رغم إن العميل
+    # رجّع البضاعة فعليًا وخُصم المبلغ من رصيده. نطبّق المبلغ على paid_amount
+    # بنفس أسلوب تسجيل أي دفعة عادية، بحد أقصى المتبقي على الفاتورة.
+    applied_to_invoice = Decimal("0")
+    if cn.invoice_id:
+        inv = await db.get(Invoice, cn.invoice_id)
+        if inv:
+            remaining = inv.total - inv.paid_amount
+            if remaining > 0:
+                applied_to_invoice = min(Decimal(str(cn.total)), remaining)
+                inv.paid_amount = inv.paid_amount + applied_to_invoice
+                if inv.paid_amount >= inv.total:
+                    inv.status = "paid"
+                elif inv.paid_amount > 0:
+                    inv.status = "partial"
+
     cn.status    = "issued"
     cn.issued_at = datetime.utcnow()
 
@@ -371,7 +389,8 @@ async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
     )
 
     await db.commit()
-    return {"id": cn_id, "status": "issued", "total": float(cn.total)}
+    return {"id": cn_id, "status": "issued", "total": float(cn.total),
+            "applied_to_invoice": float(applied_to_invoice)}
 
 
 @router.patch("/{cn_id}/cancel")
@@ -393,6 +412,20 @@ async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
         cust = await db.get(Customer, cn.customer_id)
         if cust:
             cust.balance = (cust.balance or Decimal("0")) + Decimal(str(cn.total))
+
+        # عكس ما طُبِّق على الفاتورة المرتبطة عند الإصدار (راجع issue_credit_note)
+        if cn.invoice_id:
+            inv = await db.get(Invoice, cn.invoice_id)
+            if inv:
+                reverse_amt = min(Decimal(str(cn.total)), inv.paid_amount)
+                if reverse_amt > 0:
+                    inv.paid_amount = inv.paid_amount - reverse_amt
+                    if inv.paid_amount >= inv.total:
+                        inv.status = "paid"
+                    elif inv.paid_amount > 0:
+                        inv.status = "partial"
+                    else:
+                        inv.status = "unpaid"
 
         from app.core.database import current_tenant_id as _ctid_cnc
         from app.services.auto_journal import journal_credit_note_cancel

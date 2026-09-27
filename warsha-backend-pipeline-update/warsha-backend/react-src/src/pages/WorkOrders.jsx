@@ -75,7 +75,12 @@ function MetricBomPreview({ equipmentId, length }) {
 function CutIssueModal({ res, mat, wo, onClose, onDone }) {
   const toast = useToast()
   const isPlate = !!mat && (mat.is_plate || mat.material_kind === 'plate')
-  const remaining = res ? Number(res.required_qty || 0) - Number(res.issued_qty || 0) : 0
+  // ملاحظة: لازم نستخدم reserved_qty (المحجوز فعلياً) لا required_qty (المطلوب من BOM) —
+  // لو حصل نقص عند الحجز (reserved_qty < required_qty)، الصرف الفعلي (سواء العادي عبر
+  // issue-by-reservation أو تقطيع/صرف هذه الشاشة) بيتقيّد بـ reserved_qty - issued_qty
+  // من الباك-إند دايماً. لو استخدمنا required_qty هنا هنولّد خطة تقطيع أكبر من المتاح
+  // فعلاً في الحجز، فيتقطّع/يُستهلك من المخزون أكتر مما هو محجوز لهذا الأمر تحديداً.
+  const remaining = res ? Number(res.reserved_qty || 0) - Number(res.issued_qty || 0) : 0
 
   const [pieces, setPieces] = useState([])
   const [result, setResult] = useState(null)

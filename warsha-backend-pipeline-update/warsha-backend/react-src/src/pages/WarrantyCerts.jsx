@@ -112,7 +112,7 @@ export default function WarrantyCerts() {
       setShowCreate(false)
       resetForm()
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ في الحفظ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في الحفظ', 'error') }
     finally { setSaving(false) }
   }
 
@@ -131,7 +131,7 @@ export default function WarrantyCerts() {
       addToast('تم إصدار شهادة الضمان', 'success')
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   const handleDelete = async (id) => {
@@ -141,7 +141,7 @@ export default function WarrantyCerts() {
       setConfirmDel(null)
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.detail || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
   }
 
   const printCert = (id) => api.print(`/warranty-certs/${id}/print`)

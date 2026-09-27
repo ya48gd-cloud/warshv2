@@ -84,12 +84,23 @@ async def auto_reserve_materials(db: AsyncSession, work_order_id: int) -> dict:
     if not bom_lines:
         return {"error": "لا توجد بنود BOM لهذه المعدة", "reserved": 0, "shortages": []}
 
-    # حذف الحجوزات القديمة لو موجودة
+    # حذف الحجوزات القديمة لو موجودة — لكن فقط اللي لسه ما اتصرفش/اتهلكش منها
+    # حاجة خالص. محطة 27 (تصليح جذري): كانت بتتمسح كل الحجوزات بلا استثناء،
+    # يعني إعادة استدعاء auto-reserve/reserve على أمر إنتاج بعد ما اتصرف
+    # منه جزء فعليًا كانت بتمسح issued_qty/scrap_qty المسجّلة وتبني حجز جديد
+    # بـissued_qty=0 — فأي issue_material بعد كده كان ممكن يصرف نفس الكمية
+    # تاني (لأن الحجز الجديد ملوش أي أثر للصرف السابق)، رغم إن المخزون
+    # اتخصم منه فعليًا مرة واحدة بس. الحل: حجز فيه أي تقدم فعلي (صرف أو
+    # هالك) يتسيب زي ما هو تمامًا — مش يتمسح ولا يتكرر.
     old_res = (await db.execute(
         select(MaterialReservation).where(MaterialReservation.work_order_id == work_order_id)
     )).scalars().all()
+    preserved_material_ids = set()
     for r in old_res:
-        await db.delete(r)
+        if (r.issued_qty or Decimal("0")) > 0 or (r.scrap_qty or Decimal("0")) > 0:
+            preserved_material_ids.add(r.material_id)
+        else:
+            await db.delete(r)
 
     # حذف snapshot القديم فقط إذا لم نكن نستخدمه (في حالة غير المترية)
     if not use_parametric_snapshot:
@@ -115,6 +126,11 @@ async def auto_reserve_materials(db: AsyncSession, work_order_id: int) -> dict:
     for line in bom_lines:
         mat = await db.get(Material, line['material_id'])
         if not mat:
+            continue
+
+        # لو الحجز القديم لهذه المادة فيه صرف/هالك فعلي، سايبينه زي ما هو
+        # (محطة 27 أعلاه) — تكراره هنا هيعمل صف مكرر لنفس المادة بلا داعي
+        if line['material_id'] in preserved_material_ids:
             continue
 
         # للـ snapshot المتري، الكمية جاهزة. للـ BOM العادي، نضرب في wo_qty
@@ -213,6 +229,97 @@ async def auto_reserve_materials(db: AsyncSession, work_order_id: int) -> dict:
     }
 
 
+async def reserve_single_material(db: AsyncSession, work_order_id: int, material_id: int, qty: Decimal) -> dict:
+    """
+    محطة 27: حجز يدوي لمادة واحدة بكمية محددة — للاستخدام من شاشة "حجز
+    يدوي" في الواجهة (بخلاف auto_reserve_materials اللي بيعيد بناء كل
+    حجوزات BOM دفعة واحدة). لا يمس أي حجز آخر لنفس أمر الإنتاج.
+
+    لو فيه حجز سابق لنفس المادة على نفس الأمر، بيزوّد عليه (required_qty
+    += qty) بدل ما يستبدله أو يمسحه — نفس مبدأ الحماية المطبَّق في
+    auto_reserve_materials (محطة 27 أعلاه) ضد فقد أثر issued_qty/scrap_qty.
+    """
+    wo = await db.get(WorkOrder, work_order_id)
+    if not wo:
+        return {"error": "أمر الإنتاج غير موجود"}
+    mat = await db.get(Material, material_id)
+    if not mat:
+        return {"error": "المادة غير موجودة"}
+    if qty is None or qty <= 0:
+        return {"error": "الكمية المطلوب حجزها يجب أن تكون أكبر من صفر"}
+
+    from app.core.database import current_tenant_id as _ctid_rsm
+    tid = _ctid_rsm.get() or 1
+    from app.services.inventory_ledger import get_or_create_warehouse_bin
+    raw_bin = await get_or_create_warehouse_bin(db, tid, "RAW")
+
+    res = (await db.execute(
+        select(MaterialReservation).where(
+            MaterialReservation.work_order_id == work_order_id,
+            MaterialReservation.material_id == material_id,
+        )
+    )).scalar_one_or_none()
+
+    # نفس منطق التوفر المستخدم في auto_reserve_materials: الرصيد الفعلي في
+    # مواقع RAW+IMPORTED ناقص أي حجز آخر (لأوامر إنتاج غير هذا الأمر) لسه مفتوح
+    other_reserved = (await db.execute(
+        select(MaterialReservation).where(
+            MaterialReservation.material_id == material_id,
+            MaterialReservation.work_order_id != work_order_id,
+            MaterialReservation.status.in_(['pending', 'partial', 'reserved', 'partially_issued']),
+        )
+    )).scalars().all()
+    committed = sum((r.reserved_qty - r.issued_qty) for r in other_reserved) if other_reserved else Decimal("0")
+    location_qty = await _get_raw_and_imported_qty(db, tid, mat.id)
+    available = max(location_qty - committed, Decimal("0"))
+
+    can_reserve_extra = min(qty, available)
+
+    if res:
+        res.required_qty = (res.required_qty or Decimal("0")) + qty
+        res.reserved_qty = (res.reserved_qty or Decimal("0")) + can_reserve_extra
+        res.status = 'reserved' if res.reserved_qty >= res.required_qty else 'partial'
+        if not res.location_id:
+            res.location_id = raw_bin.id
+    else:
+        res = MaterialReservation(
+            tenant_id=tid,
+            work_order_id=work_order_id,
+            material_id=material_id,
+            required_qty=qty,
+            reserved_qty=can_reserve_extra,
+            status='reserved' if can_reserve_extra >= qty else 'partial',
+            reserved_at=date.today(),
+            location_id=raw_bin.id,
+        )
+        db.add(res)
+
+    shortage = max(qty - can_reserve_extra, Decimal("0"))
+    await db.commit()
+    await db.refresh(res)
+
+    result = {
+        "reserved":      1,
+        "material_id":   mat.id,
+        "material_code": mat.code,
+        "requested_qty": float(qty),
+        "reserved_qty":  float(can_reserve_extra),
+        "shortage":      float(shortage),
+        "shortages":     [{
+            "material_id":   mat.id,
+            "material_code": mat.code,
+            "material_name": mat.name_ar,
+            "required":      float(qty),
+            "available":     float(available),
+            "shortage":      float(shortage),
+        }] if shortage > 0 else [],
+        "blocked":         shortage > 0,
+        "work_order":      wo.code,
+        "reservation_id":  res.id,
+    }
+    return result
+
+
 async def _get_full_bom(db: AsyncSession, equipment_id: int) -> List[dict]:
     """جلب BOM بشكل recursive مع تجميع نفس المواد"""
     result = {}
@@ -307,19 +414,19 @@ async def _issue_remnant_value(db: AsyncSession, tid: int, mat: Material, qty: D
     )
 
 
-async def _consume_bulk_stock(mat: Material, remaining: Decimal) -> tuple[Decimal, Decimal]:
+async def _consume_bulk_stock(db: AsyncSession, tid: int, mat: Material, remaining: Decimal) -> tuple[Decimal, Decimal]:
     """
     محطة 18 (الروادماب الأصلي): الخطوة المشتركة اللي كانت متكررة 3 مرات
     (مرتين في _consume_bar_qty، ومرة في _consume_plate_qty) — الرجوع للرصيد
     الإجمالي (bulk) بعد ما تخلص النسالة المتاحة. استخراجها هنا يقفل باب
     اختلاف السلوك بين المسارين لو حد عدّل واحدة ونسي التانية.
 
-    ملاحظة نطاق مهمة (زي محطة 16 بالظبط): الدالة دي لسه بتخصم من
-    Material.stock_qty الإجمالي مباشرة، مش من StockQuant بموقع محدد. مفيش
-    توسيع لنطاق location-awareness هنا عمدًا — نفس السبب الموثّق في محطة 16:
-    فرض موقع واحد (زي RAW) دلوقتي كان هيكسر مواد داخلة من مواقع تانية
-    (DEFAULT من الحركات اليدوية، مثلاً). التوحيد هنا هدفه إزالة تكرار
-    المنطق نفسه، مش إضافة قدرة جديدة لسه مش جاهزة.
+    محطة 26 (تكملة محطة 16/24): بعد ما تقرير التسوية (reports.py) أثبت إن
+    Material.stock_qty وSUM(StockQuant) لازم يتفقوا دايمًا (الليدجر المركزي
+    المفروض يحدّث الاتنين مع بعض)، الدالة دي كانت الاستثناء الوحيد المتبقي
+    في مسار الإنتاج بيخصم من stock_qty المجرَّد مباشرة من غير ما يزامن
+    StockQuant في موقع RAW — نفس فجوة محطة 15/25 (بالظبط) لسه موجودة هنا.
+    بنزامنها هنا في موقع RAW (نفس الموقع اللي الحجوزات وباقي محطة 16 بتفترضه).
 
     يرجّع (الكمية المستهلكة فعليًا, تكلفتها).
     """
@@ -329,6 +436,9 @@ async def _consume_bulk_stock(mat: Material, remaining: Decimal) -> tuple[Decima
     if used <= 0:
         return Decimal("0"), Decimal("0")
     mat.stock_qty -= used
+    from app.services.inventory_ledger import get_or_create_warehouse_bin, _sync_quant
+    raw_bin = await get_or_create_warehouse_bin(db, tid, "RAW")
+    await _sync_quant(db, tenant_id=tid, material_id=mat.id, delta_qty=-used, location_id=raw_bin.id)
     return used, used * mat.unit_cost
 
 
@@ -360,7 +470,7 @@ async def _consume_plate_qty(db: AsyncSession, mat: Material, required_m2: Decim
         await db.delete(rem)
         remnants_used.append({"material_name": mat.name_ar, "remnant_area_m2": float(rem_area), "cost": float(cost)})
 
-    bulk_used, bulk_cost = await _consume_bulk_stock(mat, remaining)
+    bulk_used, bulk_cost = await _consume_bulk_stock(db, tid, mat, remaining)
     total_cost += bulk_cost
     remaining -= bulk_used
 
@@ -381,7 +491,7 @@ async def _consume_bar_qty(db: AsyncSession, mat: Material, required_kg: Decimal
     from app.models.models import BarStockItem
     wpm = mat.weight_per_meter_kg
     if not wpm or wpm == 0:
-        bulk_used, bulk_cost = await _consume_bulk_stock(mat, required_kg)
+        bulk_used, bulk_cost = await _consume_bulk_stock(db, tid, mat, required_kg)
         return {
             "issued_kg": bulk_used,
             "cost": bulk_cost,
@@ -450,7 +560,7 @@ async def _consume_bar_qty(db: AsyncSession, mat: Material, required_kg: Decimal
     bulk_used_kg = Decimal("0")
     if remaining > 0:
         remaining_kg = remaining * wpm
-        bulk_used_kg, bulk_cost = await _consume_bulk_stock(mat, remaining_kg)
+        bulk_used_kg, bulk_cost = await _consume_bulk_stock(db, tid, mat, remaining_kg)
         if bulk_used_kg > 0:
             total_cost += bulk_cost
             remaining -= bulk_used_kg / wpm
@@ -540,6 +650,11 @@ async def issue_material(
         actual_qty = qty_to_issue
         total_cost = qty_to_issue * mat.unit_cost
         mat.stock_qty -= qty_to_issue
+        # محطة 26: زامن StockQuant في موقع RAW — نفس تصليح _consume_bulk_stock
+        # (كان الخصم هنا بيمس Material.stock_qty بس، بيكسر تطابق تقرير التسوية)
+        from app.services.inventory_ledger import get_or_create_warehouse_bin as _gcwb_plain, _sync_quant as _sq_plain
+        _raw_bin_plain = await _gcwb_plain(db, _tid_iss, "RAW")
+        await _sq_plain(db, tenant_id=_tid_iss, material_id=mat.id, delta_qty=-qty_to_issue, location_id=_raw_bin_plain.id)
 
     # تسجيل حركة مخزون (الخصم الفعلي)
     movement = StockMovement(
@@ -715,7 +830,7 @@ async def record_scrap(
         ))
         wo.actual_cost += cost
 
-        # تحديث الحجز — أو خصم مباشر من المخزن لو ما في حجز
+        # تحديث الحجز (لو موجود) — وفي كل الحالات نخصم من المخزن فعليًا
         res = (await db.execute(
             select(MaterialReservation).where(
                 MaterialReservation.work_order_id == work_order_id,
@@ -724,12 +839,29 @@ async def record_scrap(
         )).scalar_one_or_none()
         if res:
             res.scrap_qty += scrap_qty
-            # لا نخصم من المخزن — الخصم حصل بالفعل عند الحجز
-        else:
-            mat.stock_qty = max(Decimal("0"), mat.stock_qty - scrap_qty)
+        # محطة 26 (تصليح جذري): auto_reserve_materials() حجز "soft lock" بحت —
+        # مبيخصمش من Material.stock_qty خالص وقت الحجز (بيأثر بس على "المتاح"
+        # المحسوب via get_reserved_qty). التعليق القديم هنا كان بيفترض إن
+        # الحجز خصم فعليًا ("الخصم حصل بالفعل عند الحجز") فكان بيتجاهل خصم
+        # الهالك تمامًا لو المادة محجوزة — يعني مادة اتهلكت فعليًا (وسُجّل
+        # لها ScrapRecord وتكلفة) كانت تفضل معدودة ضمن stock_qty للأبد. لازم
+        # نخصم فعليًا هنا في كل الحالات (بغض النظر عن وجود حجز نشِط).
+        _before_sc1 = mat.stock_qty
+        mat.stock_qty = max(Decimal("0"), mat.stock_qty - scrap_qty)
+        _delta_sc1 = mat.stock_qty - _before_sc1
+        if _delta_sc1 != 0:
+            from app.services.inventory_ledger import get_or_create_warehouse_bin as _gcwb_sc1, _sync_quant as _sq_sc1
+            _raw_bin_sc1 = await _gcwb_sc1(db, _tid_sc2, "RAW")
+            await _sq_sc1(db, tenant_id=_tid_sc2, material_id=mat.id, delta_qty=_delta_sc1, location_id=_raw_bin_sc1.id)
     else:
         # هالك عام بدون أمر إنتاج — خصم مباشر من المخزن
+        _before_sc2 = mat.stock_qty
         mat.stock_qty = max(Decimal("0"), mat.stock_qty - scrap_qty)
+        _delta_sc2 = mat.stock_qty - _before_sc2
+        if _delta_sc2 != 0:
+            from app.services.inventory_ledger import get_or_create_warehouse_bin as _gcwb_sc2, _sync_quant as _sq_sc2
+            _raw_bin_sc2 = await _gcwb_sc2(db, _tid_sc2, "RAW")
+            await _sq_sc2(db, tenant_id=_tid_sc2, material_id=mat.id, delta_qty=_delta_sc2, location_id=_raw_bin_sc2.id)
 
     # flush لاحتياج scrap.id قبل القيد المحاسبي
     await db.flush()
@@ -793,15 +925,24 @@ async def record_scrap(
 # STEP 3.1: مخزون الهالك المتاح للبيع
 # ═══════════════════════════════════════════════════════════════
 
-async def get_scrap_inventory(db: AsyncSession) -> list[dict]:
+async def get_scrap_inventory(db: AsyncSession, tenant_id: Optional[int] = None) -> list[dict]:
     """تجميع الهالك المسجل لكل مادة، وحساب المتاح للبيع (الكمية - المباع)"""
+    # محطة 28 (تصليح جذري — أمان متعدد المستأجرين): هذا استعلام أعمدة/تجميع
+    # (select(Model.col, func.sum(...))) — الفلترة التلقائية العامة عبر
+    # with_loader_criteria (tenant_events.py) مصمَّمة لاستعلامات الكيان
+    # الكامل (select(Model))، ومش مضمون تطبيقها بنفس الثقة على استعلام
+    # أعمدة/تجميع بحت زي ده. فلتر tenant_id هنا صريح كدفاع إضافي (defense
+    # in depth) بدل الاعتماد فقط على الفلتر العام.
+    if tenant_id is None:
+        from app.core.database import current_tenant_id as _ctid_sci
+        tenant_id = _ctid_sci.get() or 1
     rows = (await db.execute(
         select(
             ScrapRecord.material_id,
             func.sum(ScrapRecord.qty).label("total_qty"),
             func.sum(ScrapRecord.qty_sold).label("total_sold"),
         )
-        .where(ScrapRecord.material_id.is_not(None))
+        .where(ScrapRecord.material_id.is_not(None), ScrapRecord.tenant_id == tenant_id)
         .group_by(ScrapRecord.material_id)
     )).all()
 
@@ -1116,26 +1257,17 @@ async def complete_work_order(db: AsyncSession, work_order_id: int) -> dict:
     from app.core.database import current_tenant_id as _ctid_cwo
     _tid_cwo = _ctid_cwo.get() or 1
 
+    # محطة 26 (تصليح جذري): auto_reserve_materials() لا يخصم من
+    # Material.stock_qty خالص وقت الحجز (soft lock بحت — راجع تعليق
+    # MaterialReservation.location_id). فأي جزء من الحجز لم يُصرف (عبر
+    # issue_material) ولم يُسجَّل هالك عليه (عبر record_scrap) أصلاً لسه
+    # قاعد في stock_qty ولم يتحرك منه شيء — "إرجاعه" هنا بإضافته لـ
+    # stock_qty كان يصنع مخزون وهمي (كل أمر إنتاج بيتقفل بحجز غير مصروف
+    # بالكامل كان بيضخم رصيد المادة فوق الحقيقة). التصحيح: فقط نغلق الحجز
+    # (نفرج عن الـsoft lock) من غير أي لمس لـstock_qty — الكمية غير
+    # المصروفة أصلاً موجودة بالفعل في الرصيد ولا تحتاج أي حركة.
     returned_value = Decimal("0")
     for res in reservations:
-        surplus = res.reserved_qty - res.issued_qty - res.scrap_qty
-        if surplus > 0:
-            mat = await db.get(Material, res.material_id)
-            if mat:
-                mat.stock_qty += surplus
-                surplus_cost = surplus * mat.unit_cost
-                returned_value += surplus_cost
-                # سجل حركة الإرجاع
-                db.add(StockMovement(
-                    tenant_id=_tid_cwo,
-                    material_id=res.material_id,
-                    movement_type="in",
-                    qty=surplus,
-                    unit_cost=mat.unit_cost,
-                    total_cost=surplus_cost,
-                    reference=f"{wo.code}-RETURN",
-                    movement_date=date.today(),
-                ))
         res.status = "closed"
 
     # تسجيل المعدة كمنتَجة (in_stock تمت إزالته من النموذج — نسجّل فقط حركة المخزن أدناه)
@@ -1206,17 +1338,28 @@ async def complete_work_order(db: AsyncSession, work_order_id: int) -> dict:
 # MRP ENGINE — محرك التخطيط
 # ═══════════════════════════════════════════════════════════════
 
-async def run_mrp(db: AsyncSession) -> List[dict]:
+async def run_mrp(db: AsyncSession, tenant_id: Optional[int] = None) -> List[dict]:
     """
     MRP بسيط:
     للكل مادة:
       Net = Σ(required من WOs مفتوحة) + reorder_level - stock_qty
       لو Net > 0 → اقترح طلبية
     """
+    # محطة 28 (تصليح جذري — أمان متعدد المستأجرين): فلتر tenant_id صريح
+    # هنا كدفاع إضافي (defense in depth) — دالة الداشبورد دي بتتنادى من
+    # /dashboard/full ومسارات تجميعية تانية، فمش هنعتمد فقط على الفلتر
+    # العام (with_loader_criteria في tenant_events.py) اللي بيتوقف تلقائيًا
+    # لو current_tenant_id ContextVar مش موجودة في سياق التنفيذ (مثلاً لو
+    # اتنفذت الدالة دي جوه executor/thread أو task منفصل مش وارث للسياق).
+    if tenant_id is None:
+        from app.core.database import current_tenant_id as _ctid_mrp0
+        tenant_id = _ctid_mrp0.get() or 1
+
     # احتياجات أوامر الإنتاج المفتوحة
     open_res = (await db.execute(
         select(MaterialReservation).where(
-            MaterialReservation.status.in_(['pending', 'partial', 'reserved', 'partially_issued'])
+            MaterialReservation.status.in_(['pending', 'partial', 'reserved', 'partially_issued']),
+            MaterialReservation.tenant_id == tenant_id,
         ).options(selectinload(MaterialReservation.material))
     )).scalars().all()
 
@@ -1234,7 +1377,10 @@ async def run_mrp(db: AsyncSession) -> List[dict]:
 
     # حذف اقتراحات قديمة pending
     old = (await db.execute(
-        select(MrpSuggestion).where(MrpSuggestion.status == 'pending')
+        select(MrpSuggestion).where(
+            MrpSuggestion.status == 'pending',
+            MrpSuggestion.tenant_id == tenant_id,
+        )
     )).scalars().all()
     for s in old:
         await db.delete(s)
@@ -1242,7 +1388,7 @@ async def run_mrp(db: AsyncSession) -> List[dict]:
     suggestions = []
     for mat_id, open_need in needs.items():
         mat = await db.get(Material, mat_id)
-        if not mat:
+        if not mat or mat.tenant_id != tenant_id:
             continue
 
         stock     = float(mat.stock_qty)
@@ -1259,9 +1405,8 @@ async def run_mrp(db: AsyncSession) -> List[dict]:
         lead_time = int(mat.lead_time_days or 7)
         est_cost  = order_qty * float(mat.last_purchase_price or mat.unit_cost)
 
-        from app.core.database import current_tenant_id as _ctid_mrp
         sugg = MrpSuggestion(
-            tenant_id=_ctid_mrp.get() or 1,
+            tenant_id=tenant_id,
             material_id=mat_id,
             current_stock=stock,
             required_qty=open_need,
@@ -1294,8 +1439,16 @@ async def run_mrp(db: AsyncSession) -> List[dict]:
 # DASHBOARD ALERTS ENGINE
 # ═══════════════════════════════════════════════════════════════
 
-async def get_smart_alerts(db: AsyncSession) -> List[dict]:
+async def get_smart_alerts(db: AsyncSession, tenant_id: Optional[int] = None) -> List[dict]:
     """تنبيهات ذكية للداشبورد"""
+    # محطة 28 (تصليح جذري — أمان متعدد المستأجرين): فلتر tenant_id صريح
+    # على كل استعلام هنا كدفاع إضافي (defense in depth) — الدالة دي بتتنادى
+    # من /dashboard/full، فمش هنعتمد فقط على الفلتر العام التلقائي
+    # (with_loader_criteria) اللي بيتعطّل تلقائيًا لو current_tenant_id
+    # ContextVar فاضية في سياق التنفيذ.
+    if tenant_id is None:
+        from app.core.database import current_tenant_id as _ctid_alerts0
+        tenant_id = _ctid_alerts0.get() or 1
     alerts = []
 
     # 1. مواد نقص حرج (أقل من 50% من حد إعادة الطلب)
@@ -1303,6 +1456,7 @@ async def get_smart_alerts(db: AsyncSession) -> List[dict]:
         select(Material).where(
             Material.stock_qty < Material.reorder_level * Decimal("0.5"),
             Material.reorder_level > 0,
+            Material.tenant_id == tenant_id,
         ).order_by(Material.stock_qty).limit(5)
     )).scalars().all()
 
@@ -1321,6 +1475,7 @@ async def get_smart_alerts(db: AsyncSession) -> List[dict]:
     blocked_res = (await db.execute(
         select(MaterialReservation).where(
             MaterialReservation.status == 'partial',
+            MaterialReservation.tenant_id == tenant_id,
         ).options(
             selectinload(MaterialReservation.material),
             selectinload(MaterialReservation.work_order),
@@ -1349,6 +1504,7 @@ async def get_smart_alerts(db: AsyncSession) -> List[dict]:
     unpaid_invoices = (await db.execute(
         select(Invoice).where(
             Invoice.status.in_(["unpaid", "partial"]),
+            Invoice.tenant_id == tenant_id,
         ).order_by(Invoice.due_date.nullsfirst()).limit(100)
     )).scalars().all()
 
@@ -1388,6 +1544,7 @@ async def get_smart_alerts(db: AsyncSession) -> List[dict]:
                 WarrantyCertificate.warranty_end >= _today,
                 WarrantyCertificate.warranty_end <= _soon,
                 WarrantyCertificate.status == "issued",
+                WarrantyCertificate.tenant_id == tenant_id,
             ).order_by(WarrantyCertificate.warranty_end).limit(5)
         )).scalars().all()
         for wc in expiring:

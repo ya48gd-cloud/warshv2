@@ -13,11 +13,22 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi import HTTPException
 from app.core.database import get_db, current_tenant_id
 from app.api.auth import require_any
 from app.models.models import AnalyticsEvent
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
+
+
+def _tid() -> int:
+    """يجلب tenant_id الحالي أو يرفع 401 — fail-closed بدل ما نرجّع بيانات كل
+    الـ tenants لو الـ ContextVar لأي سبب فاضي (كان الكود قديماً بيتجاهل الفلتر
+    بالكامل بدل ما يرفض في الحالة دي، وهو سلوك 'fail-open' خطير أمنياً)."""
+    tid = current_tenant_id.get()
+    if tid is None:
+        raise HTTPException(401, "غير مسموح")
+    return tid
 
 
 @router.get("/summary")
@@ -28,15 +39,13 @@ async def event_summary(
 ):
     """عدد كل نوع حدث خلال آخر N يوم — لتينانت الحالي فقط."""
     since = datetime.utcnow() - timedelta(days=days)
-    tid = current_tenant_id.get()
+    tid = _tid()
     q = (
         select(AnalyticsEvent.event_type, func.count().label("count"))
-        .where(AnalyticsEvent.created_at >= since)
+        .where(AnalyticsEvent.tenant_id == tid, AnalyticsEvent.created_at >= since)
         .group_by(AnalyticsEvent.event_type)
         .order_by(func.count().desc())
     )
-    if tid is not None:
-        q = q.where(AnalyticsEvent.tenant_id == tid)
     rows = (await db.execute(q)).all()
     return {"since": since.isoformat(), "events": [{"event_type": r[0], "count": r[1]} for r in rows]}
 
@@ -52,15 +61,14 @@ async def sales_funnel(
     مفيد لمعرفة نسبة تحول العروض لفواتير فعلية.
     """
     since = datetime.utcnow() - timedelta(days=days)
-    tid = current_tenant_id.get()
+    tid = _tid()
     steps = ["quotation_created", "order_created", "work_order_created", "invoice_created", "payment_received"]
     result = {}
     for step in steps:
         q = select(func.count()).select_from(AnalyticsEvent).where(
+            AnalyticsEvent.tenant_id == tid,
             AnalyticsEvent.event_type == step, AnalyticsEvent.created_at >= since
         )
-        if tid is not None:
-            q = q.where(AnalyticsEvent.tenant_id == tid)
         result[step] = await db.scalar(q) or 0
     return {"since": since.isoformat(), "funnel": result}
 
@@ -73,11 +81,10 @@ async def active_users(
 ):
     """عدد المستخدمين المختلفين اللي عملوا login خلال آخر N يوم (DAU/MAU-style)."""
     since = datetime.utcnow() - timedelta(days=days)
-    tid = current_tenant_id.get()
+    tid = _tid()
     q = select(func.count(func.distinct(AnalyticsEvent.user_id))).where(
+        AnalyticsEvent.tenant_id == tid,
         AnalyticsEvent.event_type == "user_login", AnalyticsEvent.created_at >= since
     )
-    if tid is not None:
-        q = q.where(AnalyticsEvent.tenant_id == tid)
     count = await db.scalar(q) or 0
     return {"since": since.isoformat(), "active_users": count}
