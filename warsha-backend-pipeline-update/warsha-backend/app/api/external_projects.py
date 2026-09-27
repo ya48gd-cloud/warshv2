@@ -170,8 +170,13 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
 async def create_project(data: ProjectIn, db: AsyncSession = Depends(get_db)):
     if data.planned_start and data.planned_end and data.planned_end < data.planned_start:
         raise HTTPException(400, "تاريخ الانتهاء المخطط يجب أن يكون بعد تاريخ البدء")
+    if data.contract_value is not None and data.contract_value < 0:
+        raise HTTPException(400, "قيمة العقد لا يمكن أن تكون سالبة")
     from app.core.database import current_tenant_id as _ctid_ep
     _tid_ep = _ctid_ep.get() or 1
+    client = await db.get(Customer, data.client_id)
+    if not client or client.tenant_id != _tid_ep:
+        raise HTTPException(404, "العميل غير موجود")
     _ep_data = data.model_dump()
     _ep_data['tenant_id'] = _tid_ep
     p = ExtProject(**_ep_data)
@@ -394,6 +399,9 @@ async def add_member(pid: int, data: MemberIn, db: AsyncSession = Depends(get_db
         raise HTTPException(404)
     if data.daily_rate is None or data.daily_rate <= 0:
         raise HTTPException(400, "الأجر اليومي يجب أن يكون أكبر من صفر")
+    worker = await db.get(Worker, data.worker_id)
+    if not worker or worker.tenant_id != (_ctid_am.get() or 1):
+        raise HTTPException(404, "العامل غير موجود")
     # لو العامل موجود بالفعل — update
     existing = (await db.execute(
         select(ExtProjectMember).where(
@@ -425,8 +433,9 @@ async def add_member(pid: int, data: MemberIn, db: AsyncSession = Depends(get_db
 @router.patch("/{pid}/team/{mid}/advance")
 async def add_site_advance(pid: int, mid: int, amount: Decimal, db: AsyncSession = Depends(get_db)):
     """تسجيل سلفة في الموقع لعامل"""
+    from app.core.database import current_tenant_id as _ctid_asa
     m = await db.get(ExtProjectMember, mid)
-    if not m or m.project_id != pid:
+    if not m or m.project_id != pid or m.tenant_id != (_ctid_asa.get() or 1):
         raise HTTPException(404)
     m.site_advances = (m.site_advances or Decimal("0")) + amount
     await db.commit()
@@ -435,8 +444,9 @@ async def add_site_advance(pid: int, mid: int, amount: Decimal, db: AsyncSession
 
 @router.delete("/{pid}/team/{mid}")
 async def remove_member(pid: int, mid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_rm
     m = await db.get(ExtProjectMember, mid)
-    if not m or m.project_id != pid:
+    if not m or m.project_id != pid or m.tenant_id != (_ctid_rm.get() or 1):
         raise HTTPException(404)
     await db.delete(m)
     await db.commit()
@@ -586,10 +596,33 @@ class ToolIn(BaseModel):
 @router.post("/{pid}/tools", status_code=201)
 async def add_tool(pid: int, data: ToolIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_ept
+    tid_ept = _ctid_ept.get() or 1
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != tid_ept:
+        raise HTTPException(404, "المشروع غير موجود")
+    mat = None
+    if data.material_id:
+        mat = await db.get(Material, data.material_id)
+        if not mat or mat.tenant_id != tid_ept:
+            raise HTTPException(404, "المادة غير موجودة")
+
     _ept_data = data.model_dump()
-    _ept_data['tenant_id'] = _ctid_ept.get() or 1
+    _ept_data['tenant_id'] = tid_ept
     t = ExtProjectTool(project_id=pid, **_ept_data)
     db.add(t)
+    await db.flush()
+
+    # ملاحظة إصلاح: عهدة العدة المرتبطة بمادة مخزون فعلية (material_id) كانت
+    # بتتسجل من غير أي خصم من رصيد المخزون — تفضل الأداة محسوبة متاحة في
+    # المخزن رغم إنها فعليًا مع فريق المشروع بره الورشة.
+    if mat:
+        from app.services.inventory_ledger import post_issue
+        await post_issue(
+            db, material=mat, qty=t.quantity, unit_cost=mat.unit_cost or Decimal("0"),
+            movement_date=t.withdrawn_date, source_doc_type="ext_project_tool", source_doc_id=t.id,
+            reference=f"EXTPROJ-TOOL-{t.id}", notes=f"سحب عهدة عدة — مشروع خارجي #{pid}",
+        )
+
     await db.commit()
     await db.refresh(t)
     return {"id": t.id, "message": "تمت الإضافة"}
@@ -599,9 +632,15 @@ async def add_tool(pid: int, data: ToolIn, db: AsyncSession = Depends(get_db)):
 async def return_tool(pid: int, tid: int, returned_qty: Decimal,
                        condition_in: str = "good", returned_date: Optional[date] = None,
                        notes: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_rt
+    tid_rt = _ctid_rt.get() or 1
     t = await db.get(ExtProjectTool, tid)
-    if not t or t.project_id != pid:
+    if not t or t.project_id != pid or t.tenant_id != tid_rt:
         raise HTTPException(404)
+    if t.status != "withdrawn":
+        # كانت الدالة بتسمح بإعادة النداء عليها أكتر من مرة، وده كان هيسبب
+        # قيد مخزون مزدوج لو الأداة مرتبطة بمادة (material_id).
+        raise HTTPException(400, "تم إرجاع/تسوية هذه العهدة بالفعل")
     if returned_qty < 0:
         raise HTTPException(400, "الكمية المرتجعة لا يمكن أن تكون سالبة")
     if returned_qty > t.quantity:
@@ -620,15 +659,44 @@ async def return_tool(pid: int, tid: int, returned_qty: Decimal,
         t.status = "returned"
     if notes:
         t.notes = notes
+
+    # نرجّع للمخزون فقط الكمية اللي رجعت فعليًا (returned_qty) — الفرق
+    # (t.quantity - returned_qty، "المفقود") يفضل مخصومًا نهائيًا كإعدام
+    # (write-off) لجزء من قيمة الأصل، مش مجرد "لسه بره".
+    if t.material_id and returned_qty > 0:
+        mat = await db.get(Material, t.material_id)
+        if mat:
+            from app.services.inventory_ledger import post_receipt
+            await post_receipt(
+                db, material=mat, qty=returned_qty, unit_cost=mat.unit_cost or Decimal("0"),
+                movement_date=t.returned_date, source_doc_type="ext_project_tool_return", source_doc_id=t.id,
+                reference=f"EXTPROJ-TOOL-{t.id}", notes=f"إرجاع عهدة عدة — مشروع خارجي #{pid}",
+            )
+
     await db.commit()
     return {"status": t.status}
 
 
 @router.delete("/{pid}/tools/{tid}")
 async def delete_tool(pid: int, tid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_delt
+    tid_delt = _ctid_delt.get() or 1
     t = await db.get(ExtProjectTool, tid)
-    if not t or t.project_id != pid:
+    if not t or t.project_id != pid or t.tenant_id != tid_delt:
         raise HTTPException(404)
+
+    # عكس متماثل لخصم المخزون اللي حصل وقت السحب — بس لو لسه في حالة
+    # withdrawn (لم يُرجَّع/يُتلَف/يُفقَد بعد، وإلا كنا هنعكس قيد اترجع فعلاً)
+    if t.material_id and t.status == "withdrawn":
+        mat = await db.get(Material, t.material_id)
+        if mat:
+            from app.services.inventory_ledger import post_receipt
+            await post_receipt(
+                db, material=mat, qty=t.quantity, unit_cost=mat.unit_cost or Decimal("0"),
+                source_doc_type="ext_project_tool_delete", source_doc_id=t.id,
+                reference=f"EXTPROJ-TOOL-{t.id}", notes=f"إلغاء سحب عهدة عدة — مشروع خارجي #{pid}",
+            )
+
     await db.delete(t)
     await db.commit()
     return {"message": "تم الحذف"}
@@ -655,14 +723,24 @@ class MaterialIn(BaseModel):
 async def add_material(pid: int, data: MaterialIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_epmat
     tid = _ctid_epmat.get() or 1
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != tid:
+        raise HTTPException(404, "المشروع غير موجود")
 
     payload = data.model_dump()
     payload["total_cost"] = float(data.quantity) * float(data.unit_cost)
     # لو من المخزون — احسب السعر تلقائياً
     mat = None
-    if data.source == "stock" and data.material_id:
+    if data.material_id:
+        # لو material_id اتبعت صراحة، لازم تتأكد إنها فعلاً موجودة ومتاحة
+        # لهذا المستأجر — وإلا الكود كان بيسيب material_id غريب (لمادة تنانت
+        # تاني) يتخزن كما هو في ExtProjectMaterial من غير أي تحقق، فيفضل FK
+        # يتيم يشاور على صف مايقدرش هذا المستأجر يشوفه أصلاً.
         mat = await db.get(Material, data.material_id)
-        if mat and float(data.unit_cost) == 0:
+        if not mat:
+            raise HTTPException(404, "المادة غير موجودة")
+    if data.source == "stock" and mat:
+        if float(data.unit_cost) == 0:
             payload["unit_cost"] = float(mat.unit_cost)
             payload["total_cost"] = float(data.quantity) * float(mat.unit_cost)
             if not data.description:
@@ -699,6 +777,10 @@ async def add_material(pid: int, data: MaterialIn, db: AsyncSession = Depends(ge
 
 @router.delete("/{pid}/materials/{mid}")
 async def delete_material(pid: int, mid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_delmat
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != (_ctid_delmat.get() or 1):
+        raise HTTPException(404, "المشروع غير موجود")
     m = await db.get(ExtProjectMaterial, mid)
     if not m or m.project_id != pid:
         raise HTTPException(404)
@@ -742,13 +824,17 @@ class TripIn(BaseModel):
 
 @router.post("/{pid}/trips", status_code=201)
 async def add_trip(pid: int, data: TripIn, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_eptrip
+    tid_eptrip = _ctid_eptrip.get() or 1
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != tid_eptrip:
+        raise HTTPException(404, "المشروع غير موجود")
     payload = data.model_dump()
     payload["total_cost"] = (
         float(data.fuel_cost) + float(data.toll_cost) +
         float(data.rental_cost) + float(data.other_cost)
     )
-    from app.core.database import current_tenant_id as _ctid_eptrip
-    payload['tenant_id'] = _ctid_eptrip.get() or 1
+    payload['tenant_id'] = tid_eptrip
     t = ExtProjectTrip(project_id=pid, **payload)
     db.add(t)
     await db.commit()
@@ -758,8 +844,9 @@ async def add_trip(pid: int, data: TripIn, db: AsyncSession = Depends(get_db)):
 
 @router.delete("/{pid}/trips/{tid}")
 async def delete_trip(pid: int, tid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_delt2
     t = await db.get(ExtProjectTrip, tid)
-    if not t or t.project_id != pid:
+    if not t or t.project_id != pid or t.tenant_id != (_ctid_delt2.get() or 1):
         raise HTTPException(404)
     await db.delete(t)
     await db.commit()
@@ -784,8 +871,12 @@ class ExpenseIn(BaseModel):
 @router.post("/{pid}/expenses", status_code=201)
 async def add_expense(pid: int, data: ExpenseIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_epexp
+    tid_epexp = _ctid_epexp.get() or 1
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != tid_epexp:
+        raise HTTPException(404, "المشروع غير موجود")
     _epexp_data = data.model_dump()
-    _epexp_data['tenant_id'] = _ctid_epexp.get() or 1
+    _epexp_data['tenant_id'] = tid_epexp
     e = ExtProjectExpense(project_id=pid, **_epexp_data)
     db.add(e)
     await db.commit()
@@ -795,8 +886,9 @@ async def add_expense(pid: int, data: ExpenseIn, db: AsyncSession = Depends(get_
 
 @router.delete("/{pid}/expenses/{eid}")
 async def delete_expense(pid: int, eid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dele
     e = await db.get(ExtProjectExpense, eid)
-    if not e or e.project_id != pid:
+    if not e or e.project_id != pid or e.tenant_id != (_ctid_dele.get() or 1):
         raise HTTPException(404)
     await db.delete(e)
     await db.commit()
@@ -822,8 +914,12 @@ class ProgressIn(BaseModel):
 @router.post("/{pid}/progress", status_code=201)
 async def add_progress(pid: int, data: ProgressIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_epprog
+    tid_epprog = _ctid_epprog.get() or 1
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != tid_epprog:
+        raise HTTPException(404, "المشروع غير موجود")
     _epprog_data = data.model_dump()
-    _epprog_data['tenant_id'] = _ctid_epprog.get() or 1
+    _epprog_data['tenant_id'] = tid_epprog
     r = ExtProjectProgress(project_id=pid, **_epprog_data)
     db.add(r)
     await db.commit()
@@ -833,8 +929,9 @@ async def add_progress(pid: int, data: ProgressIn, db: AsyncSession = Depends(ge
 
 @router.delete("/{pid}/progress/{rid}")
 async def delete_progress(pid: int, rid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_delp
     r = await db.get(ExtProjectProgress, rid)
-    if not r or r.project_id != pid:
+    if not r or r.project_id != pid or r.tenant_id != (_ctid_delp.get() or 1):
         raise HTTPException(404)
     await db.delete(r)
     await db.commit()
@@ -863,8 +960,12 @@ class PaymentReceiveIn(BaseModel):
 @router.post("/{pid}/payments", status_code=201)
 async def add_payment_milestone(pid: int, data: PaymentIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_eppmil
+    tid_eppmil = _ctid_eppmil.get() or 1
+    p = await db.get(ExtProject, pid)
+    if not p or p.tenant_id != tid_eppmil:
+        raise HTTPException(404, "المشروع غير موجود")
     _eppmil_data = data.model_dump()
-    _eppmil_data['tenant_id'] = _ctid_eppmil.get() or 1
+    _eppmil_data['tenant_id'] = tid_eppmil
     pay = ExtProjectPayment(project_id=pid, **_eppmil_data)
     db.add(pay)
     await db.commit()
@@ -876,8 +977,11 @@ async def add_payment_milestone(pid: int, data: PaymentIn, db: AsyncSession = De
 async def receive_payment(pid: int, payid: int, data: PaymentReceiveIn,
                            db: AsyncSession = Depends(get_db)):
     """تسجيل استلام دفعة"""
+    from app.core.database import current_tenant_id as _ctid_recv
+    if data.paid_amount is None or data.paid_amount <= 0:
+        raise HTTPException(400, "المبلغ المحصَّل يجب أن يكون أكبر من صفر")
     pay = await db.get(ExtProjectPayment, payid)
-    if not pay or pay.project_id != pid:
+    if not pay or pay.project_id != pid or pay.tenant_id != (_ctid_recv.get() or 1):
         raise HTTPException(404)
     pay.paid_amount = (pay.paid_amount or Decimal("0")) + data.paid_amount
     pay.payment_method = data.payment_method
@@ -893,8 +997,9 @@ async def receive_payment(pid: int, payid: int, data: PaymentReceiveIn,
 
 @router.delete("/{pid}/payments/{payid}")
 async def delete_payment(pid: int, payid: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_delpay
     pay = await db.get(ExtProjectPayment, payid)
-    if not pay or pay.project_id != pid:
+    if not pay or pay.project_id != pid or pay.tenant_id != (_ctid_delpay.get() or 1):
         raise HTTPException(404)
     await db.delete(pay)
     await db.commit()

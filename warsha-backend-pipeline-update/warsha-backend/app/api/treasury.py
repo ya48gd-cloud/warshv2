@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 from app.core.database import get_db
 from app.api.auth import require_any
@@ -37,11 +37,25 @@ class TreasuryIn(BaseModel):
     notes: Optional[str] = None
     coa_account_id: Optional[int] = None
 
+    @validator("kind")
+    def _valid_kind(cls, v):
+        # حماية: kind غلط بيكسر ترتيب _default_treasury (كاش قبل بنك) ويخلي
+        # create_treasury يربط الخزنة بحساب 1110 بصمت وكأنها "cash" حتى لو مقصود بنك
+        if v not in ("cash", "bank"):
+            raise ValueError("kind يجب أن يكون 'cash' أو 'bank'")
+        return v
+
 
 class CategoryIn(BaseModel):
     name: str
     flow: str = "both"           # in | out | both
     coa_account_id: Optional[int] = None
+
+    @validator("flow")
+    def _valid_flow(cls, v):
+        if v not in ("in", "out", "both"):
+            raise ValueError("flow يجب أن يكون 'in' أو 'out' أو 'both'")
+        return v
 
 
 class TxnIn(BaseModel):

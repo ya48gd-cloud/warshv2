@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, validator
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, require_admin_production
 from app.models.models import (
     ProductionSchedule, QualityInspection, SalesOrderWorkOrder,
     WorkOrder, CustomerOrder, Worker, Material,
@@ -134,7 +134,7 @@ async def list_schedules(
     return [sched_dict(s) for s in res.scalars().all()]
 
 
-@router.post("/schedules", status_code=201)
+@router.post("/schedules", status_code=201, dependencies=[Depends(require_admin_production)])
 async def create_schedule(data: ScheduleIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
@@ -176,7 +176,7 @@ async def create_schedule(data: ScheduleIn, db: AsyncSession = Depends(get_db)):
     return sched_dict(res.scalar_one())
 
 
-@router.patch("/schedules/{sched_id}")
+@router.patch("/schedules/{sched_id}", dependencies=[Depends(require_admin_production)])
 async def update_schedule(sched_id: int, data: ScheduleUpdateIn, db: AsyncSession = Depends(get_db)):
     sched = await db.get(ProductionSchedule, sched_id)
     if not sched:
@@ -192,7 +192,7 @@ async def update_schedule(sched_id: int, data: ScheduleUpdateIn, db: AsyncSessio
     return sched_dict(res.scalar_one())
 
 
-@router.patch("/schedules/{sched_id}/start")
+@router.patch("/schedules/{sched_id}/start", dependencies=[Depends(require_admin_production)])
 async def start_schedule(sched_id: int, db: AsyncSession = Depends(get_db)):
     sched = await db.get(ProductionSchedule, sched_id)
     if not sched:
@@ -207,7 +207,7 @@ async def start_schedule(sched_id: int, db: AsyncSession = Depends(get_db)):
     return {"id": sched_id, "status": "in_progress", "actual_start": str(date.today())}
 
 
-@router.patch("/schedules/{sched_id}/complete")
+@router.patch("/schedules/{sched_id}/complete", dependencies=[Depends(require_admin_production)])
 async def complete_schedule(sched_id: int, db: AsyncSession = Depends(get_db)):
     sched = await db.get(ProductionSchedule, sched_id)
     if not sched:
@@ -292,7 +292,7 @@ async def list_inspections(
     return [qc_dict(qi) for qi in res.scalars().all()]
 
 
-@router.post("/quality", status_code=201)
+@router.post("/quality", status_code=201, dependencies=[Depends(require_admin_production)])
 async def create_inspection(data: QCIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
@@ -362,7 +362,7 @@ async def create_inspection(data: QCIn, db: AsyncSession = Depends(get_db)):
     return result_dict
 
 
-@router.put("/quality/{insp_id}")
+@router.put("/quality/{insp_id}", dependencies=[Depends(require_admin_production)])
 async def update_inspection(insp_id: int, data: QCIn, db: AsyncSession = Depends(get_db)):
     insp = await db.get(QualityInspection, insp_id)
     if not insp:
@@ -380,7 +380,7 @@ async def update_inspection(insp_id: int, data: QCIn, db: AsyncSession = Depends
     return {"id": insp_id, "result": insp.result}
 
 
-@router.delete("/quality/{insp_id}")
+@router.delete("/quality/{insp_id}", dependencies=[Depends(require_admin_production)])
 async def delete_inspection(insp_id: int, db: AsyncSession = Depends(get_db)):
     insp = await db.get(QualityInspection, insp_id)
     if not insp:
@@ -412,7 +412,7 @@ async def qc_dashboard(db: AsyncSession = Depends(get_db)):
 # SALES ORDER → WORK ORDER LINK
 # ══════════════════════════════════════════════════════════════
 
-@router.post("/link-order", status_code=201)
+@router.post("/link-order", status_code=201, dependencies=[Depends(require_admin_production)])
 async def link_sales_to_production(data: LinkOrderIn, db: AsyncSession = Depends(get_db)):
     """ربط طلب بيع بأمر إنتاج"""
     co = await db.get(CustomerOrder, data.customer_order_id)
@@ -465,7 +465,7 @@ async def get_linked_work_orders(customer_order_id: int, db: AsyncSession = Depe
     } for i in items]
 
 
-@router.delete("/link-order/{link_id}")
+@router.delete("/link-order/{link_id}", dependencies=[Depends(require_admin_production)])
 async def unlink_order(link_id: int, db: AsyncSession = Depends(get_db)):
     link = await db.get(SalesOrderWorkOrder, link_id)
     if not link:

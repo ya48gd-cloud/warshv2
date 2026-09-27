@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any, require_admin
+from app.api.auth import require_any, require_admin, require_admin_production
 from app.models.models import (
     WorkOrder, Material, MaterialReservation,
     ScrapRecord, MrpSuggestion, StockCount, StockCountLine,
@@ -135,7 +135,7 @@ async def production_pipeline_backfill(dry_run: bool = True, db: AsyncSession = 
 
 # ── Work Order Integration ─────────────────────────────────────
 
-@router.post("/reserve/{work_order_id}")
+@router.post("/reserve/{work_order_id}", dependencies=[Depends(require_admin_production)])
 async def reserve_materials(
     work_order_id: int,
     data: Optional[ManualReserveIn] = None,
@@ -198,7 +198,7 @@ async def get_reservations(work_order_id: int, db: AsyncSession = Depends(get_db
     } for r in items]
 
 
-@router.delete("/reservations/{reservation_id}")
+@router.delete("/reservations/{reservation_id}", dependencies=[Depends(require_admin_production)])
 async def cancel_reservation(reservation_id: int, db: AsyncSession = Depends(get_db)):
     """إلغاء حجز مادة لم يُصرف منها شيء بعد"""
     r = await db.get(MaterialReservation, reservation_id)
@@ -211,7 +211,7 @@ async def cancel_reservation(reservation_id: int, db: AsyncSession = Depends(get
     return {"message": "تم إلغاء الحجز", "id": reservation_id}
 
 
-@router.post("/issue")
+@router.post("/issue", dependencies=[Depends(require_admin_production)])
 async def issue_material_endpoint(data: IssueIn, db: AsyncSession = Depends(get_db)):
     """صرف مواد لأمر إنتاج في مرحلة معينة"""
     result = await issue_material(
@@ -222,7 +222,7 @@ async def issue_material_endpoint(data: IssueIn, db: AsyncSession = Depends(get_
     return result
 
 
-@router.post("/issue-by-reservation")
+@router.post("/issue-by-reservation", dependencies=[Depends(require_admin_production)])
 async def issue_by_reservation(
     reservation_id: int,
     db: AsyncSession = Depends(get_db)
@@ -243,7 +243,7 @@ async def issue_by_reservation(
     return result
 
 
-@router.post("/scrap")
+@router.post("/scrap", dependencies=[Depends(require_admin_production)])
 async def record_scrap_endpoint(data: ScrapIn, db: AsyncSession = Depends(get_db)):
     """تسجيل هالك — في أمر إنتاج، أو هالك عام بدون أمر إنتاج"""
     result = await record_scrap(
@@ -262,7 +262,7 @@ async def scrap_inventory_endpoint(db: AsyncSession = Depends(get_db)):
     return await get_scrap_inventory(db, _ctid_sci_ep.get() or 1)
 
 
-@router.post("/scrap-sales")
+@router.post("/scrap-sales", dependencies=[Depends(require_admin_production)])
 async def create_scrap_sale_endpoint(data: ScrapSaleIn, db: AsyncSession = Depends(get_db)):
     """بيع كمية من الهالك المسجل"""
     result = await create_scrap_sale(db, data.model_dump())
@@ -325,7 +325,7 @@ async def scrap_sale_detail(sale_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.post("/complete/{work_order_id}")
+@router.post("/complete/{work_order_id}", dependencies=[Depends(require_admin_production)])
 async def complete_wo(work_order_id: int, db: AsyncSession = Depends(get_db)):
     """إنهاء أمر الإنتاج — إرجاع الزائد + إضافة للمخزن"""
     result = await complete_work_order(db, work_order_id)
@@ -420,14 +420,14 @@ async def get_mrp_alias(db: AsyncSession = Depends(get_db)):
     return await run_mrp(db, _ctid_mrp_ep2.get() or 1)
 
 
-@router.post("/mrp/run")
+@router.post("/mrp/run", dependencies=[Depends(require_admin_production)])
 async def run_mrp_endpoint(db: AsyncSession = Depends(get_db)):
     """تشغيل محرك MRP وإرجاع الاقتراحات"""
     from app.core.database import current_tenant_id as _ctid_mrp_ep3
     return await run_mrp(db, _ctid_mrp_ep3.get() or 1)
 
 
-@router.post("/mrp/{suggestion_id}/approve")
+@router.post("/mrp/{suggestion_id}/approve", dependencies=[Depends(require_admin_production)])
 async def approve_mrp(suggestion_id: int, db: AsyncSession = Depends(get_db)):
     """الموافقة على اقتراح MRP — ينشئ PurchaseOrder تلقائياً"""
     from app.models.models import PurchaseOrder, PurchaseOrderLine
@@ -490,7 +490,7 @@ async def approve_mrp(suggestion_id: int, db: AsyncSession = Depends(get_db)):
     return {"id": s.id, "status": "ordered", "po_id": po.id, "po_code": _code}
 
 
-@router.post("/mrp/{suggestion_id}/ignore")
+@router.post("/mrp/{suggestion_id}/ignore", dependencies=[Depends(require_admin_production)])
 async def ignore_mrp(suggestion_id: int, db: AsyncSession = Depends(get_db)):
     """تجاهل اقتراح MRP"""
     s = await db.get(MrpSuggestion, suggestion_id)
@@ -514,7 +514,7 @@ async def list_bins(db: AsyncSession = Depends(get_db)):
     } for b in bins]
 
 
-@router.post("/bins", status_code=201)
+@router.post("/bins", status_code=201, dependencies=[Depends(require_admin_production)])
 async def create_bin(data: BinLocationIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_bin
     payload = data.model_dump()
@@ -574,7 +574,7 @@ async def list_stock_counts(db: AsyncSession = Depends(get_db)):
     return out
 
 
-@router.post("/stock-count", status_code=201)
+@router.post("/stock-count", status_code=201, dependencies=[Depends(require_admin_production)])
 async def create_stock_count(db: AsyncSession = Depends(get_db)):
     """إنشاء جلسة جرد جديدة"""
     from app.core.database import current_tenant_id as _ctid_stk
@@ -598,7 +598,7 @@ async def create_stock_count(db: AsyncSession = Depends(get_db)):
     return {"id": count.id, "date": str(count.count_date), "items": len(mats)}
 
 
-@router.post("/stock-count/{count_id}/scan")
+@router.post("/stock-count/{count_id}/scan", dependencies=[Depends(require_admin_production)])
 async def scan_item(
     count_id: int,
     data: ScanIn,
@@ -633,7 +633,7 @@ async def scan_item(
     }
 
 
-@router.post("/stock-count/{count_id}/close")
+@router.post("/stock-count/{count_id}/close", dependencies=[Depends(require_admin_production)])
 async def close_stock_count(count_id: int, db: AsyncSession = Depends(get_db)):
     """إغلاق الجرد وتطبيق الفروقات على المخزن"""
     count = await db.get(StockCount, count_id)
@@ -684,7 +684,7 @@ async def close_stock_count(count_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # ── Auto-reserve from BOM endpoint ────────────────────────────────────────
-@router.post("/auto-reserve/{work_order_id}")
+@router.post("/auto-reserve/{work_order_id}", dependencies=[Depends(require_admin_production)])
 async def auto_reserve(work_order_id: int, db: AsyncSession = Depends(get_db)):
     """Auto-reserve all BOM materials for a work order. Returns shortages."""
     result = await auto_reserve_materials(db, work_order_id)
@@ -725,12 +725,19 @@ async def list_team(wo_id: int, db: AsyncSession = Depends(get_db)):
     } for m in items]
 
 
-@router.post("/work-orders/{wo_id}/team", status_code=201)
+@router.post("/work-orders/{wo_id}/team", status_code=201, dependencies=[Depends(require_admin_production)])
 async def add_team_member(wo_id: int, data: WOMemberIn, db: AsyncSession = Depends(get_db)):
     """إضافة/تحديث عامل في فريق أمر الإنتاج"""
     wo = await db.get(WorkOrder, wo_id)
     if not wo:
         raise HTTPException(404, "أمر الإنتاج غير موجود")
+    if wo.status == "done":
+        # محطة 29: أمر الإنتاج المكتمل خلاص عدّى تكلفة العمالة (actual_cost)
+        # مرة واحدة وللأبد في complete_work_order()، ورصيد FG-{code} اتسجّل
+        # بتكلفة وحدة ثابتة مبنية عليها. تعديل الفريق بعد كده كان بيوهم إن
+        # التكلفة اتحدّثت (الرد بيرجّع labor_cost محسوب) من غير ما يمس
+        # actual_cost أو FG.unit_cost فعليًا خالص — تناقض صامت.
+        raise HTTPException(400, "أمر الإنتاج مكتمل بالفعل — لا يمكن تعديل فريق العمل بعد الإنهاء")
 
     existing = (await db.execute(
         select(WorkOrderMember).where(
@@ -757,23 +764,32 @@ async def add_team_member(wo_id: int, data: WOMemberIn, db: AsyncSession = Depen
     return {"id": m.id, "message": "تمت الإضافة"}
 
 
-@router.patch("/work-orders/{wo_id}/team/{mid}/hours")
+@router.patch("/work-orders/{wo_id}/team/{mid}/hours", dependencies=[Depends(require_admin_production)])
 async def update_actual_hours(wo_id: int, mid: int, actual_hours: Decimal, db: AsyncSession = Depends(get_db)):
     """تحديث ساعات العمل الفعلية لعامل"""
     m = await db.get(WorkOrderMember, mid)
     if not m or m.work_order_id != wo_id:
         raise HTTPException(404)
+    wo = await db.get(WorkOrder, wo_id)
+    if wo and wo.status == "done":
+        # محطة 29: نفس الفجوة أعلاه — بعد الإنهاء، actual_cost وFG.unit_cost
+        # مقفولين على القيمة المحسوبة وقت الإنهاء؛ تحديث الساعات هنا كان
+        # هيرجّع labor_cost جديد للواجهة من غير أي أثر حقيقي على أي حاجة.
+        raise HTTPException(400, "أمر الإنتاج مكتمل بالفعل — لا يمكن تعديل ساعات العمل بعد الإنهاء")
     m.actual_hours = actual_hours
     await db.commit()
     return {"actual_hours": float(m.actual_hours), "labor_cost": float(m.actual_hours * m.hourly_rate)}
 
 
-@router.delete("/work-orders/{wo_id}/team/{mid}")
+@router.delete("/work-orders/{wo_id}/team/{mid}", dependencies=[Depends(require_admin_production)])
 async def remove_team_member(wo_id: int, mid: int, db: AsyncSession = Depends(get_db)):
     """إزالة عامل من فريق أمر الإنتاج"""
     m = await db.get(WorkOrderMember, mid)
     if not m or m.work_order_id != wo_id:
         raise HTTPException(404)
+    wo = await db.get(WorkOrder, wo_id)
+    if wo and wo.status == "done":
+        raise HTTPException(400, "أمر الإنتاج مكتمل بالفعل — لا يمكن حذف عضو من فريق العمل بعد الإنهاء")
     await db.delete(m)
     await db.commit()
     return {"message": "تم الحذف"}

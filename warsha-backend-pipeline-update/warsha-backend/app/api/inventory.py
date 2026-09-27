@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, delete as sa_delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 from app.core.database import get_db
 from app.api.auth import require_any
@@ -60,6 +60,20 @@ class MaterialCreate(BaseModel):
     valuation_method: Optional[str] = None  # standard | moving_average | last_price | fifo
     removal_strategy: Optional[str] = None  # fifo | lifo | fefo | manual
 
+    @validator("unit_cost")
+    def _unit_cost_not_negative(cls, v):
+        # سعر سالب هيتسرب لمتوسط التكلفة المرجّح في كل استلام لاحق (post_receipt)
+        # ويبوّظ تقييم المخزون وتكلفة البضاعة المباعة بشكل دائم وصامت.
+        if v is not None and v < 0:
+            raise ValueError("سعر الوحدة لا يمكن أن يكون سالباً")
+        return v
+
+    @validator("reorder_level")
+    def _reorder_level_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("حد إعادة الطلب لا يمكن أن يكون سالباً")
+        return v
+
 
 class MovementCreate(BaseModel):
     material_id: int
@@ -88,6 +102,15 @@ class MovementCreate(BaseModel):
     waste_g: Optional[Decimal] = None
     customer_id: Optional[int] = None
     source: Optional[str] = None
+
+    @validator("movement_type")
+    def _valid_movement_type(cls, v):
+        # قبل هذا الفحص، أي قيمة غير "in" كانت تُعامَل ضمنيًا كـ"out" (else
+        # branch في record_movement) — خطأ إملائي في الفرونت إند (أو طلب
+        # مُتلاعَب به) كان يُنقص المخزون بدل ما يزوّده من غير أي تحذير.
+        if v not in ("in", "out"):
+            raise ValueError("movement_type يجب أن يكون 'in' أو 'out'")
+        return v
 
 
 def enrich_material_shape(payload: dict) -> dict:
@@ -147,6 +170,29 @@ async def create_material(data: MaterialCreate, db: AsyncSession = Depends(get_d
             .limit(1)
         )
         payload['category_id'] = cat_id or 1  # fallback 1 (seeded in tests)
+    else:
+        # لو category_id اتبعت صراحة، لازم يتأكد إنها فعلاً فئة تابعة لنفس
+        # الـ tenant — وإلا مادة تنانت A ممكن تتربط بفئة تنانت B (رقم ID
+        # صحيح بس مش بتاعه)، وبعدين تنانت B يقدر يمسح الفئة دي (عدّاد
+        # موادها هيبقى صفر من وجهة نظره) ويسيب مادة تنانت A بفئة يتيمة.
+        owns_cat = await db.scalar(
+            select(MaterialCategory.id).where(
+                MaterialCategory.id == payload['category_id'],
+                MaterialCategory.tenant_id == payload['tenant_id'],
+            )
+        )
+        if not owns_cat:
+            raise HTTPException(400, "الفئة المحددة غير موجودة")
+    if payload.get('supplier_id') is not None:
+        from app.models.models import Supplier as _Supplier_mat
+        owns_sup = await db.scalar(
+            select(_Supplier_mat.id).where(
+                _Supplier_mat.id == payload['supplier_id'],
+                _Supplier_mat.tenant_id == payload['tenant_id'],
+            )
+        )
+        if not owns_sup:
+            raise HTTPException(400, "المورد المحدد غير موجود")
     mat = Material(**payload, stock_qty=Decimal("0"))
     db.add(mat)
     await db.commit()
@@ -230,6 +276,28 @@ async def update_material(material_id: int, data: MaterialCreate, db: AsyncSessi
             payload['category_id'] = mat.category_id  # حافظ على الفئة الحالية لو لم تُرسَل
         else:
             raise HTTPException(400, "الفئة مطلوبة")
+    elif payload['category_id'] != mat.category_id:
+        # نفس فحص create_material: لو الفئة اتغيرت، لازم تتأكد إنها فعلاً
+        # فئة تابعة لنفس الـ tenant (وإلا مادة تربط بفئة تنانت تاني).
+        from app.models.models import MaterialCategory as _MatCat_upd
+        owns_cat = await db.scalar(
+            select(_MatCat_upd.id).where(
+                _MatCat_upd.id == payload['category_id'],
+                _MatCat_upd.tenant_id == mat.tenant_id,
+            )
+        )
+        if not owns_cat:
+            raise HTTPException(400, "الفئة المحددة غير موجودة")
+    if payload.get('supplier_id') is not None and payload['supplier_id'] != mat.supplier_id:
+        from app.models.models import Supplier as _Supplier_upd
+        owns_sup = await db.scalar(
+            select(_Supplier_upd.id).where(
+                _Supplier_upd.id == payload['supplier_id'],
+                _Supplier_upd.tenant_id == mat.tenant_id,
+            )
+        )
+        if not owns_sup:
+            raise HTTPException(400, "المورد المحدد غير موجود")
     if new_code and new_code != mat.code:
         dup = await db.scalar(select(Material.id).where(Material.code == new_code))
         if dup:
@@ -432,6 +500,17 @@ async def transfer_stock(data: TransferIn, db: AsyncSession = Depends(get_db)):
     mat = await db.get(Material, data.material_id)
     if not mat:
         raise HTTPException(404, "المادة غير موجودة")
+
+    # المصدر والوجهة بيوصلوا كـ IDs خام من العميل — post_transfer نفسه بيفحص
+    # التوفر في الموقع المصدر (فبيرفض id مصدر وهمي ضمنيًا)، لكن الموقع
+    # الوجهة مكانش بيتفحص خالص: أي رقم (حتى لو مش BinLocation موجود، أو
+    # موجود بس لتنانت تاني) كان بيعدي، و_sync_quant كان بينشئ StockQuant
+    # يتيم عليه — رصيد "منقول" فعليًا بس مالوش موقع حقيقي يظهر بيه في
+    # /quants ولا ينفع يترحّل منه تاني.
+    if not await db.get(BinLocation, data.source_location_id):
+        raise HTTPException(404, "موقع المصدر غير موجود")
+    if not await db.get(BinLocation, data.destination_location_id):
+        raise HTTPException(404, "موقع الوجهة غير موجود")
 
     movement = await post_transfer(
         db, material=mat, qty=data.qty,
@@ -966,6 +1045,13 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
         res = await db.get(MaterialReservation, data.reservation_id)
         if not res:
             raise HTTPException(404, "الحجز غير موجود")
+        if res.material_id != data.material_id:
+            # لو الحجز تابع لمادة مختلفة عن material_id المُرسلة، كان الكود
+            # بيخصم فعليًا من مخزون data.material_id (post_issue/stock items)
+            # لكن يعلّم حجز مادة تانية تمامًا كـ"مصروف" (res.issued_qty يزيد) —
+            # فيسيب المادة الحقيقية المحجوزة لأمر الإنتاج من غير أي صرف فعلي
+            # رغم إن حجزها بيظهر مُنفَّذ، ويستهلك مخزون مادة مش لها علاقة بالأمر.
+            raise HTTPException(400, "الحجز المحدد لا يخص هذه المادة")
         remaining_reserved = res.reserved_qty - res.issued_qty
         if remaining_reserved <= 0:
             raise HTTPException(400, f"تم صرف {mat.name_ar} لهذا الحجز بالكامل من قبل — لا يمكن الصرف مرة أخرى")

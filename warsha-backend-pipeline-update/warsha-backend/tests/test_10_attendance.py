@@ -126,3 +126,29 @@ async def test_delete_attendance(cli):
     att_id = r.json()["id"]
     r2 = await cli.delete(f"{BASE}/{att_id}")
     assert r2.status_code == 204
+
+
+# ════════════════ TENANT OWNERSHIP ════════════════════════════════════
+@pytest.mark.asyncio
+async def test_record_attendance_rejects_foreign_worker(cli, cli2):
+    """Regression: record_attendance never checked that worker_id belongs to
+    the caller's own tenant — a worker id from another tenant was silently
+    accepted and an attendance row created for it."""
+    wid_other = await _make_worker(cli2, "عامل مستأجر آخر")
+    r = await cli.post(BASE, json={
+        "worker_id": wid_other,
+        "attendance_date": str(date.today()),
+        "status": "present",
+    })
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_bulk_attendance_rejects_foreign_worker(cli, cli2):
+    """Same tenant-ownership gap as above, for the bulk endpoint."""
+    wid_other = await _make_worker(cli2, "عامل مستأجر آخر 2")
+    r = await cli.post(f"{BASE}/bulk", json={
+        "attendance_date": str(date.today()),
+        "records": [{"worker_id": wid_other, "status": "present"}],
+    })
+    assert r.status_code == 404

@@ -78,6 +78,12 @@ async def create_worker(data: WorkerIn, db: AsyncSession = Depends(get_db)):
     tid = _ctid_wrk.get() or 1
     d = data.model_dump()
     d['code'] = d.get('code') or await _next_worker_code(db, tid)
+    # كود يدوي مكرَّر لنفس المستأجر كان بيسقط في IntegrityError غير معالَج
+    # (500) بدل رسالة تحقق واضحة — القيد الفريد على (tenant_id, code) موجود
+    # في الموديل لكن محدش كان بيتحقق منه قبل الإدراج.
+    dup = await db.scalar(select(Worker.id).where(Worker.code == d['code'], Worker.tenant_id == tid))
+    if dup:
+        raise HTTPException(400, f"الكود {d['code']} مستخدم بالفعل")
     # base_weekly_wage = daily_wage × 6 تلقائياً
     d['base_weekly_wage'] = data.daily_wage * 6
     d['tenant_id'] = tid
@@ -87,8 +93,9 @@ async def create_worker(data: WorkerIn, db: AsyncSession = Depends(get_db)):
 @router.put("/{wid}")
 async def update_worker(wid: int, data: WorkerIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_uw
+    tid_uw = _ctid_uw.get() or 1
     w = await db.get(Worker, wid)
-    if not w or w.tenant_id != (_ctid_uw.get() or 1): raise HTTPException(404)
+    if not w or w.tenant_id != tid_uw: raise HTTPException(404)
     if data.daily_wage is None or data.daily_wage <= 0:
         raise HTTPException(400, "الأجر اليومي يجب أن يكون أكبر من صفر")
     if data.hire_date and data.contract_end_date and data.contract_end_date < data.hire_date:
@@ -96,6 +103,12 @@ async def update_worker(wid: int, data: WorkerIn, db: AsyncSession = Depends(get
     d = data.model_dump()
     if not d.get("code"):
         d["code"] = w.code  # حافظ على الكود الموجود لو لم يُرسَل
+    else:
+        dup = await db.scalar(
+            select(Worker.id).where(Worker.code == d['code'], Worker.tenant_id == tid_uw, Worker.id != wid)
+        )
+        if dup:
+            raise HTTPException(400, f"الكود {d['code']} مستخدم بالفعل")
     d['base_weekly_wage'] = data.daily_wage * 6
     for k,v in d.items(): setattr(w,k,v)
     await db.commit(); await db.refresh(w); return wd(w)
@@ -108,39 +121,64 @@ async def deactivate(wid: int, db: AsyncSession = Depends(get_db)):
     w.is_active = False; await db.commit(); return {"message":"تم التعطيل"}
 
 # ── Advances ───────────────────────────────────────────────────
+_VALID_ADVANCE_TYPES = {"advance", "deduction", "bonus"}
+
 @router.post("/advances", status_code=201)
 async def add_advance(data: AdvanceIn, db: AsyncSession = Depends(get_db)):
+    if data.advance_type not in _VALID_ADVANCE_TYPES:
+        raise HTTPException(400, f"نوع غير صالح. القيم المسموحة: {sorted(_VALID_ADVANCE_TYPES)}")
+    if data.amount is None or data.amount <= 0:
+        raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
     from app.core.database import current_tenant_id as _ctid_adv
+    tid_adv = _ctid_adv.get() or 1
+    worker = await db.get(Worker, data.worker_id)
+    if not worker or worker.tenant_id != tid_adv:
+        raise HTTPException(404, "العامل غير موجود")
+
     adv_payload = data.model_dump()
-    adv_payload['tenant_id'] = _ctid_adv.get() or 1
+    adv_payload['tenant_id'] = tid_adv
     a = WorkerAdvance(**adv_payload); db.add(a); await db.flush()
 
-    worker = await db.get(Worker, a.worker_id)
-    from app.services.treasury_link import record_payment_in_treasury
-    txn = await record_payment_in_treasury(
-        db, amount=a.amount, direction="out", source="worker_advance",
-        linked_type="worker_advance", linked_id=a.id,
-        category_name="سلف عمال",
-        description=f"سلفة عامل: {worker.name if worker else a.worker_id}",
-    )
-    if txn is not None and a.advance_type == "advance":
-        from app.models.models import Treasury
-        treasury = await db.get(Treasury, txn.treasury_id)
-        if treasury and treasury.coa_account_id:
-            from app.services.auto_journal import journal_worker_advance
-            await journal_worker_advance(
-                db, adv_payload['tenant_id'], a.id,
-                worker.name if worker else str(a.worker_id),
-                a.amount, treasury.coa_account_id, a.date,
-            )
+    # ملاحظة إصلاح: "bonus" مش نقدية بتخرج من الخزنة دلوقتي — قيمتها بتتضاف
+    # لصافي الراتب وتُصرف فعليًا فقط وقت دفع الكشف (pay_payroll_run). قبل كده
+    # كانت الخزنة بتتصرف هنا فورًا *و كمان* الصافي وقت الدفع، يعني المكافأة
+    # كانت بتتصرف مرتين فعليًا من نفس الخزنة لنفس المبلغ.
+    # "deduction" زي "advance" تمامًا من ناحية الخزنة/القيد — فلوس بتخرج الآن
+    # وتُسترد من الراتب لاحقًا، فلازم يتسجل لها نفس القيد المحاسبي (كان قبل
+    # كده بيتسجل لـ"advance" بس، فتفضل حركة خزنة بدون أي أثر في دليل الحسابات).
+    if a.advance_type != "bonus":
+        from app.services.treasury_link import record_payment_in_treasury
+        txn = await record_payment_in_treasury(
+            db, amount=a.amount, direction="out", source="worker_advance",
+            linked_type="worker_advance", linked_id=a.id,
+            category_name="سلف عمال",
+            description=f"سلفة عامل: {worker.name if worker else a.worker_id}",
+        )
+        if txn is not None:
+            from app.models.models import Treasury
+            treasury = await db.get(Treasury, txn.treasury_id)
+            if treasury and treasury.coa_account_id:
+                from app.services.auto_journal import journal_worker_advance
+                await journal_worker_advance(
+                    db, tid_adv, a.id,
+                    worker.name if worker else str(a.worker_id),
+                    a.amount, treasury.coa_account_id, a.date,
+                )
     await db.commit(); await db.refresh(a)
     return {"id":a.id,"amount":float(a.amount),"advance_type":a.advance_type}
 
 @router.delete("/advances/{aid}")
 async def del_advance(aid: int, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_da
+    tid_da = _ctid_da.get() or 1
     a = await db.get(WorkerAdvance, aid)
-    if not a or a.tenant_id != (_ctid_da.get() or 1): raise HTTPException(404)
+    if not a or a.tenant_id != tid_da: raise HTTPException(404)
+    if a.is_settled:
+        # اتسوّت بالفعل في كشف رواتب — صافي راتب العامل اتخصم منه المبلغ ده
+        # فعليًا. حذفها المباشر هنا كان هيمسح السلفة من غير ما يرجّع الخصم
+        # في كشف الرواتب، يعني العامل يتخصم منه فلوس لسلفة "مبقتش موجودة".
+        # لازم تُلغى تسوية الكشف نفسه أولاً (حذف/إعادة توليد الكشف).
+        raise HTTPException(400, "لا يمكن حذف سلفة تم تسويتها في كشف رواتب — احذف كشف الرواتب أولاً لإلغاء التسوية")
     from app.models.models import TreasuryTransaction, Treasury
     txn = (await db.execute(
         select(TreasuryTransaction).where(
@@ -153,6 +191,10 @@ async def del_advance(aid: int, db: AsyncSession = Depends(get_db)):
         if treasury:
             treasury.balance = (treasury.balance or Decimal("0")) + txn.amount
         await db.delete(txn)
+        # عكس القيد المحاسبي المرتبط (مدين 1220 / دائن الخزنة) — كان قبل كده
+        # بيتعكس رصيد الخزنة بس، ويفضل قيد يتيم في دليل الحسابات يوازيه.
+        from app.services.auto_journal import journal_reverse_entry
+        await journal_reverse_entry(db, tid_da, "worker_advance", aid, "حذف السلفة")
     await db.delete(a); await db.commit(); return {"message":"تم"}
 
 # ── Payroll ────────────────────────────────────────────────────
@@ -258,15 +300,30 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
             att_map[a.worker_id]["gross_project"] += rate / 2
 
     # السلف والمكافآت
+    # ملاحظة إصلاح: إعادة توليد كشف لم يُصرف بعد (بعد تعديل الحضور مثلاً) كانت
+    # بتفوّت أي سلفة/مكافأة سبق ربطها بنفس الكشف ده تحديدًا في مرة توليد سابقة
+    # (لأنها بقت is_settled=True فمابتترجعش في فلتر "غير مسوّاة" تحت) — نلغي
+    # ربطها الأول عشان نعيد حسابها من الصفر مع باقي الكشف.
+    prev_linked = (await db.execute(
+        select(WorkerAdvance).where(WorkerAdvance.payroll_run_id == run_id, WorkerAdvance.tenant_id == tid)
+    )).scalars().all()
+    for _pl in prev_linked:
+        _pl.is_settled = False
+        _pl.payroll_run_id = None
+    await db.flush()
+
     adv_recs = (await db.execute(
-        select(WorkerAdvance).where(WorkerAdvance.is_settled == False, WorkerAdvance.tenant_id == tid)
+        select(WorkerAdvance)
+        .where(WorkerAdvance.is_settled == False, WorkerAdvance.tenant_id == tid)
+        .order_by(WorkerAdvance.date, WorkerAdvance.id)
     )).scalars().all()
     adv_map: dict[int, dict] = {}
     for a in adv_recs:
-        adv_map.setdefault(a.worker_id, {"d": Decimal("0"), "b": Decimal("0"), "ids": []})
-        if a.advance_type == "bonus": adv_map[a.worker_id]["b"] += a.amount
-        else: adv_map[a.worker_id]["d"] += a.amount
-        adv_map[a.worker_id]["ids"].append(a.id)
+        bucket = adv_map.setdefault(a.worker_id, {"bonus_ids": [], "debt": []})
+        if a.advance_type == "bonus":
+            bucket["bonus_ids"].append(a.id)
+        else:
+            bucket["debt"].append(a)  # "advance" أو "deduction" — بترتيب تاريخي (الأقدم أولاً)
 
     # حذف البنود القديمة وإعادة الحساب
     old = (await db.execute(
@@ -292,10 +349,38 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
         gross          = gross_workshop + gross_project
         total_days     = info["days_workshop"] + info["days_project"]
 
-        ai = adv_map.get(w.id, {"d": Decimal("0"), "b": Decimal("0"), "ids": []})
-        # نخصم السلف فقط بقدر ما كسبه العامل — لا يصبح الصافي سالباً
-        deductible = min(ai["d"], gross + ai["b"])
-        net = gross + ai["b"] - deductible
+        ai = adv_map.get(w.id, {"bonus_ids": [], "debt": []})
+
+        # المكافآت (bonus) تُسوَّى دائمًا فور تضمينها هنا — بصرف النظر عن وجود
+        # سلف مستحقة الخصم — كانت قبل كده بتتسوّى بالصدفة فقط لو "deductible>0"
+        # حصل، وإلا كانت بترجع تُحسب وتُدفع تاني في كل كشف رواتب لاحق (نفس
+        # المكافأة بتتصرف أكتر من مرة).
+        bonus_total = Decimal("0")
+        for bid in ai["bonus_ids"]:
+            b = await db.get(WorkerAdvance, bid)
+            if b:
+                bonus_total += b.amount
+                b.is_settled = True
+                b.payroll_run_id = run_id
+
+        # نسوّي سلف/خصومات العامل (الأقدم أولاً) بالكامل فقط بقدر ما تسمح به
+        # سعة الأسبوع (الإجمالي + المكافأة). لا نسوّي جزءًا من سلفة ونعلّمها
+        # "مسوّاة بالكامل" — ده كان معناه ضياع باقي المبلغ المستحق للأبد (كان
+        # deductible بيتحسب Capped لمنع صافي سالب، لكن كل سلف العامل كانت
+        # بتتعلّم settled بغض النظر، حتى لو غُطّي جزء بسيط منها بس). بدل كده:
+        # لو مافيش سعة كافية لتغطية سلفة بالكامل، نسيبها زي ما هي لحد ما تتوفر
+        # سعة كافية في كشف قادم.
+        capacity = gross + bonus_total
+        deductible = Decimal("0")
+        for adv in ai["debt"]:
+            if adv.amount <= capacity:
+                capacity -= adv.amount
+                deductible += adv.amount
+                adv.is_settled = True
+                adv.payroll_run_id = run_id
+            # وإلا سيبها غير مسوّاة لحد كشف لاحق فيه سعة كافية
+
+        net = gross + bonus_total - deductible
 
         notes = None
         if info["days_project"] > 0:
@@ -309,20 +394,12 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
             tenant_id=tid,
             payroll_run_id=run_id, worker_id=w.id,
             days_worked=total_days,
-            gross_amount=gross, bonus=ai["b"], deductions=deductible,
+            gross_amount=gross, bonus=bonus_total, deductions=deductible,
             net_amount=net, notes=notes,
         ))
         run.total_gross += gross
         run.total_deductions += deductible
         run.total_net += net
-
-        # نسوّي فقط السلف التي غُطّيت فعلاً — لو deductible=0 لا نسوّيها
-        if deductible > 0:
-            for aid in ai["ids"]:
-                adv = await db.get(WorkerAdvance, aid)
-                if adv:
-                    adv.is_settled = True
-                    adv.payroll_run_id = run_id
 
         result.append({
             "worker": w.name,
@@ -370,13 +447,14 @@ async def pay_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
     pay_date = run.week_end or _dt.date.today()
 
     if run.total_net > 0 or run.total_gross > 0:
-        advances_settled = (await db.execute(
-            select(func.coalesce(func.sum(WorkerAdvance.amount), 0)).where(
-                WorkerAdvance.payroll_run_id == run_id,
-                WorkerAdvance.advance_type == "advance",
-                WorkerAdvance.is_settled == True,
-            )
-        )).scalar() or Decimal("0")
+        # ملاحظة إصلاح: كان بيُعاد حساب "advances_settled" من استعلام منفصل
+        # (مجموع WorkerAdvance.amount الكاملة لنوع "advance" فقط، is_settled=True)
+        # بدل استخدام run.total_deductions المحسوبة فعليًا في generate() — ده كان
+        # بيدّي نتيجة مختلفة عن الخصم الحقيقي من صافي الراتب كل ما فيه سلفة من
+        # نوع "deduction" (كانت بتتخصم من الصافي لكن مستبعدة من هذا الاستعلام)،
+        # فيطلع قيد محاسبي غير متوازن مع الحقيقة الفعلية للراتب المصروف.
+        # run.total_deductions هي مصدر الحقيقة الوحيد المتّسق مع ما خُصم فعلاً.
+        advances_settled = run.total_deductions or Decimal("0")
         from app.services.auto_journal import journal_payroll
         await journal_payroll(
             db, _tid_pr, run_id, run_code,
@@ -474,12 +552,13 @@ async def worker_profile(wid: int, db: AsyncSession = Depends(get_db)):
     w = await db.get(Worker, wid)
     if not w or w.tenant_id != tid: raise HTTPException(404)
     advances = (await db.execute(
-        select(WorkerAdvance).where(WorkerAdvance.worker_id == wid).order_by(WorkerAdvance.date.desc())
+        select(WorkerAdvance).where(WorkerAdvance.worker_id == wid, WorkerAdvance.tenant_id == tid)
+        .order_by(WorkerAdvance.date.desc())
     )).scalars().all()
     payroll_lines = (await db.execute(
         select(PayrollRun, PayrollLine)
         .join(PayrollLine, PayrollLine.payroll_run_id == PayrollRun.id)
-        .where(PayrollLine.worker_id == wid)
+        .where(PayrollLine.worker_id == wid, PayrollLine.tenant_id == tid)
         .order_by(PayrollRun.week_start.desc())
         .limit(10)
     )).all()

@@ -192,6 +192,26 @@ async def delete_workshop(
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(404, "الورشة غير موجودة")
+
+    # حماية: tenant_id في عشرات الجداول (مستخدمين، فواتير، مخزون...) معرَّف
+    # كـ ForeignKey("tenants.id") عادي بدون ON DELETE CASCADE على مستوى الداتابيز
+    # ولا أي cascade على مستوى الـ ORM هنا. حذف الـ tenant مباشرة كان بالتالي إما
+    # بيرمي IntegrityError غير معالج (500) على أي قاعدة بيانات بتفرض قيود FK فعليًا
+    # (PostgreSQL في production)، أو بيسيب صفوف يتيمة بصمت (SQLite بدون FK). كل
+    # ورشة بيتعمل لها seed_default_accounts + seed_default_warehouses فور الإنشاء،
+    # يعني عمليًا كل tenant حقيقي عنده بيانات مرتبطة من أول لحظة — فالحذف الفعلي
+    # كان غير قابل للاستخدام أصلاً. الحل الآمن: نمنع الحذف النهائي طالما فيه
+    # مستخدمين، ونوجّه لاستخدام التعطيل (toggle) بدلاً منه.
+    user_count = await db.scalar(
+        select(func.count()).select_from(User).where(User.tenant_id == tenant_id)
+    )
+    if (user_count or 0) > 0:
+        raise HTTPException(
+            409,
+            f"لا يمكن حذف الورشة نهائياً — يوجد بها {user_count} مستخدم وبيانات مرتبطة "
+            "(مخزون/فواتير/حسابات...). استخدم تعطيل الورشة (PUT /workshops/{id}/toggle) بدلاً من الحذف النهائي.",
+        )
+
     await db.delete(tenant)
     await db.commit()
     return {"message": "تم حذف الورشة"}

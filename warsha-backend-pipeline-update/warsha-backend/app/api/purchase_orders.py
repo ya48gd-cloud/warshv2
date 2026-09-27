@@ -186,6 +186,15 @@ async def create_purchase_order(data: POIn, db: AsyncSession = Depends(get_db)):
         sup_check = await db.get(Supplier, data.supplier_id)
         if not sup_check or sup_check.tenant_id != _tid_po:
             raise HTTPException(400, "المورد غير موجود")
+    # تحقق أن كل مادة مرتبطة ببند فعلاً تابعة لنفس الـ tenant — من غيره كان
+    # ممكن نمرر material_id تخميني تابع لـ tenant تاني، فيتسجل في بند أمر
+    # الشراء، وبعدين عند الاستلام (receive_purchase_order) يترفع مخزون/سعر
+    # مادة مش بتاعتنا خالص (تسريب/عبث فعلي بين المستأجرين).
+    for l in data.lines:
+        if l.material_id:
+            mat_check = await db.get(Material, l.material_id)
+            if not mat_check or mat_check.tenant_id != _tid_po:
+                raise HTTPException(400, "المادة غير موجودة")
 
     subtotal = sum(Decimal(str(l.ordered_qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
     tax_amount = subtotal * Decimal(str(data.tax_pct)) / 100
@@ -278,6 +287,11 @@ async def update_purchase_order(po_id: int, data: POIn, db: AsyncSession = Depen
         sup_check = await db.get(Supplier, data.supplier_id)
         if not sup_check or sup_check.tenant_id != _tid_upo:
             raise HTTPException(400, "المورد غير موجود")
+    for l in data.lines:
+        if l.material_id:
+            mat_check = await db.get(Material, l.material_id)
+            if not mat_check or mat_check.tenant_id != _tid_upo:
+                raise HTTPException(400, "المادة غير موجودة")
 
     subtotal = sum(Decimal(str(l.ordered_qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
     tax_amount = subtotal * Decimal(str(data.tax_pct)) / 100
@@ -403,6 +417,8 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
         # رفع المخزون — بموقع فعلي حقيقي (RAW أو IMPORTED) مش بالاسم فقط
         if line.material_id:
             mat = await db.get(Material, line.material_id)
+            if not mat:
+                raise HTTPException(400, "المادة غير موجودة")
             if mat:
                 from app.services.inventory_ledger import get_or_create_warehouse_bin, post_receipt
                 wh_code = "IMPORTED" if _is_import_supplier(po.supplier) else "RAW"
@@ -506,6 +522,23 @@ async def delete_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
     lines = (await db.execute(select(PurchaseOrderLine).where(PurchaseOrderLine.order_id == po_id))).scalars().all()
     for l in lines:
         await db.delete(l)
+
+    # حذف مرفقات أمر الشراء (لو وُجدت عبر endpoint المرفقات العام /purchases/attach)
+    # — كانت بتفضل يتيمة (سجل + ملف على القرص) بعد حذف الأمر نفسه.
+    from app.models.models import FileAttachment
+    from app.api.purchases import UPLOAD_DIR as _PO_UPLOAD_DIR
+    atts_res = await db.execute(
+        select(FileAttachment).where(
+            FileAttachment.entity_type == "purchase_order",
+            FileAttachment.entity_id == po_id,
+        )
+    )
+    for att in atts_res.scalars().all():
+        att_path = _PO_UPLOAD_DIR / att.stored_name
+        if att_path.exists():
+            att_path.unlink()
+        await db.delete(att)
+
     await db.delete(po)
     await db.commit()
     return {"message": "تم الحذف", "id": po_id}

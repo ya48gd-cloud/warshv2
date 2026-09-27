@@ -108,6 +108,49 @@ async def test_quotation_to_invoice(cli):
     assert "id" in r2.json()
 
 
+@pytest.mark.asyncio
+async def test_quotation_to_invoice_posts_to_general_ledger_and_customer_balance(cli):
+    """
+    إصلاح ثغرة تكامل (رصدها فريق المنصة/الإدارة): quotation_to_invoice كان
+    المسار الوحيد بين كل مسارات إنشاء الفاتورة (create_invoice،
+    work_order_to_invoice) اللي مابيسجّلش قيد محاسبي للإيراد
+    (journal_sales_invoice_create) ولا يحدّث رصيد العميل — فيفضل البيع عبر
+    تحويل عرض سعر → فاتورة غير مرئي تمامًا في دفتر الأستاذ (حساب 4100
+    الإيرادات وحساب 1210 العملاء) رغم إن الفاتورة فعليًا موجودة.
+    """
+    coa = "/api/v1/accounts"
+    await cli.post(f"{coa}/chart/seed")  # آمن يتكرر — idempotent
+
+    async def _trial_balance_map():
+        r = await cli.get(f"{coa}/trial-balance")
+        assert r.status_code == 200, r.text
+        return {row["code"]: row for row in r.json()["accounts"]}
+
+    before = await _trial_balance_map()
+    ar_debit_before = float(before.get("1210", {}).get("total_debit", 0))
+    rev_credit_before = float(before.get("4100", {}).get("total_credit", 0))
+
+    cid = await _make_customer(cli)
+    cust_before = (await cli.get(f"{CUST_BASE}/{cid}")).json()
+    assert cust_before["balance"] == 0.0
+
+    r = await cli.post(f"{BASE}/quotations", json=_quot_payload(cid))  # subtotal/total = 200.0
+    qid = r.json()["id"]
+    r2 = await cli.post(f"{BASE}/quotations/{qid}/to-invoice", params={"invoice_code": "INV-GL-Q1"})
+    assert r2.status_code in (200, 201), r2.text
+    total = r2.json()["total"]
+    assert total == 200.0
+
+    # رصيد العميل لازم يتحدث بقيمة الفاتورة (كان قبل الإصلاح واقف على صفر)
+    cust_after = (await cli.get(f"{CUST_BASE}/{cid}")).json()
+    assert cust_after["balance"] == total
+
+    # القيد المحاسبي لازم يُسجَّل: مدين العملاء (1210) ودائن الإيرادات (4100)
+    after = await _trial_balance_map()
+    assert float(after["1210"]["total_debit"]) == ar_debit_before + total
+    assert float(after["4100"]["total_credit"]) == rev_credit_before + total
+
+
 # ════════════════ QUOTATION → ORDER ══════════════════════════════════
 @pytest.mark.asyncio
 async def test_quotation_to_order(cli):
@@ -814,6 +857,53 @@ async def test_pay_installment_endpoint_settles_correct_installment(cli):
 
 
 @pytest.mark.asyncio
+async def test_pay_installment_posts_to_general_ledger(cli):
+    """
+    إصلاح ثغرة تكامل (رصدها فريق المحاسبة/الخزينة): POST .../pay كان يستقبل
+    فلوس فعلية في الخزنة (record_payment_in_treasury) من غير ما يسجّل القيد
+    المحاسبي المقابل (مدين الصندوق 1110 / دائن العملاء 1210) — بعكس
+    record_invoice_payment العادي اللي بيعمل النفس الاتنين. الفرق ده كان
+    يخلي ميزان المراجعة واقف من غير ما يعكس الكاش المُحصَّل عبر سداد الأقساط
+    المباشر، رغم إن رصيد الخزنة فعلاً بيزيد.
+    """
+    coa = "/api/v1/accounts"
+    await cli.post(f"{coa}/chart/seed")  # آمن يتكرر — idempotent
+
+    async def _trial_balance_map():
+        r = await cli.get(f"{coa}/trial-balance")
+        assert r.status_code == 200, r.text
+        return {row["code"]: row for row in r.json()["accounts"]}
+
+    cid = await _make_customer(cli)
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))
+    iid = r.json()["id"]
+    await cli.post(f"{BASE}/invoices/{iid}/payment-schedule", json={
+        "installments": [
+            {"label": "أول", "amount": 200, "due_date": str(date.today())},
+            {"label": "تاني", "amount": 300, "due_date": str(date.today())},
+        ]
+    })
+    sched = (await cli.get(f"{BASE}/invoices/{iid}/payment-schedule")).json()
+    first_ins_id = sched[0]["id"]
+
+    before = await _trial_balance_map()
+    cash_debit_before = float(before.get("1110", {}).get("total_debit", 0))
+    ar_credit_before   = float(before.get("1210", {}).get("total_credit", 0))
+
+    r_pay = await cli.post(
+        f"{BASE}/invoices/{iid}/payment-schedule/{first_ins_id}/pay",
+        json={"amount": 200.0, "payment_type": "cash"}
+    )
+    assert r_pay.status_code == 200, r_pay.text
+
+    after = await _trial_balance_map()
+    # مدين الصندوق (1110) لازم يزيد بقيمة القسط المسدد
+    assert float(after["1110"]["total_debit"]) == cash_debit_before + 200.0
+    # دائن العملاء (1210) لازم يزيد بنفس القيمة (تقليص الذمم المدينة)
+    assert float(after["1210"]["total_credit"]) == ar_credit_before + 200.0
+
+
+@pytest.mark.asyncio
 async def test_pay_installment_rejects_already_paid(cli):
     """تسديد قسط مسدد بالفعل → 400."""
     cid = await _make_customer(cli)
@@ -1299,3 +1389,55 @@ async def test_credit_note_issue_already_fully_paid_invoice_only_affects_balance
     inv = (await cli.get(f"{BASE}/invoices/{iid}")).json()
     assert inv["paid_amount"] == 500.0
     assert inv["status"] == "paid"
+
+
+# ════════════════ GAP-ANALYSIS ROUND 2: FK VALIDATION ═══════════════
+# إشعار دائن/فاتورة/عرض سعر بمرجع customer_id غير موجود (أو تابع لـ tenant
+# تاني — with_loader_criteria بيرجّعه None بصمت) كان يُقبل من غير أي خطأ:
+# السجل يتكوّن بمرجع عميل يتيم، ورصيد ذلك العميل (الوهمي) لا يتحدث أبداً.
+@pytest.mark.asyncio
+async def test_create_invoice_rejects_nonexistent_customer(cli):
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(999999))
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_quotation_rejects_nonexistent_customer(cli):
+    r = await cli.post(f"{BASE}/quotations", json=_quot_payload(999999))
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_invoice_rejects_nonexistent_customer(cli):
+    cid = await _make_customer(cli)
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))
+    iid = r.json()["id"]
+    bad_payload = _inv_payload(999999)
+    r2 = await cli.put(f"{BASE}/invoices/{iid}", json=bad_payload)
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_credit_note_rejects_nonexistent_customer(cli):
+    r = await cli.post(CN_BASE, json={
+        "customer_id": 999999,
+        "date": str(date.today()),
+        "lines": [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
+    })
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_credit_note_rejects_invoice_belonging_to_other_customer(cli):
+    cid1 = await _make_customer(cli)
+    cid2 = await _make_customer(cli)
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(cid1))
+    iid = r.json()["id"]
+    # cid2 لا علاقة له بالفاتورة دي — لازم يترفض
+    r2 = await cli.post(CN_BASE, json={
+        "customer_id": cid2,
+        "invoice_id": iid,
+        "date": str(date.today()),
+        "lines": [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
+    })
+    assert r2.status_code == 400

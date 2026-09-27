@@ -343,7 +343,9 @@ async def test_movement_no_sequential_per_tenant(cli):
 async def test_movement_no_isolated_per_tenant(cli, cli2):
     """أرقام الحركات مستقلة بين المستأجرين — tenant2 يبدأ ترقيمه لوحده من غير تأثر بـ tenant1."""
     m1 = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
-    m2 = (await cli2.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    # category_id=2 هي الفئة المزروعة لـ tenant-2 في conftest (category_id=1
+    # بتاعة tenant-1 — بعد إصلاح فحص ملكية الفئة، ما عادش ينفع تنانت تاني يستخدمها)
+    m2 = (await cli2.post(f"{BASE}/materials", json=_mat_payload(category_id=2))).json()["id"]
 
     await cli.post(f"{BASE}/movements", json={
         "material_id": m1, "movement_type": "in", "qty": 10, "unit_cost": 5.0,
@@ -583,6 +585,49 @@ async def test_cutting_plan_main_stock_over_consumption_rejected(cli):
 
 
 @pytest.mark.asyncio
+async def test_cutting_plan_commit_rejects_reservation_material_mismatch(cli):
+    """
+    قبل الإصلاح: reservation_id مالوش أي فحص إنه فعلاً بيخص material_id
+    المُرسلة. كان ينفع تخصم فعليًا من مخزون مادة A (عبر consumed_qty_from_main_stock)
+    بس تسجّل الحجز بتاع مادة B كـ'مصروف' (issued_qty يزيد) — فتفضل مادة B
+    الحقيقية المحجوزة لأمر الإنتاج من غير أي صرف فعلي رغم إن حجزها بيظهر مُنفَّذ.
+    """
+    EQ = "/api/v1/equipment"
+    PROD = "/api/v1/production"
+    ACC = "/api/v1/accounting"
+
+    mat_a = (await cli.post(f"{BASE}/materials", json=_mat_payload(name_ar="مادة أ"))).json()["id"]
+    mat_b = (await cli.post(f"{BASE}/materials", json=_mat_payload(name_ar="مادة ب"))).json()["id"]
+    for mid in (mat_a, mat_b):
+        await cli.post(f"{BASE}/movements", json={
+            "material_id": mid, "movement_type": "in", "qty": 100, "unit_cost": 10.0,
+        })
+
+    eq_id = (await cli.post(EQ, json={"name_ar": "معدة تقطيع مزدوجة", "level": 1})).json()["id"]
+    await cli.post(f"{EQ}/bom", json={"equipment_id": eq_id, "material_id": mat_a, "qty": 10.0, "unit_cost": 10.0})
+    await cli.post(f"{EQ}/bom", json={"equipment_id": eq_id, "material_id": mat_b, "qty": 10.0, "unit_cost": 10.0})
+    wo_id = (await cli.post(f"{ACC}/work-orders", json={
+        "equipment_id": eq_id, "planned_cost": 1000.0, "start_date": str(date.today()),
+    })).json()["id"]
+    await cli.post(f"{PROD}/auto-reserve/{wo_id}")
+
+    reservations = (await cli.get(f"{PROD}/{wo_id}/reservations")).json()
+    res_b = next(r for r in reservations if r["material_id"] == mat_b)
+
+    # نبعت material_id=mat_a بس reservation_id بتاع مادة ب — لازم يترفض
+    commit = await cli.post(f"{BASE}/cutting-plan/commit", json={
+        "material_id": mat_a, "reservation_id": res_b["id"],
+        "consumed_qty_from_main_stock": 5,
+    })
+    assert commit.status_code == 400
+
+    # حجز مادة ب يفضل زي ما هو (مفيش صرف اتسجل عليه غلط)
+    reservations_after = (await cli.get(f"{PROD}/{wo_id}/reservations")).json()
+    res_b_after = next(r for r in reservations_after if r["material_id"] == mat_b)
+    assert res_b_after["issued_qty"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_reversal_keeps_quant_in_sync(cli):
     """عكس حركة (محطة 2) لازم يزامن الـ StockQuant برضه، مش بس stock_qty."""
     r = await cli.post(f"{BASE}/materials", json=_mat_payload())
@@ -703,3 +748,144 @@ async def test_transfer_insufficient_source_quant_rejected(cli):
         "material_id": mid, "source_location_id": loc_a, "destination_location_id": loc_b, "qty": 5,
     })
     assert r2.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_transfer_rejects_nonexistent_destination_location(cli):
+    """موقع وجهة برقم وهمي (مش BinLocation موجود أصلاً) كان يعدي ويعمل
+    StockQuant يتيم — رصيد 'منقول' فعليًا بس مالوش موقع حقيقي يظهر بيه."""
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload())
+    mid = r.json()["id"]
+    loc_a = await _make_location(cli, "REAL-SRC")
+    r2 = await cli.post(f"{BASE}/movements/transfer", json={
+        "material_id": mid, "source_location_id": loc_a, "destination_location_id": 999999, "qty": 1,
+    })
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_transfer_rejects_nonexistent_source_location(cli):
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload())
+    mid = r.json()["id"]
+    loc_b = await _make_location(cli, "REAL-DST")
+    r2 = await cli.post(f"{BASE}/movements/transfer", json={
+        "material_id": mid, "source_location_id": 999999, "destination_location_id": loc_b, "qty": 1,
+    })
+    assert r2.status_code == 404
+
+
+# ════════════ Round-2 gap/validation fixes ═══════════════════════════
+
+@pytest.mark.asyncio
+async def test_create_material_rejects_negative_unit_cost(cli):
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(unit_cost=-5))
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_material_rejects_negative_reorder_level(cli):
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(reorder_level=-1))
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_material_rejects_negative_unit_cost(cli):
+    """PUT /materials/{id} كان بيقبل unit_cost سالب من غير أي فحص، وده كان
+    هيتسرب لمتوسط التكلفة المرجّح في أي استلام لاحق ويبوّظ COGS بصمت."""
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    r = await cli.put(f"{BASE}/materials/{mid}", json=_mat_payload(unit_cost=-1))
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_movement_rejects_invalid_movement_type(cli):
+    """قيمة غير 'in'/'out' كانت بتتعامل ضمنيًا كـ'out' (else branch) وتنقص
+    المخزون بدل ما ترفض الطلب."""
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    r = await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "adjustment", "qty": 10, "unit_cost": 5.0,
+    })
+    assert r.status_code == 422
+    # الرصيد ميتأثرش خالص
+    mat = await cli.get(f"{BASE}/materials/{mid}")
+    assert mat.json()["stock_qty"] == 0
+
+
+@pytest.mark.asyncio
+async def test_create_material_rejects_category_from_another_tenant(cli, cli2):
+    """category_id=1 بتاعة tenant-1 — tenant-2 ميقدرش يربط مادته بيها،
+    وإلا لو tenant-1 حذف الفئة تبقى مادة tenant-2 بمرجع يتيم، وعدّاد مواد
+    الفئة عند tenant-1 هيبقى غلط (المادة الأجنبية دي مش هتتحسب في عدّه)."""
+    r = await cli2.post(f"{BASE}/materials", json=_mat_payload(category_id=1))
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_material_rejects_category_from_another_tenant(cli, cli2):
+    mid = (await cli2.post(f"{BASE}/materials", json=_mat_payload(category_id=2))).json()["id"]
+    r = await cli2.put(f"{BASE}/materials/{mid}", json=_mat_payload(category_id=1))
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_material_rejects_supplier_from_another_tenant(cli, cli2):
+    sup = await cli2.post("/api/v1/purchases/suppliers", json={"name": "مورد تنانت2"})
+    foreign_supplier_id = sup.json()["id"]
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(supplier_id=foreign_supplier_id))
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_catalog_import_with_opening_qty_goes_through_ledger(cli):
+    """
+    /api/v1/catalog/{id}/import كان بيحط Material.stock_qty=data.stock_qty
+    مباشرة من غير أي StockMovement ولا مزامنة StockQuant — رصيد "شبح" كان
+    هيفضل مش متطابق أبداً مع stock-check ولا traceability. بعد الإصلاح لازم
+    يعدي عن طريق post_receipt زي أي استلام تاني في النظام.
+    """
+    from tests.conftest import TestSessionLocal
+    from app.api.catalog import GlobalCatalogItem
+
+    async with TestSessionLocal() as session:
+        item = GlobalCatalogItem(
+            code="CAT-IMPORT-TEST", name_ar="صاج مستورد", unit="كجم",
+        )
+        session.add(item)
+        await session.commit()
+        await session.refresh(item)
+        item_id = item.id
+
+    r = await cli.post(f"/api/v1/catalog/{item_id}/import", json={
+        "unit_cost": 15.0, "stock_qty": 40, "reorder_level": 5,
+    })
+    assert r.status_code == 200
+    mid = r.json()["material_id"]
+
+    mat = (await cli.get(f"{BASE}/materials/{mid}")).json()
+    assert mat["stock_qty"] == 40.0
+
+    movements = (await cli.get(f"{BASE}/movements/{mid}")).json()
+    assert len(movements) == 1
+    assert movements[0]["movement_type"] == "in"
+    assert movements[0]["qty"] == 40.0
+    assert movements[0]["source_doc_type"] == "catalog_import"
+
+    check = (await cli.get(f"{BASE}/materials/{mid}/stock-check")).json()
+    assert check["matches"] is True
+    assert check["quant_total"] == 40.0
+
+
+@pytest.mark.asyncio
+async def test_catalog_import_rejects_negative_opening_qty(cli):
+    from tests.conftest import TestSessionLocal
+    from app.api.catalog import GlobalCatalogItem
+
+    async with TestSessionLocal() as session:
+        item = GlobalCatalogItem(code="CAT-IMPORT-NEG", name_ar="مادة", unit="قطعة")
+        session.add(item)
+        await session.commit()
+        await session.refresh(item)
+        item_id = item.id
+
+    r = await cli.post(f"/api/v1/catalog/{item_id}/import", json={"stock_qty": -1})
+    assert r.status_code == 400

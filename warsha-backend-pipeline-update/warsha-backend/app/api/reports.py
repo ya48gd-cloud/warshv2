@@ -1156,6 +1156,38 @@ async def labor_performance_report(
 # PERIOD COMPARISON — مقارنة الفترات
 # ══════════════════════════════════════════════════════════════
 
+async def _period_cogs(db: AsyncSession, tid: int, date_from: date, date_to: date) -> float:
+    """تكلفة البضاعة المباعة الفعلية للفترة — من دفتر الأستاذ (حساب 5100) مباشرة،
+    بدل تقدير مبني على WorkOrder.actual_cost.
+
+    ليه التغيير: journal_cogs() بقى بيتسجل الآن من كل مسارات البيع الثلاثة
+    (تسليم أمر توريد supply_contracts، فوترة أمر إنتاج مباشرة work_order_to_invoice،
+    وتسليم delivery_orders) بنفس التاريخ بالظبط اللي اتسجل بيه إيراد البيع
+    المقابل. الاعتماد على WorkOrder.actual_cost + WorkOrder.created_at (الكود
+    القديم) كان بيفوّت تكلفة مبيعات عقود التوريد بالكامل (مفيش WorkOrder ليها
+    أصلاً) وكان بيقارن تاريخ *إنشاء* أمر الإنتاج بتاريخ *فاتورة* البيع —
+    فترتين مختلفتين تماماً في الغالب — فالربح المعروض كان بيبقى مبالغ فيه
+    (تكلفة مفقودة) أو في توقيت غلط عن الإيراد الحقيقي.
+    """
+    from app.models.models import AccountingEntry, AccountingEntryLine, ChartOfAccount
+    cogs_account_ids = select(ChartOfAccount.id).where(
+        ChartOfAccount.tenant_id == tid, ChartOfAccount.code == "5100",
+    )
+    total = await db.scalar(
+        select(func.coalesce(func.sum(AccountingEntryLine.amount), 0))
+        .select_from(AccountingEntryLine)
+        .join(AccountingEntry, AccountingEntry.id == AccountingEntryLine.entry_id)
+        .where(
+            AccountingEntry.tenant_id == tid,
+            AccountingEntry.entry_date >= date_from,
+            AccountingEntry.entry_date <= date_to,
+            AccountingEntryLine.side == "debit",
+            AccountingEntryLine.account_id.in_(cogs_account_ids),
+        )
+    )
+    return float(total or 0)
+
+
 async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: date) -> dict:
     """يحسب أهم مؤشرات الأداء لفترة معيّنة (مقصورة على tenant الحالي)"""
     sales_total = float(await db.scalar(
@@ -1177,6 +1209,10 @@ async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: dat
 
     dt_from = datetime.combine(date_from, time.min)
     dt_to = datetime.combine(date_to, time.max)
+    # ملحوظة: production_cost هنا مقياس تشغيلي منفصل ("كام اتكلّف تصنيع اللي
+    # خلص هذا الشهر") — مقصود يفضل مبني على WorkOrder.actual_cost/status=done،
+    # مش المفروض يُستخدم كتكلفة مبيعات (COGS) لحساب الربح. راجع _period_cogs
+    # تحت لحساب الربح الفعلي.
     production_cost = float(await db.scalar(
         select(func.coalesce(func.sum(WorkOrder.actual_cost), 0))
         .where(WorkOrder.tenant_id == tid, WorkOrder.status == "done",
@@ -1199,7 +1235,8 @@ async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: dat
                TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
     ) or 0)
 
-    profit = sales_total - production_cost
+    cogs_actual = await _period_cogs(db, tid, date_from, date_to)
+    profit = sales_total - cogs_actual
 
     return {
         "date_from": str(date_from), "date_to": str(date_to),
@@ -1208,6 +1245,7 @@ async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: dat
         "invoices_count": invoices_count,
         "purchases_total": round(purchases_total, 2),
         "production_cost": round(production_cost, 2),
+        "cogs_actual": round(cogs_actual, 2),
         "completed_work_orders": completed_work_orders,
         "cashflow_in": round(cashflow_in, 2),
         "cashflow_out": round(cashflow_out, 2),
@@ -1251,6 +1289,7 @@ async def period_comparison_report(
         ("invoices_count", "عدد الفواتير"),
         ("purchases_total", "إجمالي المشتريات"),
         ("production_cost", "تكلفة الإنتاج"),
+        ("cogs_actual", "تكلفة البضاعة المباعة الفعلية"),
         ("completed_work_orders", "أوامر إنتاج مكتملة"),
         ("cashflow_in", "تدفق نقدي داخل"),
         ("cashflow_out", "تدفق نقدي خارج"),

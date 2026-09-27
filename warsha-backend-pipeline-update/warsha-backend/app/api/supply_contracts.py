@@ -224,6 +224,14 @@ async def create_contract(data: ContractIn, db: AsyncSession = Depends(get_db)):
     cust_check = await db.get(Customer, data.customer_id)
     if not cust_check or (tid is not None and cust_check.tenant_id != tid):
         raise HTTPException(400, "العميل غير موجود")
+    # تحقق أن كل مادة مرتبطة ببند فعلاً تابعة لنفس الـ tenant — من غيره كان
+    # ممكن نمرر material_id تخميني تابع لـ tenant تاني، وعند تأكيد التسليم
+    # (confirm_delivery) يتصرف من مخزون مادة مش بتاعتنا خالص.
+    for l in data.lines:
+        if l.material_id:
+            mat_check = await db.get(Material, l.material_id)
+            if not mat_check or (tid is not None and mat_check.tenant_id != tid):
+                raise HTTPException(400, "المادة غير موجودة")
 
     c = SupplyContract(
         tenant_id=tid,
@@ -497,6 +505,8 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
         mat = await db.get(Material, line.material_id)
         if not mat:
             continue
+        if mat.tenant_id != c.tenant_id:
+            raise HTTPException(400, "المادة غير موجودة")
         unit_cost = mat.unit_cost or Decimal("0")
         await post_issue(
             db, material=mat, qty=line.qty, unit_cost=unit_cost,
@@ -605,6 +615,23 @@ async def delete_contract(contract_id: int, db: AsyncSession = Depends(get_db)):
             PaymentScheduleTemplate.source_id == contract_id,
         )
     )
+
+    # حذف مرفقات العقد (لو وُجدت عبر endpoint المرفقات العام /purchases/attach)
+    # — كانت بتفضل يتيمة (سجل + ملف على القرص) بعد حذف العقد نفسه.
+    from app.models.models import FileAttachment
+    from app.api.purchases import UPLOAD_DIR as _SC_UPLOAD_DIR
+    atts_res = await db.execute(
+        select(FileAttachment).where(
+            FileAttachment.entity_type == "supply_contract",
+            FileAttachment.entity_id == contract_id,
+        )
+    )
+    for att in atts_res.scalars().all():
+        att_path = _SC_UPLOAD_DIR / att.stored_name
+        if att_path.exists():
+            att_path.unlink()
+        await db.delete(att)
+
     await db.delete(c)
     await db.commit()
 

@@ -311,6 +311,11 @@ async def create_quotation(data: QuotationIn, db: AsyncSession = Depends(get_db)
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
     if data.date and data.valid_until and data.valid_until < data.date:
         raise HTTPException(400, "تاريخ صلاحية العرض يجب أن يكون بعد تاريخ الإصدار")
+    # إصلاح ثغرة تحقق: كان ممكن تتبعت quotation لعميل رقمه مش موجود أصلاً
+    # (أو تابع لـ tenant تاني — with_loader_criteria بيرجّعه None بصمت)، فيتولد
+    # عرض سعر بمرجع عميل يتيم/عابر للمستأجرين من غير أي خطأ للمستخدم.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
     from app.core.database import current_tenant_id as _ctid_cq
     _tid_cq = _ctid_cq.get() or 1
     subtotal, disc_amt, tax_amt, total = calc_totals(data.lines, data.tax_pct, data.discount_pct)
@@ -487,6 +492,18 @@ async def quotation_to_invoice(qid: int, invoice_code: str, db: AsyncSession = D
             qty=l.qty, unit=l.unit, unit_price=l.unit_price,
             total_price=l.total_price, notes=l.notes, sort_order=l.sort_order))
     q.status = "accepted"
+
+    # إصلاح ثغرة تكامل (رصدها فريق المنصة/الإدارة): هذا المسار كان الوحيد بين
+    # كل مسارات إنشاء الفاتورة (create_invoice، work_order_to_invoice) اللي
+    # مابيسجّلش قيد محاسبي للإيراد (journal_sales_invoice_create) ولا يحدّث
+    # رصيد العميل — فيفضل البيع عبر تحويل عرض سعر → فاتورة غير مرئي تمامًا
+    # في دفتر الأستاذ (حساب 4100) وفي رصيد العميل (AR) رغم إن الفاتورة
+    # فعليًا موجودة ومرئية في شاشات الفواتير.
+    cust = await db.get(Customer, q.customer_id)
+    if cust:
+        cust.balance = cust.balance + inv.total
+    await journal_sales_invoice_create(db, _tid_q2i, inv.id, inv.code, inv.tax_amount, inv.total, inv.date)
+
     # محطة 7: لو عرض السعر عنده قالب خطة دفع، طبّقه على الفاتورة الجديدة تلقائيًا
     await _materialize_payment_schedule_from_template(db, "quotation", qid, inv, _tid_q2i)
     await db.commit()
@@ -518,6 +535,11 @@ async def get_next_invoice_code_ep(db: AsyncSession = Depends(get_db)):
 async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db)):
     if not data.lines:
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
+    # إصلاح ثغرة تحقق: إنشاء فاتورة لعميل رقمه غير موجود (أو تابع لـ tenant
+    # تاني) كان ينجح بصمت — الفاتورة تتسجل بمرجع عميل يتيم، ورصيد العميل
+    # (وحد الائتمان) لا يتحدث لأنه ببساطة مش موجود، من غير ما ينتبه المستخدم.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
     from app.core.database import current_tenant_id as _ctid
     _tid = _ctid.get() or 1
     code = (data.code or '').strip() or await _next_invoice_code(db)
@@ -574,6 +596,11 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
     if not inv: raise HTTPException(404)
     if not data.lines:
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
+    # إصلاح ثغرة تحقق: نقل الفاتورة لعميل رقمه غير موجود (أو تابع لـ tenant
+    # تاني) كان ينجح بصمت — الفاتورة تتحول لمرجع عميل يتيم ورصيده الجديد
+    # لا يتحدث لأنه ببساطة مش موجود.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
 
     # أعد حساب الإجماليات الجديدة الأول (من غير أي تعديل فعلي بعد) عشان نتحقق
     # من عدم تعارضها مع خطة أقساط موجودة قبل ما نلمس أي حاجة في الداتابيز
@@ -1124,6 +1151,13 @@ async def pay_installment(
         linked_id=pay_record.id, category_name="تحصيل من عملاء",
         description=f"سداد قسط {ins.installment_no} — فاتورة {inv.code}",
     )
+
+    # إصلاح ثغرة تكامل (رصدها فريق المحاسبة/الخزينة): هذا المسار بيستقبل
+    # فلوس فعلية في الخزنة (record_payment_in_treasury فوق) بالظبط زي
+    # record_invoice_payment، لكن كان ناقصه القيد المحاسبي المقابل في دفتر
+    # الأستاذ — فيفضل رصيد الخزنة يزيد والـtrial balance واقف من غير ما
+    # يعكس الكاش المُحصَّل عبر سداد الأقساط المباشر.
+    await journal_sales_invoice_payment(db, _tid_pi, inv.id, inv.code, amount, inv.date)
 
     await db.commit()
     return {

@@ -96,6 +96,14 @@ class AllocationIn(BaseModel):
     invoice_id: int
     amount: Decimal
 
+    @validator("amount")
+    def _positive_amount(cls, v):
+        # حماية: بدون التحقق ده، amount=0 أو سالب كان يعدي من غير أي خطأ ويقدر
+        # يقلل paid_amount الفاتورة أو يسجل تخصيصاً وهمياً بدون أي دفعة فعلية
+        if v <= 0:
+            raise ValueError("amount يجب أن يكون أكبر من صفر")
+        return v
+
 
 # ── Default Chart of Accounts seed ────────────────────────────
 
@@ -364,7 +372,7 @@ async def trial_balance(
             func.sum(AccountingEntryLine.amount).label("total"),
         )
         .join(AccountingEntry, AccountingEntry.id == AccountingEntryLine.entry_id)
-        .where(AccountingEntry.tenant_id == tid)
+        .where(AccountingEntry.tenant_id == tid, AccountingEntry.posted == True)
         .group_by(AccountingEntryLine.account_id, AccountingEntryLine.side)
     )
     if from_date:
@@ -538,6 +546,7 @@ async def income_statement(
         .join(ChartOfAccount, ChartOfAccount.id == AccountingEntryLine.account_id)
         .where(
             AccountingEntry.tenant_id == tid,
+            AccountingEntry.posted == True,
             ChartOfAccount.account_type.in_(["revenue", "expense"]),
         )
         .group_by(
@@ -611,6 +620,7 @@ async def balance_sheet(
         .join(ChartOfAccount, ChartOfAccount.id == AccountingEntryLine.account_id)
         .where(
             AccountingEntry.tenant_id == tid,
+            AccountingEntry.posted == True,
             AccountingEntry.entry_date <= target_date,
         )
         .group_by(
@@ -751,6 +761,7 @@ async def _account_balance(db: AsyncSession, tid: int, code: str, as_of_date: da
         .join(ChartOfAccount, ChartOfAccount.id == AccountingEntryLine.account_id)
         .where(
             AccountingEntry.tenant_id == tid,
+            AccountingEntry.posted == True,
             AccountingEntry.entry_date <= as_of_date,
             ChartOfAccount.code == code,
         )

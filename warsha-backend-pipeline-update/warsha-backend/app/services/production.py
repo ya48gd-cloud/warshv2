@@ -596,6 +596,11 @@ async def issue_material(
     mat = await db.get(Material, material_id)
     if not wo or not mat:
         return {"error": "بيانات غير صحيحة"}
+    if qty_to_issue is None or qty_to_issue <= 0:
+        # محطة 29: صرف بكمية صفر/سالبة كان بيمر من غير فحص — لكمية سالبة
+        # كان بيزوّد stock_qty فعليًا (بدل ما يخصم) وبينقص wo.actual_cost
+        # (total_cost بيبقى سالب)، عكس كل منطق الدالة تمامًا.
+        return {"error": "الكمية المطلوب صرفها يجب أن تكون أكبر من صفر"}
 
     # البحث عن الحجز
     res = (await db.execute(
@@ -791,6 +796,11 @@ async def record_scrap(
     mat = await db.get(Material, material_id)
     if not mat:
         return {"error": "بيانات غير صحيحة"}
+    if scrap_qty is None or scrap_qty <= 0:
+        # محطة 29: هالك بكمية صفر/سالبة كان بيمر من غير فحص — كمية سالبة
+        # كانت بتـ"زوّد" stock_qty (max(0, stock_qty - qty سالبة) = زيادة)
+        # وتنقص wo.actual_cost بدل ما تزوّده، عكس معنى "هالك" تمامًا.
+        return {"error": "كمية الهالك يجب أن تكون أكبر من صفر"}
 
     wo = None
     if work_order_id:
@@ -1243,6 +1253,18 @@ async def complete_work_order(db: AsyncSession, work_order_id: int) -> dict:
     wo  = await db.get(WorkOrder, work_order_id)
     if not wo:
         return {"error": "أمر الإنتاج غير موجود"}
+
+    # محطة 29 (تصليح جذري): لم يكن هناك أي حماية ضد استدعاء الدالة دي
+    # مرتين على نفس أمر الإنتاج (نقرة مزدوجة من الواجهة، إعادة محاولة بعد
+    # timeout، أو استدعاء يدوي متكرر لـ /production/complete). الاستدعاء
+    # الثاني كان بيضيف تكلفة العمالة تاني فوق اللي اتضافت خلاص (مضاعفة
+    # wo.actual_cost)، والأخطر إن _release_wip_and_receive_fg بتستخدم
+    # post_receipt (إضافة رصيد) من غير أي فحص — فبيستقبل كمية FG-{code}
+    # جديدة (= wo.quantity تاني) فوق اللي موجودة بالفعل، يعني مخزون تام
+    # صنع وهمي يتضاعف بلا أي إنتاج فعلي إضافي. وده تحديدًا المخزون اللي
+    # sales.py بيعتمد عليه بالكامل لفوترة أمر الإنتاج وحساب COGS.
+    if wo.status == "done":
+        return {"error": f"أمر الإنتاج {wo.code} مكتمل بالفعل — لا يمكن إنهاؤه مرة أخرى"}
 
     eq = await db.get(Equipment, wo.equipment_id) if wo.equipment_id else None
 

@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 from app.core.database import get_db
 from app.api.auth import require_any
@@ -61,6 +61,22 @@ class CostLineCreate(BaseModel):
     qty: Decimal = Decimal("1")
     unit_cost: Decimal
     material_id: Optional[int] = None
+
+    @validator("qty")
+    def _positive_qty(cls, v):
+        if v <= 0:
+            raise ValueError("qty يجب أن يكون أكبر من صفر")
+        return v
+
+    @validator("unit_cost")
+    def _positive_unit_cost(cls, v):
+        # حماية: unit_cost <= 0 كان يعدي من غير أي تحقق — بند تكلفة بمبلغ صفري/سالب
+        # كان يقلل wo.actual_cost بصمت (أو يضيف صفراً) من غير أي قيد محاسبي مقابل
+        # (journal_cost_line بيتخطى القيود اللي amount <= 0)، فيختلف actual_cost عن
+        # ما هو مرحّل فعلياً في دليل الحسابات.
+        if v <= 0:
+            raise ValueError("unit_cost يجب أن يكون أكبر من صفر")
+        return v
 
 
 async def _next_wo_code(db: AsyncSession) -> str:
@@ -381,6 +397,16 @@ async def delete_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
     )
     wo = await db.get(WorkOrder, wo_id)
     if not wo: raise HTTPException(404)
+
+    # إصلاح ثغرة تكامل: حذف أمر إنتاج كان يحذف بنود التكلفة (CostLine) وغيرها
+    # مباشرة من غير ما يعكس أي قيد محاسبي (AccountingEntry) مرتبط بيها — فيفضل
+    # قيد بند تكلفة/صرف مواد/عمالة/إغلاق/هالك "يتيم" في دليل الحسابات للأبد
+    # يشير لأمر إنتاج مش موجود، ويوّرط ميزان المراجعة وقوائم الدخل في أرقام
+    # لا تعكس حالة النظام الفعلية بعد الحذف.
+    from app.services.auto_journal import journal_reverse_all_for_wo
+    from app.core.database import current_tenant_id as _ctid_delwo
+    _tid_delwo = _ctid_delwo.get() or 1
+    await journal_reverse_all_for_wo(db, _tid_delwo, wo_id, "حذف أمر الإنتاج بالكامل")
 
     # سجلات لا يجوز أن يبقى عمود work_order_id فيها NULL — تُحذف مع الأمر
     for model in (CostLine, JournalEntry, MaterialReservation, WorkOrderBOMLine,

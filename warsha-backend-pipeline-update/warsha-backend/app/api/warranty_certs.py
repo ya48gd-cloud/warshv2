@@ -138,6 +138,14 @@ async def get_cert(wr_id: int, db: AsyncSession = Depends(get_db)):
 async def create_cert(data: WRIn, db: AsyncSession = Depends(get_db)):
     if data.warranty_months is not None and data.warranty_months < 0:
         raise HTTPException(400, "مدة الضمان لا يمكن أن تكون سالبة")
+    # إصلاح ثغرة تحقق: مرجع عميل/فاتورة/شهادة إتمام غير موجودة (أو تابعة
+    # لـ tenant تاني) كان يُقبل بصمت.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    if data.invoice_id is not None and not await db.get(Invoice, data.invoice_id):
+        raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
+    if data.wcc_id is not None and not await db.get(WorkCompletionCert, data.wcc_id):
+        raise HTTPException(404, "شهادة الإتمام المرجعية غير موجودة")
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
     code = await _next_code(db)

@@ -426,8 +426,15 @@ async def create_purchase_invoice(data: PurchaseInvoiceIn, db: AsyncSession = De
     from app.services.inventory_ledger import is_import_supplier, get_or_create_warehouse_bin, post_receipt
     supplier_for_loc = await db.get(Supplier, data.supplier_id)
     # تحقق إن المورد فعلاً تابع لنفس الـ tenant — منع إسناد فاتورة لمورد تابع
-    # لـ tenant تاني عن طريق تمرير supplier_id تخميني (تسريب/عبث بين المستأجرين)
-    if supplier_for_loc and supplier_for_loc.tenant_id != _tid_pi:
+    # لـ tenant تاني عن طريق تمرير supplier_id تخميني (تسريب/عبث بين المستأجرين).
+    # ملحوظة: الفلتر التلقائي على مستوى الـORM (tenant_events._apply_tenant_filter)
+    # بيخلي db.get يرجع None مباشرة لمورد تابع لـ tenant تاني — فالشرط القديم
+    # "supplier_for_loc and supplier_for_loc.tenant_id != _tid_pi" كان كوداً
+    # ميت فعلياً (supplier_for_loc بيبقى None أصلاً في الحالة دي، فالشرط
+    # مايتحققش أبداً)، وده كان بيسيب الفاتورة تتنشئ بنجاح بـ supplier_id
+    # يتيم (تابع لـ tenant تاني) من غير أي رسالة خطأ ومن غير تحديث رصيد أي
+    # مورد حقيقي. الإصلاح: نتحقق من عدم وجود المورد أصلاً بدل مقارنة tenant_id.
+    if not supplier_for_loc:
         raise HTTPException(400, "المورد غير موجود")
     wh_code = "IMPORTED" if is_import_supplier(supplier_for_loc) else "RAW"
 
@@ -471,6 +478,14 @@ async def create_purchase_invoice(data: PurchaseInvoiceIn, db: AsyncSession = De
 
         if line_data.update_stock and line_data.material_id:
             mat = await db.get(Material, line_data.material_id)
+            # الفلتر التلقائي على مستوى الـORM (tenant_events._apply_tenant_filter)
+            # بيخلي db.get يرجع None لأي مادة تابعة لـ tenant تاني — فمنعاً لتسريب
+            # مخزون/سعر مادة تانية كان أصلاً متغطّى. لكن قبل الإصلاح ده، تمرير
+            # material_id تخميني (مش موجود لنفس الـ tenant) كان بيسيب سكوت تام:
+            # يتسجل بند الفاتورة بمرجع مادة "يتيم" من غير أي تحديث مخزون/سعر
+            # ومن غير أي رسالة خطأ للمستخدم رغم إنه طلب update_stock=True صراحة.
+            if not mat:
+                raise HTTPException(400, "المادة غير موجودة")
             if mat:
                 bin_loc = await get_or_create_warehouse_bin(db, _tid_pi, wh_code)
                 await post_receipt(
@@ -636,7 +651,10 @@ async def update_purchase_invoice(iid: int, data: PurchaseInvoiceIn, db: AsyncSe
 
     # الموقع الجديد بيتحدد حسب المورد الجديد على الفاتورة (ممكن يكون اتغيّر)
     new_supplier = await db.get(Supplier, data.supplier_id) if data.supplier_id else None
-    if new_supplier and new_supplier.tenant_id != _tid_upd:
+    # نفس ملاحظة create_purchase_invoice: db.get بيرجع None تلقائياً لمورد
+    # تابع لـ tenant تاني، فالتحقق لازم يبقى "مطلوب ومش موجود" مش "موجود
+    # وبتنانت مختلف" (اللي كان كوداً ميتاً بيسيب الفاتورة تتحدّث بمورد يتيم).
+    if data.supplier_id and not new_supplier:
         raise HTTPException(400, "المورد غير موجود")
     new_wh_code = "IMPORTED" if is_import_supplier(new_supplier) else "RAW"
     new_bin = await get_or_create_warehouse_bin(db, _tid_upd, new_wh_code)
@@ -654,6 +672,8 @@ async def update_purchase_invoice(iid: int, data: PurchaseInvoiceIn, db: AsyncSe
 
         if line_data.update_stock and line_data.material_id:
             mat = await db.get(Material, line_data.material_id)
+            if not mat:
+                raise HTTPException(400, "المادة غير موجودة")
             if mat:
                 await post_receipt(
                     db, material=mat, qty=Decimal(str(line_data.qty)),
@@ -705,6 +725,13 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
         inv = (await db.execute(await _tenant_invoice_query(data.invoice_id))).scalar_one_or_none()
         if not inv:
             raise HTTPException(404, "فاتورة الشراء غير موجودة")
+        # تحقق إن الفاتورة فعلاً تابعة لنفس المورد المحدد — من غيره كان ممكن
+        # نمرر supplier_id لمورد وinvoice_id لفاتورة مورد تاني (نفس الـ tenant)،
+        # فتتسدد الفاتورة (paid_amount/status) وتتخصم القيمة من رصيد مورد مالوش
+        # أي علاقة بالفاتورة دي، ويفضل رصيد المورد الحقيقي صاحب الفاتورة زي
+        # ما هو — خلط فعلي بين حسابات موردين مختلفين.
+        if inv.supplier_id != sup.id:
+            raise HTTPException(400, "الفاتورة لا تخص هذا المورد")
         remaining = inv.total - inv.paid_amount
         invoice_amount = min(amount, remaining) if remaining > 0 else Decimal("0")
         excess = amount - invoice_amount
@@ -713,6 +740,18 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
             inv.status = "paid"
         elif inv.paid_amount > 0:
             inv.status = "partial"
+
+    # تحقق إن ضريبة الخصم لا تتجاوز الجزء اللي فعلاً هتتخصم منه محاسبياً.
+    # الفحص الأول فوق كان بيقارن wht_amt بإجمالي amount بس — لكن لو جزء من
+    # الدفعة راح على الفاتورة (invoice_amount) والباقي "تحت الحساب" (excess)،
+    # القيد المحاسبي (journal_purchase_invoice_payment) بيحمّل wht_amt كامل
+    # على invoice_amount لوحده. لو wht_amt > invoice_amount، سطر الصندوق
+    # (1110) بيتحسب بقيمة سالبة (amount - wht_amount)، يعني قيد معكوس فعلياً
+    # (الصندوق "يزيد" بدل ما "يقل") رغم إن مجموع القيد لسه متوازن ظاهرياً —
+    # فساد محاسبي حقيقي كان بيمر من غير أي تحقق.
+    bucket = invoice_amount if invoice_amount > 0 else excess
+    if wht_amt > bucket:
+        raise HTTPException(400, "ضريبة الخصم تحت الحساب أكبر من المبلغ المطبَّق على الفاتورة/تحت الحساب")
 
     sup.balance -= amount
 
@@ -861,8 +900,16 @@ async def delete_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     )
     inv = res.scalar_one_or_none()
     if not inv: raise HTTPException(404)
-    if inv.status == "paid":
-        raise HTTPException(400, "لا يمكن حذف فاتورة مدفوعة بالكامل")
+    # كان الشرط بيمنع حذف الفاتورة المدفوعة بالكامل فقط ("paid") ويسمح بحذف
+    # فاتورة "partial" (مدفوعة جزئياً) بحرية. المشكلة: عكس القيد المحاسبي
+    # تحت بيعكس دائماً كامل قيمة الفاتورة (total) من حساب الموردين (2110)،
+    # بينما سداد الدفعة الجزئية كان بالفعل عكس جزء منها فعلياً (2110 مدين
+    # بقيمة المبلغ المسدد) — فالعكس المزدوج ده بيسيب حساب الموردين (2110)
+    # بفارق سالب يساوي المبلغ المسدد فعلاً (خطأ محاسبي حقيقي وقائم، مش مجرد
+    # عرض). نفس منطق update_purchase_invoice بالظبط (بيمنع التعديل لو
+    # paid_amount > 0)، فالحذف لازم يتبع نفس القاعدة.
+    if inv.paid_amount > 0:
+        raise HTTPException(400, "لا يمكن حذف فاتورة تم تسجيل دفعات عليها")
 
     from app.core.database import current_tenant_id as _ctid_del
     _tid_del = _ctid_del.get() or 1
@@ -900,6 +947,23 @@ async def delete_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
             sup.balance -= unpaid
     # قيد عكسي في دفتر الأستاذ
     await journal_purchase_invoice_delete(db, _tid_del, inv.id, inv.code, inv.tax_amount, inv.total, inv.date)
+
+    # حذف مرفقات الفاتورة (ملفات + سجلات) — كان الحذف السابق بيمسح الفاتورة
+    # وبنودها بس، ويسيب سجلات FileAttachment يتيمة تشاور على invoice_id بقى
+    # مش موجود، والملفات الفعلية على القرص من غير أي مرجع ليها تاني (تسريب
+    # مساحة تخزين + بيانات معلّقة للأبد).
+    atts_res = await db.execute(
+        select(FileAttachment).where(
+            FileAttachment.entity_type == "purchase_invoice",
+            FileAttachment.entity_id == iid,
+        )
+    )
+    for att in atts_res.scalars().all():
+        att_path = UPLOAD_DIR / att.stored_name
+        if att_path.exists():
+            att_path.unlink()
+        await db.delete(att)
+
     await db.delete(inv)
     await db.commit()
     return {"message": "تم الحذف", "id": iid}

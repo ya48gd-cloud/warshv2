@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, require_admin_production
 from app.models.models import WorkOrderStage, WorkOrder, Worker
 
 router = APIRouter(prefix="/production/stages", tags=["work_order_stages"], dependencies=[Depends(require_any)])
@@ -42,6 +42,38 @@ class StageUpdateIn(BaseModel):
     planned_hours: Optional[Decimal] = None
     actual_hours: Optional[Decimal] = None
     notes: Optional[str] = None
+
+
+async def _maybe_finalize_work_order(db: AsyncSession, work_order_id: int) -> None:
+    """
+    محطة 29 (تصليح جذري): لو كل مراحل أمر الإنتاج بقت "منتهية" أو "متخطاة"،
+    كان الكود القديم بيكتفي بتغيير wo.status = "done" هنا مباشرة — من غير
+    ما يمر على complete_work_order() (services/production.py). النتيجة:
+    أمر إنتاج بيوصل لحالة "done" (تظهر كده في كل الشاشات) لكن من غير أي
+    ترحيل حقيقي WIP→FG (مادة FG-{wo.code})، من غير إغلاق الحجوزات
+    المفتوحة، من غير إضافة تكلفة العمالة الفعلية، ومن غير قيد محاسبي.
+
+    وده بقى فجوة حرجة تحديدًا دلوقتي: فوترة أمر الإنتاج مباشرة
+    (sales.py work_order_to_invoice) بقت تعتمد كليًا على وجود FG-{code}
+    برصيد كافٍ — أمر إنتاج خلّص عن طريق المراحل (مش زرار "إنهاء" اليدوي)
+    كان هيفضل عالق: "done" في الاسم بس مستحيل تتفوتر عليه أبدًا.
+
+    الحل: أي مسار بيوصّل كل المراحل لحالة نهائية (إنهاء/تخطي/تعديل مباشر
+    عبر PUT) بيستدعي نفس complete_work_order() اللي بيستخدمها زرار
+    "إنهاء أمر الإنتاج" اليدوي بالظبط — نفس الأثر الكامل مهما كان طريق
+    الوصول لحالة "كل المراحل خلصت".
+    """
+    wo = await db.get(WorkOrder, work_order_id)
+    if not wo or wo.status == "done":
+        return
+    all_stages = (await db.execute(
+        select(WorkOrderStage).where(WorkOrderStage.work_order_id == work_order_id)
+    )).scalars().all()
+    if not all_stages:
+        return
+    if all(st.status in ("done", "skipped") for st in all_stages):
+        from app.services.production import complete_work_order
+        await complete_work_order(db, work_order_id)
 
 
 def stage_dict(s: WorkOrderStage) -> dict:
@@ -94,7 +126,7 @@ async def list_stages(work_order_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.post("/{work_order_id}/seed")
+@router.post("/{work_order_id}/seed", dependencies=[Depends(require_admin_production)])
 async def seed_default_stages(work_order_id: int, db: AsyncSession = Depends(get_db)):
     """إنشاء المراحل الافتراضية لأمر الإنتاج"""
     from app.core.database import current_tenant_id
@@ -121,7 +153,7 @@ async def seed_default_stages(work_order_id: int, db: AsyncSession = Depends(get
     return {"work_order_id": work_order_id, "stages_created": len(DEFAULT_STAGES)}
 
 
-@router.post("/{work_order_id}", status_code=201)
+@router.post("/{work_order_id}", status_code=201, dependencies=[Depends(require_admin_production)])
 async def create_stage(work_order_id: int, data: StageIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
@@ -142,7 +174,7 @@ async def create_stage(work_order_id: int, data: StageIn, db: AsyncSession = Dep
     return stage_dict(res.scalar_one())
 
 
-@router.patch("/{stage_id}/start")
+@router.patch("/{stage_id}/start", dependencies=[Depends(require_admin_production)])
 async def start_stage(stage_id: int, db: AsyncSession = Depends(get_db)):
     s = await db.get(WorkOrderStage, stage_id)
     if not s:
@@ -172,7 +204,7 @@ async def start_stage(stage_id: int, db: AsyncSession = Depends(get_db)):
     return {"id": stage_id, "status": "in_progress", "started_at": s.started_at.isoformat()}
 
 
-@router.patch("/{stage_id}/complete")
+@router.patch("/{stage_id}/complete", dependencies=[Depends(require_admin_production)])
 async def complete_stage(stage_id: int, actual_hours: Optional[float] = None, db: AsyncSession = Depends(get_db)):
     s = await db.get(WorkOrderStage, stage_id)
     if not s:
@@ -187,22 +219,15 @@ async def complete_stage(stage_id: int, actual_hours: Optional[float] = None, db
         hrs = (datetime.utcnow() - s.started_at).total_seconds() / 3600
         s.actual_hours = Decimal(str(round(hrs, 2)))
 
-    # هل كل المراحل انتهت؟ → أمر العمل done
-    wo = await db.get(WorkOrder, s.work_order_id)
-    if wo:
-        all_stages = (await db.execute(
-            select(WorkOrderStage).where(WorkOrderStage.work_order_id == s.work_order_id)
-        )).scalars().all()
-        # عد المراحل التي لم تنته بعد (غير المرحلة الحالية)
-        pending = [st for st in all_stages if st.id != stage_id and st.status not in ("done", "skipped")]
-        if not pending:
-            wo.status = "done"
+    # هل كل المراحل انتهت (منتهية أو متخطاة)؟ → إنهاء أمر الإنتاج بالكامل
+    # (نفس مسار /production/complete تمامًا — راجع _maybe_finalize_work_order أعلاه)
+    await _maybe_finalize_work_order(db, s.work_order_id)
 
     await db.commit()
     return {"id": stage_id, "status": "done", "actual_hours": float(s.actual_hours or 0)}
 
 
-@router.patch("/{stage_id}/skip")
+@router.patch("/{stage_id}/skip", dependencies=[Depends(require_admin_production)])
 async def skip_stage(stage_id: int, reason: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     s = await db.get(WorkOrderStage, stage_id)
     if not s:
@@ -210,17 +235,30 @@ async def skip_stage(stage_id: int, reason: Optional[str] = None, db: AsyncSessi
     s.status = "skipped"
     if reason:
         s.notes = reason
+
+    # محطة 29: تخطّي آخر مرحلة متبقية لازم يُنهي أمر الإنتاج بالكامل بالظبط
+    # زي إنهاء آخر مرحلة — قبل كده كان تخطّي المرحلة الأخيرة بيسيب أمر
+    # الإنتاج عالق في "in_progress" للأبد رغم إن كل المراحل خلصت/اتخطت.
+    await _maybe_finalize_work_order(db, s.work_order_id)
+
     await db.commit()
     return {"id": stage_id, "status": "skipped"}
 
 
-@router.put("/{stage_id}")
+@router.put("/{stage_id}", dependencies=[Depends(require_admin_production)])
 async def update_stage(stage_id: int, data: StageUpdateIn, db: AsyncSession = Depends(get_db)):
     s = await db.get(WorkOrderStage, stage_id)
     if not s:
         raise HTTPException(404)
     for k, v in data.model_dump(exclude_none=True).items():
         setattr(s, k, v)
+
+    # محطة 29: PUT العام ده بيسمح بتغيير status مباشرة (بلا أي من فحوصات
+    # /start أو /complete أو /skip) — لو التعديل خلّى كل المراحل منتهية/
+    # متخطاة، لازم برضه يُنهي أمر الإنتاج بالكامل (مش يسيبه معلّق).
+    if data.status is not None:
+        await _maybe_finalize_work_order(db, s.work_order_id)
+
     await db.commit()
     res = await db.execute(
         select(WorkOrderStage).options(selectinload(WorkOrderStage.assigned_worker))
@@ -229,7 +267,7 @@ async def update_stage(stage_id: int, data: StageUpdateIn, db: AsyncSession = De
     return stage_dict(res.scalar_one())
 
 
-@router.delete("/{stage_id}")
+@router.delete("/{stage_id}", dependencies=[Depends(require_admin_production)])
 async def delete_stage(stage_id: int, db: AsyncSession = Depends(get_db)):
     s = await db.get(WorkOrderStage, stage_id)
     if not s:

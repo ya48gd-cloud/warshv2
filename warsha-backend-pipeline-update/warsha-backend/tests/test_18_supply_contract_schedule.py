@@ -353,3 +353,54 @@ async def test_deliver_rounding_correction(cli):
     assert abs(schedule_total - inv_total) < 0.02, (
         f"مجموع {schedule_total} ≠ إجمالي {inv_total}"
     )
+
+
+# ── ROUND-2 GAP REGRESSION TESTS ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_create_contract_rejects_material_of_another_tenant(cli, cli2):
+    """عقد التوريد كان بيقبل material_id تخميني تابع لـtenant تاني من غير
+    أي تحقق — عند تأكيد التسليم كان بيتصرف من مخزون مادة مش بتاعت الـtenant
+    الحالي فعلياً (confirm_delivery → post_issue)."""
+    r2 = await cli2.post(f"{BASE_INV}/materials", json={
+        "name_ar": "مادة تينانت 2 - عقد", "unit": "كجم", "unit_cost": 5.0,
+    })
+    assert r2.status_code == 201, r2.text
+    other_tenant_mid = r2.json()["id"]
+
+    cid = await _make_customer(cli)
+    payload = {
+        "customer_id": cid,
+        "date": str(date.today()),
+        "lines": [{
+            "description": "بند مشبوه",
+            "qty": "5", "unit": "كجم", "unit_price": "100",
+            "material_id": other_tenant_mid,
+        }],
+    }
+    r = await cli.post(BASE_SC, json=payload)
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.asyncio
+async def test_delete_contract_cleans_up_attachments(cli):
+    """حذف عقد توريد (draft) كان بيسيب مرفقات (لو اتضافت عبر endpoint
+    المرفقات العام /purchases/attach) يتيمة — سجل وملف على القرص بلا مرجع."""
+    cid = await _make_customer(cli)
+    mid = await _make_material(cli)
+    c = await _create_contract(cli, cid, mid)
+    contract_id = c["id"]
+
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    up = await cli.post(
+        f"/api/v1/purchases/attach?entity_type=supply_contract&entity_id={contract_id}",
+        files={"file": ("contract.png", png_bytes, "image/png")},
+    )
+    assert up.status_code == 200, up.text
+    att_id = up.json()["id"]
+
+    r = await cli.delete(f"{BASE_SC}/{contract_id}")
+    assert r.status_code in (200, 204)
+
+    dl = await cli.get(f"/api/v1/purchases/attachments/{att_id}/download")
+    assert dl.status_code == 404

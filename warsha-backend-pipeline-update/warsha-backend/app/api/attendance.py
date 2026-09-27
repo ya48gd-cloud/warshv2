@@ -56,6 +56,9 @@ async def record_attendance(data: AttendanceIn, db: AsyncSession = Depends(get_d
 
     from app.core.database import current_tenant_id as _ctid_att
     tid = _ctid_att.get() or 1
+    worker = await db.get(Worker, data.worker_id)
+    if not worker or worker.tenant_id != tid:
+        raise HTTPException(404, "العامل غير موجود")
     existing = (await db.execute(
         select(Attendance).where(
             Attendance.worker_id == data.worker_id,
@@ -128,8 +131,14 @@ async def bulk_attendance(data: BulkAttendanceIn, db: AsyncSession = Depends(get
     from app.core.database import current_tenant_id as _ctid_battat
     tid = _ctid_battat.get() or 1
 
+    tenant_worker_ids = set((await db.execute(
+        select(Worker.id).where(Worker.tenant_id == tid)
+    )).scalars().all())
+
     results = []
     for rec in data.records:
+        if rec.get("worker_id") not in tenant_worker_ids:
+            raise HTTPException(404, f"العامل {rec.get('worker_id')} غير موجود")
         overtime = Decimal(str(rec.get("overtime_hours") or 0))
         if overtime < 0:
             raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تكون سالبة")

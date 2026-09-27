@@ -4,6 +4,7 @@ WorkOrder · حجز مواد · صرف · خردة · إتمام · جرد ال�
 """
 import pytest
 from datetime import date
+from app.api.auth import create_token
 
 PROD = "/api/v1/production"
 ACC = "/api/v1/accounting"
@@ -525,3 +526,293 @@ async def test_smart_alerts_respects_tenant_isolation(cli, cli2):
     assert alerts2.status_code == 200
     wo_link = f"/workorders/{wo_id}"
     assert all(a.get("link") != wo_link for a in alerts2.json())
+
+
+# ════════════════ محطة 29: كل الطرق لـ"done" لازم تنتج FG صحيح ═══════════
+
+async def _make_work_order_qty(cli, eq_id, qty):
+    r = await cli.post(f"{ACC}/work-orders", json={
+        "equipment_id": eq_id, "planned_cost": 1000.0,
+        "start_date": str(date.today()), "quantity": qty,
+    })
+    assert r.status_code in (200, 201), r.text
+    return r.json()
+
+
+async def _run_all_stages_to_done(cli, wo_id):
+    """يعمل seed لمراحل الأمر الافتراضية، ثم start+complete لكل مرحلة بالترتيب."""
+    seed = await cli.post(f"{PROD}/stages/{wo_id}/seed")
+    assert seed.status_code in (200, 201), seed.text
+    stages = (await cli.get(f"{PROD}/stages/{wo_id}")).json()["stages"]
+    stages.sort(key=lambda s: s["stage_order"])
+    return stages
+
+
+@pytest.mark.asyncio
+async def test_stage_driven_completion_creates_fg_stock_like_manual_complete(cli):
+    """
+    قبل التصليح: إنهاء آخر مرحلة من مراحل أمر الإنتاج (work_order_stages.py
+    complete_stage) كان بيكتفي بتغيير wo.status = "done" مباشرة من غير ما
+    يمر على complete_work_order() (services/production.py) — يعني معندوش
+    أي رصيد FG-{code} حقيقي، ولا إغلاق حجوزات، ولا تكلفة عمالة، رغم إن
+    الحالة بتظهر "done" في كل الشاشات. فوترة sales.py المباشرة لأمر
+    الإنتاج (اللي بتعتمد كليًا على وجود FG-{code} بكمية كافية) كانت هترفض
+    للأبد لأمر خلّص عن طريق المراحل مش زرار "إنهاء" اليدوي.
+    """
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo = await _make_work_order_qty(cli, eq_id, qty=2)
+    wo_id, wo_code = wo["id"], wo["code"]
+
+    await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 10, "stage": "تجميع",
+    })
+
+    stages = await _run_all_stages_to_done(cli, wo_id)
+    for st in stages:
+        r = await cli.patch(f"{PROD}/stages/{st['id']}/start")
+        assert r.status_code == 200, r.text
+        r = await cli.patch(f"{PROD}/stages/{st['id']}/complete")
+        assert r.status_code == 200, r.text
+
+    wo_after = await cli.get(f"{ACC}/work-orders/{wo_id}")
+    assert wo_after.status_code == 200
+    assert wo_after.json()["status"] == "done"
+
+    mats = (await cli.get(f"{INV}/materials")).json()
+    fg = next((m for m in mats if m["code"] == f"FG-{wo_code}"), None)
+    assert fg is not None, "لازم تتنشئ مادة FG حتى لو الإنهاء جه من مراحل الإنتاج مش الزرار اليدوي"
+    assert float(fg["stock_qty"]) == 2.0
+    assert float(fg["unit_cost"]) > 0
+
+    # الحجوزات المفتوحة (لو أي) لازم تتقفل زي ما بيحصل في الإنهاء اليدوي
+    reservations = (await cli.get(f"{PROD}/{wo_id}/reservations")).json()
+    assert all(r["status"] == "closed" for r in reservations)
+
+
+@pytest.mark.asyncio
+async def test_skipping_last_stage_completes_work_order_too(cli):
+    """
+    نفس الفجوة لكن عبر مسار /skip: تخطّي آخر مرحلة متبقية (بدل إنهائها)
+    لازم يُنهي أمر الإنتاج بالكامل برضه — قبل التصليح، skip_stage ماكانش
+    بيعمل أي فحص لحالة باقي المراحل خالص، فأمر الإنتاج كان يفضل عالق في
+    "in_progress" للأبد حتى لو كل مراحله خلصت/اتخطت.
+    """
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo = await _make_work_order_qty(cli, eq_id, qty=1)
+    wo_id, wo_code = wo["id"], wo["code"]
+
+    await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 5, "stage": "قطع",
+    })
+
+    stages = await _run_all_stages_to_done(cli, wo_id)
+    *earlier, last = stages
+    for st in earlier:
+        await cli.patch(f"{PROD}/stages/{st['id']}/start")
+        r = await cli.patch(f"{PROD}/stages/{st['id']}/complete")
+        assert r.status_code == 200, r.text
+
+    await cli.patch(f"{PROD}/stages/{last['id']}/start")
+    r = await cli.patch(f"{PROD}/stages/{last['id']}/skip")
+    assert r.status_code == 200, r.text
+
+    wo_after = await cli.get(f"{ACC}/work-orders/{wo_id}")
+    assert wo_after.json()["status"] == "done"
+
+    mats = (await cli.get(f"{INV}/materials")).json()
+    fg = next((m for m in mats if m["code"] == f"FG-{wo_code}"), None)
+    assert fg is not None
+    assert float(fg["stock_qty"]) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_double_complete_does_not_duplicate_fg_stock(cli):
+    """
+    قبل التصليح: complete_work_order() معندهاش أي حماية ضد الاستدعاء
+    مرتين (نقرة مزدوجة، retry بعد timeout). الاستدعاء الثاني كان
+    بيستقبل FG-{code} تاني (post_receipt بيضيف رصيد من غير فحص) فوق
+    اللي موجود بالفعل — مخزون تام صنع وهمي يتضاعف بلا أي إنتاج فعلي.
+    """
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo = await _make_work_order_qty(cli, eq_id, qty=3)
+    wo_id, wo_code = wo["id"], wo["code"]
+
+    await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 10, "stage": "تجميع",
+    })
+
+    r1 = await cli.post(f"{PROD}/complete/{wo_id}")
+    assert r1.status_code in (200, 201), r1.text
+
+    mats = (await cli.get(f"{INV}/materials")).json()
+    fg = next(m for m in mats if m["code"] == f"FG-{wo_code}")
+    assert float(fg["stock_qty"]) == 3.0
+
+    r2 = await cli.post(f"{PROD}/complete/{wo_id}")
+    assert r2.status_code == 400, r2.text
+
+    mats_after = (await cli.get(f"{INV}/materials")).json()
+    fg_after = next(m for m in mats_after if m["code"] == f"FG-{wo_code}")
+    assert float(fg_after["stock_qty"]) == 3.0, "لازم يفضل رصيد FG زي ما هو — مش يتضاعف باستدعاء ثاني"
+
+
+@pytest.mark.asyncio
+async def test_issue_material_rejects_zero_and_negative_qty(cli):
+    """
+    قبل التصليح: صرف كمية سالبة كان بيمر من غير أي فحص — بيزوّد
+    stock_qty فعليًا (بدل ما يخصم منه) وينقص wo.actual_cost (تكلفة سالبة)،
+    عكس معنى "صرف مواد" تمامًا.
+    """
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo_id = await _make_work_order(cli, eq_id)
+
+    r = await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": -5, "stage": "تجميع",
+    })
+    assert r.status_code == 400, r.text
+
+    r2 = await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 0, "stage": "تجميع",
+    })
+    assert r2.status_code == 400, r2.text
+
+    mat = await cli.get(f"{INV}/materials/{mid}")
+    assert float(mat.json()["stock_qty"]) == 100.0  # لم يتأثر خالص
+
+
+@pytest.mark.asyncio
+async def test_record_scrap_rejects_zero_and_negative_qty(cli):
+    """
+    قبل التصليح: هالك بكمية سالبة كان بيمر من غير فحص —
+    max(0, stock_qty - (سالبة)) بيزوّد stock_qty بدل ما يخصمه، عكس معنى
+    "هالك" تمامًا.
+    """
+    mid = await _make_material(cli, qty=50)
+
+    r = await cli.post(f"{PROD}/scrap", json={"material_id": mid, "qty": -3, "reason": "تلف"})
+    assert r.status_code == 400, r.text
+
+    r2 = await cli.post(f"{PROD}/scrap", json={"material_id": mid, "qty": 0, "reason": "تلف"})
+    assert r2.status_code == 400, r2.text
+
+    mat = await cli.get(f"{INV}/materials/{mid}")
+    assert float(mat.json()["stock_qty"]) == 50.0  # لم يتأثر خالص
+
+
+@pytest.mark.asyncio
+async def test_team_hours_cannot_be_edited_after_work_order_done(cli):
+    """
+    بعد إنهاء أمر الإنتاج، actual_cost وFG.unit_cost مقفولين على القيمة
+    المحسوبة وقت الإنهاء (تكلفة العمالة اتضافت مرة واحدة وللأبد). تعديل
+    ساعات فريق العمل بعد كده كان بيوهم الواجهة بتحديث تكلفة من غير أي أثر
+    حقيقي — دلوقتي لازم يترفض بوضوح.
+    """
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo_id = await _make_work_order(cli, eq_id)
+
+    worker = await cli.post("/api/v1/workers", json={"name": "فني 1", "daily_wage": 100})
+    assert worker.status_code in (200, 201), worker.text
+    wid = worker.json()["id"]
+
+    add = await cli.post(f"{PROD}/work-orders/{wo_id}/team", json={
+        "worker_id": wid, "hourly_rate": 10, "planned_hours": 5,
+    })
+    assert add.status_code == 201, add.text
+    mid_member = add.json()["id"]
+
+    await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 5, "stage": "تجميع",
+    })
+    r = await cli.post(f"{PROD}/complete/{wo_id}")
+    assert r.status_code in (200, 201), r.text
+
+    r2 = await cli.patch(
+        f"{PROD}/work-orders/{wo_id}/team/{mid_member}/hours",
+        params={"actual_hours": 8},
+    )
+    assert r2.status_code == 400, r2.text
+
+    r3 = await cli.post(f"{PROD}/work-orders/{wo_id}/team", json={
+        "worker_id": wid, "hourly_rate": 20, "planned_hours": 5,
+    })
+    assert r3.status_code == 400, r3.text
+
+
+# ════════════════ محطة 30: viewer ممنوع من الكتابة في وحدة الإنتاج ══════
+
+@pytest.mark.asyncio
+async def test_viewer_role_forbidden_from_production_write_endpoints(client):
+    """
+    قبل التصليح: production.py وproduction_v2.py وwork_order_stages.py
+    وcad.py كانت كلها معتمدة على require_any فقط على مستوى الراوتر —
+    وrequire_any بيسمح صراحة بدور "viewer" (راجع تعريفه في auth.py). لكن
+    users.py بيوثّق ROLE_WRITE["viewer"] == [] أي إن viewer مفروض يكون
+    قراءة فقط في كل النظام. بما إن مفيش أي endpoint هنا كان بيستخدم
+    require_admin_production (المعرّفة أصلاً في auth.py بالظبط لكده)، كان
+    "viewer" يقدر فعليًا يصرف مواد، يسجّل هالك، ينهي أوامر إنتاج، يرفع/
+    يحذف ملفات CAD... كل حاجة، رغم توثيقه كقراءة فقط. القراءة (GET) لازم
+    تفضل مسموحة لـviewer، لكن أي endpoint كتابة (POST/PUT/PATCH/DELETE)
+    لازم يترفض بـ403.
+    """
+    viewer_token = create_token(user_id=999, username="viewer1", role="viewer", tenant_id=1)
+    viewer_headers = {"Authorization": f"Bearer {viewer_token}"}
+
+    # القراءة لسه لازم تفضل مسموحة لـviewer في كل الملفات
+    for read_url in (
+        f"{PROD}/alerts",
+        f"{PROD}/pipeline",
+        f"{PROD}/stages/dashboard/overview",
+        "/api/v1/production/v2/schedules",
+        "/api/v1/production/v2/quality",
+    ):
+        r = await client.get(read_url, headers=viewer_headers)
+        assert r.status_code == 200, f"{read_url} -> {r.status_code}: {r.text}"
+
+    # الكتابة لازم تترفض بـ403 (بغض النظر عن صحة البيانات — الفحص بيحصل
+    # قبل ما يوصل لمنطق الـendpoint خالص)
+    write_calls = [
+        ("POST", f"{PROD}/scrap", {"material_id": 1, "qty": 1, "reason": "x"}),
+        ("POST", f"{PROD}/issue", {"work_order_id": 1, "material_id": 1, "qty": 1, "stage": "x"}),
+        ("POST", f"{PROD}/complete/1", None),
+        ("POST", f"{PROD}/auto-reserve/1", None),
+        ("POST", f"{PROD}/reserve/1", None),
+        ("DELETE", f"{PROD}/reservations/1", None),
+        ("POST", f"{PROD}/bins", {"code": "X1"}),
+        ("POST", f"{PROD}/stock-count", None),
+        ("POST", f"{PROD}/work-orders/1/team", {"worker_id": 1, "hourly_rate": 10}),
+        ("PATCH", f"{PROD}/work-orders/1/team/1/hours", None),
+        ("DELETE", f"{PROD}/work-orders/1/team/1", None),
+        ("POST", f"{PROD}/stages/1/seed", None),
+        ("POST", f"{PROD}/stages/1", {"stage_name": "x"}),
+        ("PATCH", "/api/v1/production/stages/1/start", None),
+        ("PATCH", "/api/v1/production/stages/1/complete", None),
+        ("PATCH", "/api/v1/production/stages/1/skip", None),
+        ("PUT", "/api/v1/production/stages/1", {"notes": "x"}),
+        ("DELETE", "/api/v1/production/stages/1", None),
+        ("POST", "/api/v1/production/v2/schedules", {
+            "work_order_id": 1, "scheduled_start": str(date.today()), "scheduled_end": str(date.today()),
+        }),
+        ("PATCH", "/api/v1/production/v2/schedules/1", None),
+        ("POST", "/api/v1/production/v2/quality", {
+            "inspection_date": str(date.today()), "qty_inspected": 1, "qty_passed": 1,
+        }),
+        ("DELETE", "/api/v1/production/v2/quality/1", None),
+        ("POST", "/api/v1/production/v2/link-order", {"customer_order_id": 1, "work_order_id": 1}),
+        ("DELETE", f"{CAD}/1", None),
+    ]
+    for method, url, payload in write_calls:
+        r = await client.request(method, url, json=payload, headers=viewer_headers)
+        assert r.status_code == 403, f"{method} {url} -> {r.status_code} (expected 403): {r.text}"
+
+    # صلاحية "production" (أو admin) لازم تفضل تقدر تكتب طبيعي (لا حماية زايدة عن اللازم)
+    prod_token = create_token(user_id=998, username="prod1", role="production", tenant_id=1)
+    prod_headers = {"Authorization": f"Bearer {prod_token}"}
+    r_ok = await client.get(f"{PROD}/alerts", headers=prod_headers)
+    assert r_ok.status_code == 200
+    r_ok2 = await client.post(f"{PROD}/bins", json={"code": "PB1"}, headers=prod_headers)
+    assert r_ok2.status_code == 201, r_ok2.text

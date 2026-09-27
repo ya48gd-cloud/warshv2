@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, require_admin_production
 from app.models.models import CADFile, Equipment
 
 router = APIRouter(prefix="/cad", tags=["cad"], dependencies=[Depends(require_any)])
@@ -42,7 +42,7 @@ ALLOWED_TYPES = {
 MAX_SIZE = 50 * 1024 * 1024  # 50 MB
 
 
-@router.post("/upload/{equipment_id}")
+@router.post("/upload/{equipment_id}", dependencies=[Depends(require_admin_production)])
 async def upload_cad_file(
     equipment_id: int,
     file: UploadFile = File(...),
@@ -145,7 +145,7 @@ async def download_cad_file(file_id: int, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.delete("/{file_id}")
+@router.delete("/{file_id}", dependencies=[Depends(require_admin_production)])
 async def delete_cad_file(file_id: int, db: AsyncSession = Depends(get_db)):
     cad = await db.get(CADFile, file_id)
     if not cad:

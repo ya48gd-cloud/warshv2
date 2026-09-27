@@ -191,6 +191,13 @@ async def import_to_inventory(
     if existing.scalar_one_or_none():
         raise HTTPException(409, f"المادة {cat_item.code} موجودة بالفعل في مخزونك")
 
+    if data.unit_cost is not None and data.unit_cost < 0:
+        raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    if data.stock_qty is not None and data.stock_qty < 0:
+        raise HTTPException(400, "الكمية الافتتاحية لا يمكن أن تكون سالبة")
+    if data.reorder_level is not None and data.reorder_level < 0:
+        raise HTTPException(400, "حد إعادة الطلب لا يمكن أن يكون سالباً")
+
     cat_name = data.category_name or cat_item.category or "عام"
     cat_result = await db.execute(select(MaterialCategory).where(MaterialCategory.tenant_id == tenant_id, MaterialCategory.name_ar == cat_name))
     category = cat_result.scalar_one_or_none()
@@ -199,11 +206,17 @@ async def import_to_inventory(
         db.add(category); await db.flush()
 
     material_kind = "plate" if cat_item.is_plate else ("bar" if cat_item.weight_per_meter_kg else "general")
+    opening_qty = data.stock_qty or Decimal("0")
     material = Material(
         tenant_id=tenant_id, code=cat_item.code,
         name_ar=cat_item.name_ar, name_en=cat_item.name_en or cat_item.name_ar,
         unit=cat_item.unit, unit_cost=data.unit_cost or Decimal("0"),
-        stock_qty=data.stock_qty or Decimal("0"),
+        # محطة (round-2 gap fix): الرصيد الافتتاحي بيتسجّل عن طريق
+        # post_receipt تحت (مش هنا مباشرة) عشان يعمل StockMovement +
+        # يزامن StockQuant — قبل كده كان Material.stock_qty بيتحدد هنا
+        # مباشرة من غير أي حركة أو Quant، فيبقى فيه رصيد "شبح" (phantom)
+        # مطابقتش أبداً مع /materials/{id}/stock-check ولا traceability.
+        stock_qty=Decimal("0"),
         reorder_level=data.reorder_level or Decimal("0"),
         category_id=category.id, material_kind=material_kind,
         is_plate=cat_item.is_plate or False,
@@ -217,6 +230,16 @@ async def import_to_inventory(
         weight_per_meter_kg=cat_item.weight_per_meter_kg,
     )
     db.add(material)
+    await db.flush()  # نحتاج material.id قبل ما نسجل حركة استلام عليه
+
+    if opening_qty > 0:
+        from app.services.inventory_ledger import post_receipt
+        await post_receipt(
+            db, material=material, qty=opening_qty, unit_cost=data.unit_cost or Decimal("0"),
+            source_doc_type="catalog_import", source_doc_id=cat_item.id,
+            reference=f"استيراد من الكتالوج العام — {cat_item.code}",
+        )
+
     cat_item.usage_count = (cat_item.usage_count or 0) + 1
     await db.commit()
     await log_event(Events.CATALOG_ITEM_IMPORTED, tenant_id=tenant_id, entity_type="material",

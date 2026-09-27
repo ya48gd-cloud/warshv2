@@ -155,6 +155,14 @@ async def create_cert(data: WCCIn, db: AsyncSession = Depends(get_db)):
             raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
         if it.unit_price is not None and it.unit_price < 0:
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    # إصلاح ثغرة تحقق: مرجع عميل/فاتورة/عقد غير موجودة (أو تابعة لـ tenant
+    # تاني) كان يُقبل بصمت.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    if data.invoice_id is not None and not await db.get(Invoice, data.invoice_id):
+        raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
+    if data.contract_id is not None and not await db.get(SupplyContract, data.contract_id):
+        raise HTTPException(404, "العقد المرجعي غير موجود")
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
     code = await _next_code(db)

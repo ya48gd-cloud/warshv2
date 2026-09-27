@@ -133,3 +133,32 @@ async def test_duplicate_lot_number_still_rejected(cli):
     await cli.post(BATCH, json=_batch_payload(mid, lot="DUP-1", qty=10))
     r = await cli.post(BATCH, json=_batch_payload(mid, lot="DUP-1", qty=5))
     assert r.status_code == 400
+
+
+# ════════════ Round-2 gap/validation fixes ═══════════════════════════
+
+@pytest.mark.asyncio
+async def test_create_batch_rejects_non_positive_qty(cli):
+    """كمية استلام صفر أو سالبة كانت بتعدي — post_receipt بيرفضها لكن لازم
+    تتقفل من بوابة الـ API كمان برسالة واضحة، مش بعد ما batch اتعمل فعلاً."""
+    mid = await _make_material(cli, qty=0)
+    r = await cli.post(BATCH, json=_batch_payload(mid, qty=0))
+    assert r.status_code == 400
+
+    r2 = await cli.post(BATCH, json=_batch_payload(mid, qty=-5))
+    assert r2.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_batch_rejects_supplier_from_another_tenant(cli, cli2):
+    """مورد صحيح بس تابع لتنانت تاني كان بيتقبل من غير فحص — الدُفعة كانت
+    هتتربط بمورد مش بتاعها."""
+    sup = await cli2.post("/api/v1/purchases/suppliers", json={"name": "مورد تنانت2"})
+    assert sup.status_code == 201
+    foreign_supplier_id = sup.json()["id"]
+
+    mid = await _make_material(cli, qty=0)
+    payload = _batch_payload(mid, qty=10)
+    payload["supplier_id"] = foreign_supplier_id
+    r = await cli.post(BATCH, json=payload)
+    assert r.status_code == 400

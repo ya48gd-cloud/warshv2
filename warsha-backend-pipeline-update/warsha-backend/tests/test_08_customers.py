@@ -224,3 +224,103 @@ async def test_general_customer_payment_also_updates_installments(cli):
     rows = (await cli.get(f"{SALES_BASE}/invoices/{iid}/payment-schedule")).json()
     assert rows[0]["status"] == "paid"     # كان المفروض يفضل pending قبل الإصلاح
     assert rows[1]["status"] == "pending"
+
+
+# ════════════════ GAP-ANALYSIS ROUND 2 ═══════════════════════════════
+
+@pytest.mark.asyncio
+async def test_record_payment_rejects_zero_or_negative_amount(cli):
+    """قبل الإصلاح: مبلغ صفر أو سالب كان يتقبل بصمت ويغيّر رصيد العميل
+    من غير أي قيد محاسبي أو حركة خزنة مقابلة (سجل غير متزن)."""
+    r = await cli.post(BASE, json=_cust())
+    cid = r.json()["id"]
+    for bad_amount in (0, -50.0):
+        r2 = await cli.post(f"{BASE}/payments", json={
+            "customer_id": cid, "amount": bad_amount,
+            "payment_type": "cash", "payment_date": str(date.today()),
+        })
+        assert r2.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_order_rejects_nonexistent_customer(cli):
+    r2 = await cli.post(f"{BASE}/orders", json={
+        "customer_id": 999999,
+        "order_date": str(date.today()),
+        "status": "pending",
+        "lines": [{"description": "منتج", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
+    })
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_edit_order_reassigns_customer_balance_correctly(cli):
+    """إصلاح ثغرة تكامل: تعديل الطلب بنقله لعميل تاني كان يطبّق صافي الفرق
+    (-old_total+new_total) على العميل *القديم* فقط، والعميل الجديد ما
+    يتحمّلش قيمة الطلب في رصيده إطلاقًا."""
+    r1 = await cli.post(BASE, json=_cust("عميل أ"))
+    cid1 = r1.json()["id"]
+    r2 = await cli.post(BASE, json=_cust("عميل ب"))
+    cid2 = r2.json()["id"]
+
+    ro = await cli.post(f"{BASE}/orders", json={
+        "customer_id": cid1,
+        "order_date": str(date.today()),
+        "status": "pending",
+        "lines": [{"description": "منتج", "qty": 1, "unit": "قطعة", "unit_price": 1000.0}],
+    })
+    oid = ro.json()["id"]
+
+    bal1_after_create = (await cli.get(f"{BASE}/{cid1}")).json()["balance"]
+    assert bal1_after_create == 1000.0
+
+    # انقل الطلب لعميل ب بنفس القيمة
+    r_edit = await cli.patch(f"{BASE}/orders/{oid}/edit", json={
+        "customer_id": cid2,
+        "order_date": str(date.today()),
+        "status": "pending",
+        "lines": [{"description": "منتج", "qty": 1, "unit": "قطعة", "unit_price": 1000.0}],
+    })
+    assert r_edit.status_code == 200, r_edit.text
+
+    bal1_after_move = (await cli.get(f"{BASE}/{cid1}")).json()["balance"]
+    bal2_after_move = (await cli.get(f"{BASE}/{cid2}")).json()["balance"]
+    assert bal1_after_move == 0.0       # العميل القديم لازم يترجع صفر بالكامل
+    assert bal2_after_move == 1000.0    # العميل الجديد لازم يتحمّل القيمة كاملة
+
+
+@pytest.mark.asyncio
+async def test_edit_order_rejects_nonexistent_new_customer(cli):
+    r1 = await cli.post(BASE, json=_cust())
+    cid1 = r1.json()["id"]
+    ro = await cli.post(f"{BASE}/orders", json={
+        "customer_id": cid1, "order_date": str(date.today()), "status": "pending",
+        "lines": [{"description": "منتج", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
+    })
+    oid = ro.json()["id"]
+    r_edit = await cli.patch(f"{BASE}/orders/{oid}/edit", json={
+        "customer_id": 999999, "order_date": str(date.today()), "status": "pending",
+        "lines": [{"description": "منتج", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
+    })
+    assert r_edit.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_order_status_terminal_states_cannot_be_reversed(cli):
+    """إصلاح ثغرة تكامل: بعد delivered/cancelled كانت الحالة قابلة للتراجع
+    بحرية — ده كان بيسمح بازدواج CustomerAsset عند الرجوع لـpending ثم
+    delivered تاني، أو بضياع عكس رصيد الإلغاء عند الرجوع من cancelled."""
+    r = await cli.post(BASE, json=_cust())
+    cid = r.json()["id"]
+    ro = await cli.post(f"{BASE}/orders", json={
+        "customer_id": cid, "order_date": str(date.today()), "status": "pending",
+        "lines": [{"description": "منتج", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
+    })
+    oid = ro.json()["id"]
+
+    r_cancel = await cli.put(f"{BASE}/orders/{oid}", params={"status": "cancelled"})
+    assert r_cancel.status_code == 200
+
+    # محاولة الرجوع لأي حالة تانية بعد الإلغاء لازم تترفض
+    r_back = await cli.put(f"{BASE}/orders/{oid}", params={"status": "pending"})
+    assert r_back.status_code == 400

@@ -206,3 +206,44 @@ async def test_receive_creates_invoice_when_flag_true(cli):
 async def test_po_dashboard(cli):
     r = await cli.get(f"{BASE}/dashboard/summary")
     assert r.status_code == 200
+
+
+# ════════════════ ROUND-2 GAP REGRESSION TESTS ═══════════════════════
+
+@pytest.mark.asyncio
+async def test_create_po_rejects_material_of_another_tenant(cli, cli2):
+    """أمر الشراء كان بيقبل material_id تخميني تابع لـtenant تاني من غير أي
+    تحقق — عند الاستلام كان بيرفع مخزون/سعر مادة مش بتاعت الـtenant الحالي."""
+    r2 = await cli2.post("/api/v1/inventory/materials", json={
+        "name_ar": "مادة تينانت 2 - أمر شراء", "unit": "كجم", "unit_cost": 5.0,
+    })
+    assert r2.status_code == 201, r2.text
+    other_tenant_mid = r2.json()["id"]
+
+    sid = await _make_supplier(cli)
+    r = await cli.post(BASE, json=_po_payload(sid, other_tenant_mid))
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.asyncio
+async def test_delete_po_cleans_up_attachments(cli):
+    """حذف أمر شراء (مسودة) كان بيسيب مرفقات (لو اتضافت عبر endpoint المرفقات
+    العام /purchases/attach) يتيمة — سجل وملف على القرص من غير أي مرجع."""
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    r = await cli.post(BASE, json=_po_payload(sid, mid))
+    po_id = r.json()["id"]
+
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    up = await cli.post(
+        f"{PUR}/attach?entity_type=purchase_order&entity_id={po_id}",
+        files={"file": ("po.png", png_bytes, "image/png")},
+    )
+    assert up.status_code == 200, up.text
+    att_id = up.json()["id"]
+
+    r2 = await cli.delete(f"{BASE}/{po_id}")
+    assert r2.status_code in (200, 204)
+
+    dl = await cli.get(f"{PUR}/attachments/{att_id}/download")
+    assert dl.status_code == 404

@@ -154,6 +154,17 @@ async def create_credit_note(data: CNIn, db: AsyncSession = Depends(get_db)):
             raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
         if l.unit_price is not None and l.unit_price < 0:
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    # إصلاح ثغرة تحقق: إنشاء إشعار دائن لعميل رقمه غير موجود (أو تابع لـ
+    # tenant تاني) كان ينجح بصمت — الإشعار يتسجل بمرجع عميل يتيم، ورصيده
+    # لا يُخفَّض فعليًا عند الإصدار لأنه ببساطة مش موجود.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    if data.invoice_id is not None:
+        inv_check = await db.get(Invoice, data.invoice_id)
+        if not inv_check:
+            raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
+        if inv_check.customer_id != data.customer_id:
+            raise HTTPException(400, "الفاتورة المرجعية لا تخص هذا العميل")
     code = await _next_code(db)
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
@@ -222,6 +233,14 @@ async def update_credit_note(cn_id: int, data: CNIn, db: AsyncSession = Depends(
         raise HTTPException(404)
     if cn.status != "draft":
         raise HTTPException(400, "لا يمكن تعديل إشعار دائن بعد إصداره أو إلغائه")
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    if data.invoice_id is not None:
+        inv_check = await db.get(Invoice, data.invoice_id)
+        if not inv_check:
+            raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
+        if inv_check.customer_id != data.customer_id:
+            raise HTTPException(400, "الفاتورة المرجعية لا تخص هذا العميل")
 
     subtotal = sum(Decimal(str(l.qty)) * Decimal(str(l.unit_price)) for l in data.lines)
     tax_amount = subtotal * Decimal(str(data.tax_pct)) / 100

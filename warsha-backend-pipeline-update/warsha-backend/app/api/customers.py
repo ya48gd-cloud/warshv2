@@ -769,6 +769,11 @@ def _order_dict(o: CustomerOrder) -> dict:
 async def create_order(data: OrderIn, db: AsyncSession = Depends(get_db)):
     if data.order_date and data.delivery_date and data.delivery_date < data.order_date:
         raise HTTPException(400, "تاريخ التسليم يجب أن يكون بعد تاريخ الطلب")
+    # إصلاح ثغرة تحقق: إنشاء طلب لعميل رقمه غير موجود (أو تابع لـ tenant تاني)
+    # كان ينجح بصمت — الطلب يتسجل بمرجع عميل يتيم، ورصيده لا يتحدث لأنه
+    # ببساطة مش موجود.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
 
@@ -829,6 +834,14 @@ async def update_order_status(order_id: int, status: str, db: AsyncSession = Dep
         raise HTTPException(400, f"حالة غير صالحة. القيم المسموحة: {sorted(_VALID_ORDER_STATUSES)}")
     o = await db.get(CustomerOrder, order_id)
     if not o: raise HTTPException(404)
+    # إصلاح ثغرة تكامل: الحالتين "delivered" و"cancelled" كانتا قابلتين
+    # للتراجع عنهم بحرية (مفيش أي state machine) — العودة لـ"pending" بعد
+    # "cancelled" ما كانتش بترجّع رصيد العميل اللي اتعكس وقت الإلغاء، والعودة
+    # لـ"delivered" تاني بعد الرجوع لحالة سابقة كانت بتنشئ CustomerAsset
+    # + AssetMovement *مكرّرين* (أصل تاني وهمي لنفس المعدة). الحل: نخلي
+    # الحالتين ده نهائيتين (terminal) — زي بالظبط delivery_orders.py.
+    if o.status in ("delivered", "cancelled"):
+        raise HTTPException(400, f"لا يمكن تغيير حالة الطلب بعد أن أصبحت {o.status}")
     # إلغاء الطلب → إرجاع الرصيد الذي خُصم عند إنشائه
     if status == "cancelled" and o.status != "cancelled":
         cust = await db.get(Customer, o.customer_id)
@@ -939,10 +952,21 @@ async def edit_order_fields(order_id: int, data: OrderIn, db: AsyncSession = Dep
     else:
         new_total = Decimal(str(data.unit_price)) * data.quantity
 
-    # تحديث رصيد العميل بالفرق
-    cust = await db.get(Customer, o.customer_id)
-    if cust:
-        cust.balance = cust.balance - old_total + new_total
+    # إصلاح ثغرة تكامل: لو تعديل الطلب بينقل العميل (data.customer_id !=
+    # o.customer_id)، كان الكود بيطبّق (-old_total + new_total) كـnet على
+    # العميل *القديم* بس — العميل القديم يفضل عليه جزء من قيمة الطلب رغم
+    # إنه اتنقل، والعميل الجديد ما يتحمّلش قيمة الطلب في رصيده إطلاقًا.
+    # الصح: نعكس old_total بالكامل من العميل القديم، ونضيف new_total
+    # بالكامل للعميل (الجديد أو نفسه لو مفيش تغيير) — بالظبط زي معالجة نقل
+    # العميل في update_invoice بتاع sales.py.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    old_cust = await db.get(Customer, o.customer_id)
+    if old_cust:
+        old_cust.balance = old_cust.balance - old_total
+    new_cust = await db.get(Customer, data.customer_id)
+    if new_cust:
+        new_cust.balance = new_cust.balance + new_total
 
     o.customer_id = data.customer_id
     o.location_id = data.location_id
@@ -987,6 +1011,13 @@ async def record_payment(data: PaymentIn, db: AsyncSession = Depends(get_db),
     from decimal import Decimal as _Dec
     from app.models.models import Invoice, CustomerPaymentAllocation
     from sqlalchemy import select as _sel
+
+    # إصلاح ثغرة تحقق: الدفعة العامة من شاشة العملاء (بعكس /sales/invoices/{id}/payment)
+    # كانت الوحيدة اللي بتقبل مبلغ صفر أو سالب من غير أي رفض — رصيد العميل كان
+    # يتغيّر (وممكن يزيد بدل ما ينقص لو المبلغ سالب) من غير أي قيد محاسبي أو حركة
+    # خزنة مقابلة (الخزنة بترفض amt<=0 بصمت)، فيفضل السجل غير متزن تمامًا.
+    if data.amount is None or data.amount <= 0:
+        raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
 
     from app.core.database import current_tenant_id as _ctid_cpay
     payment_data = data.model_dump()

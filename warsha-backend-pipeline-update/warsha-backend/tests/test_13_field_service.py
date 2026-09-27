@@ -27,9 +27,17 @@ async def _make_equipment(cli):
     return r.json()["id"]
 
 
-async def _make_material(cli):
+async def _make_material(cli, stock=10):
     r = await cli.post(f"{INV}/materials", json={"name_ar": "أداة خدمة", "unit": "قطعة", "unit_cost": 10.0})
-    return r.json()["id"]
+    mid = r.json()["id"]
+    if stock:
+        # عهدة العدة (tool withdrawal) بتخصم فعليًا من رصيد المخزون، فلازم
+        # يبقى فيه رصيد افتتاحي قبل السحب.
+        r2 = await cli.post(f"{INV}/movements", json={
+            "material_id": mid, "movement_type": "in", "qty": stock, "unit_cost": 10.0,
+        })
+        assert r2.status_code == 201, r2.text
+    return mid
 
 
 async def _make_asset(cli, cid, eq_id=None):
@@ -241,6 +249,24 @@ async def test_list_labor(cli):
     assert isinstance(r.json(), list)
 
 
+@pytest.mark.asyncio
+async def test_add_labor_rejects_foreign_worker(cli, cli2):
+    """Regression: add_labor never checked worker_id belongs to the caller's
+    own tenant."""
+    cid = await _make_customer(cli)
+    oid = await _make_order(cli, cid)
+    r2 = await cli2.post(WORKERS, json={"name": "فني مستأجر آخر", "daily_wage": 100.0})
+    wid_other = r2.json()["id"]
+    r = await cli.post(f"{BASE}/orders/{oid}/labor", json={
+        "worker_id": wid_other,
+        "entry_date": str(date.today()),
+        "days": 1,
+        "daily_wage": 200.0,
+        "allowance": 0,
+    })
+    assert r.status_code == 404
+
+
 # ════════════════ TOOL WITHDRAWALS ═══════════════════════════════════
 @pytest.mark.asyncio
 async def test_withdraw_and_return_tool(cli):
@@ -277,6 +303,81 @@ async def test_return_tool_rejects_qty_over_withdrawn(cli):
         "returned_date": str(date.today()), "returned_qty": 5, "damaged_qty": 0,
     })
     assert r2.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_tool_withdrawal_deducts_and_restores_stock(cli):
+    """Regression: withdrawing/returning a tool never touched Material.stock_qty
+    at all — the tool stayed counted as fully available stock the whole time it
+    was checked out with a field technician."""
+    cid = await _make_customer(cli)
+    oid = await _make_order(cli, cid)
+    mid = await _make_material(cli, stock=10)
+
+    r = await cli.post(f"{BASE}/orders/{oid}/tools", json={
+        "material_id": mid, "qty": 3, "withdrawn_date": str(date.today()),
+    })
+    assert r.status_code == 201
+    wid = r.json()["id"]
+
+    mat = (await cli.get(f"{INV}/materials/{mid}")).json()
+    assert mat["stock_qty"] == 7  # 10 - 3 انسحبت فعليًا
+
+    r2 = await cli.patch(f"{BASE}/orders/{oid}/tools/{wid}/return", json={
+        "returned_date": str(date.today()), "returned_qty": 3, "damaged_qty": 0,
+    })
+    assert r2.status_code == 200
+    mat2 = (await cli.get(f"{INV}/materials/{mid}")).json()
+    assert mat2["stock_qty"] == 10  # رجعت بالكامل
+
+
+@pytest.mark.asyncio
+async def test_tool_writeoff_permanently_reduces_stock(cli):
+    """Regression: a damaged/lost tool must be written off the stock/asset
+    register permanently — only the genuinely-returned portion should come
+    back to available stock."""
+    cid = await _make_customer(cli)
+    oid = await _make_order(cli, cid)
+    mid = await _make_material(cli, stock=10)
+
+    r = await cli.post(f"{BASE}/orders/{oid}/tools", json={
+        "material_id": mid, "qty": 4, "withdrawn_date": str(date.today()),
+    })
+    wid = r.json()["id"]
+    assert (await cli.get(f"{INV}/materials/{mid}")).json()["stock_qty"] == 6
+
+    r2 = await cli.patch(f"{BASE}/orders/{oid}/tools/{wid}/return", json={
+        "returned_date": str(date.today()), "returned_qty": 2, "damaged_qty": 2,
+    })
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "damaged"
+    # 6 + 2 مرتجعة سليمة = 8 — الـ2 التالفة مابترجعش أبداً للمخزون
+    assert (await cli.get(f"{INV}/materials/{mid}")).json()["stock_qty"] == 8
+
+    # مايتسمحش بتكرار الإرجاع على نفس العهدة (كان بيدّي فرصة لخصم/إضافة مزدوجة)
+    r3 = await cli.patch(f"{BASE}/orders/{oid}/tools/{wid}/return", json={
+        "returned_date": str(date.today()), "returned_qty": 0, "damaged_qty": 0,
+    })
+    assert r3.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_delete_withdrawal_restores_stock(cli):
+    """Regression: deleting a still-outstanding withdrawal removed the custody
+    record but left the stock permanently short by that quantity."""
+    cid = await _make_customer(cli)
+    oid = await _make_order(cli, cid)
+    mid = await _make_material(cli, stock=10)
+
+    r = await cli.post(f"{BASE}/orders/{oid}/tools", json={
+        "material_id": mid, "qty": 5, "withdrawn_date": str(date.today()),
+    })
+    wid = r.json()["id"]
+    assert (await cli.get(f"{INV}/materials/{mid}")).json()["stock_qty"] == 5
+
+    r2 = await cli.delete(f"{BASE}/orders/{oid}/tools/{wid}")
+    assert r2.status_code == 200
+    assert (await cli.get(f"{INV}/materials/{mid}")).json()["stock_qty"] == 10
 
 
 # ════════════════ DASHBOARD + CALENDAR ═══════════════════════════════

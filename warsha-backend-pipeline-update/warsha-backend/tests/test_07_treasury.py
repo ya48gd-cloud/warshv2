@@ -48,6 +48,15 @@ async def test_delete_treasury(cli):
     assert r2.status_code == 204
 
 
+# ══ جولة 2 — إصلاح ثغرة تكامل: kind بلا تحقق enum كان بيسمح بقيمة عشوائية
+# تكسر ترتيب _default_treasury (كاش قبل بنك) وتخلي create_treasury يربط
+# الخزنة بحساب 1110 بصمت وكأنها "cash" حتى لو مقصود منها تكون حاجة تانية ═══
+@pytest.mark.asyncio
+async def test_create_treasury_rejects_invalid_kind(cli):
+    r = await cli.post(f"{BASE}/accounts", json=_account("خزينة غريبة", kind="wallet"))
+    assert r.status_code == 422
+
+
 # ════════════════ CATEGORIES ════════════════════════════════════════
 @pytest.mark.asyncio
 async def test_create_category(cli):
@@ -70,6 +79,14 @@ async def test_delete_category(cli):
     cid = r.json()["id"]
     r2 = await cli.delete(f"{BASE}/categories/{cid}")
     assert r2.status_code == 204
+
+
+# ══ جولة 2 — إصلاح ثغرة تكامل: flow بلا تحقق enum كان بيسمح بقيمة عشوائية
+# تُخزَّن كما هي بدون أي معنى محاسبي ═══════════════════════════════════
+@pytest.mark.asyncio
+async def test_create_category_rejects_invalid_flow(cli):
+    r = await cli.post(f"{BASE}/categories", json={"name": "فئة غريبة", "flow": "sideways"})
+    assert r.status_code == 422
 
 
 # ════════════════ TRANSACTIONS ═══════════════════════════════════════

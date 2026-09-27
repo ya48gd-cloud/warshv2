@@ -8,7 +8,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 from app.core.database import get_db, current_tenant_id
 from app.api.auth import require_any
@@ -33,11 +33,35 @@ class FixedAssetIn(BaseModel):
     useful_life_years: int = 5
     location: Optional[str] = None
     notes: Optional[str] = None
+    payment_account_code: str = "1110"   # 1110 = صندوق، 1120 = بنك — الحساب اللي اتدفعت منه تكلفة الشراء
 
 
 class DepreciationIn(BaseModel):
     period_year: int
     period_month: int
+
+    @validator("period_month")
+    def _valid_month(cls, v):
+        if not (1 <= v <= 12):
+            raise ValueError("period_month يجب أن يكون بين 1 و 12")
+        return v
+
+    @validator("period_year")
+    def _valid_year(cls, v):
+        if not (2000 <= v <= 2100):
+            raise ValueError("period_year خارج النطاق المسموح")
+        return v
+
+
+class DisposeAssetIn(BaseModel):
+    sale_amount: Decimal = Decimal("0")   # عائد البيع/التخريد (0 = إعدام بدون عائد)
+    cash_account_code: str = "1110"       # الحساب اللي هيستلم العائد (صندوق/بنك)
+
+    @validator("sale_amount")
+    def _non_negative(cls, v):
+        if v < 0:
+            raise ValueError("sale_amount لا يمكن أن يكون سالباً")
+        return v
 
 
 # ════════════════════════════════════════════════════
@@ -127,6 +151,28 @@ async def create_asset(data: FixedAssetIn, db: AsyncSession = Depends(get_db)):
         useful_life_years=data.useful_life_years, location=data.location, notes=data.notes,
     )
     db.add(asset)
+    await db.flush()
+
+    # إصلاح ثغرة تكامل: شراء أصل ثابت هو صرف فعلي لفلوس (أو التزام بالسداد) —
+    # كان يُسجَّل في FixedAsset فقط من غير أي قيد محاسبي مقابل، فتبقى تكلفة
+    # الأصل غير ظاهرة إطلاقاً في دليل الحسابات (لا في 1400 ولا في نقص النقدية).
+    # مدين: الأصول الثابتة (1400)   دائن: الصندوق/البنك (بحسب payment_account_code)
+    fixed_asset_acc = await _get_account(db, tid, "1400")
+    cash_acc = await _get_account(db, tid, data.payment_account_code)
+    entry = AccountingEntry(
+        tenant_id=tid,
+        entry_date=data.purchase_date,
+        reference=code,
+        description=f"شراء أصل ثابت: {data.name} ({code})",
+        source="fixed_asset_purchase",
+        source_id=asset.id,
+        posted=True,
+    )
+    db.add(entry)
+    await db.flush()
+    db.add(AccountingEntryLine(entry_id=entry.id, account_id=fixed_asset_acc.id, side="debit", amount=data.cost))
+    db.add(AccountingEntryLine(entry_id=entry.id, account_id=cash_acc.id, side="credit", amount=data.cost))
+
     await db.commit()
     await db.refresh(asset)
     return _asset_dict(asset)
@@ -134,6 +180,7 @@ async def create_asset(data: FixedAssetIn, db: AsyncSession = Depends(get_db)):
 
 @router.patch("/{asset_id}")
 async def update_asset(asset_id: int, data: FixedAssetIn, db: AsyncSession = Depends(get_db)):
+    tid = current_tenant_id.get() or 1
     a = await db.get(FixedAsset, asset_id)
     if not a:
         raise HTTPException(404, "الأصل غير موجود")
@@ -143,6 +190,29 @@ async def update_asset(asset_id: int, data: FixedAssetIn, db: AsyncSession = Dep
         raise HTTPException(400, "قيمة الخردة يجب أن تكون أقل من التكلفة")
     if data.useful_life_years <= 0:
         raise HTTPException(400, "العمر الإنتاجي يجب أن يكون أكبر من صفر")
+
+    # إصلاح ثغرة تكامل (نفس نمط تعديل فاتورة البيع): تغيير تكلفة الأصل بعد
+    # ترحيل قيد الشراء الأصلي كان يسيب القيد القديم واقفاً على القيمة القديمة
+    # للأبد بينما FixedAsset.cost يتغيّر — فيختل دليل الحسابات عن سجل الأصول.
+    # نعكس قيد الشراء القديم ونسجل قيداً جديداً بالتكلفة الجديدة لو اتغيّرت.
+    if data.cost != a.cost:
+        from app.services.auto_journal import journal_reverse_entry
+        await journal_reverse_entry(db, tid, "fixed_asset_purchase", a.id, "تعديل تكلفة الأصل")
+        fixed_asset_acc = await _get_account(db, tid, "1400")
+        cash_acc = await _get_account(db, tid, data.payment_account_code)
+        entry = AccountingEntry(
+            tenant_id=tid,
+            entry_date=data.purchase_date,
+            reference=data.code or a.code,
+            description=f"تعديل تكلفة أصل ثابت: {data.name} ({data.code or a.code})",
+            source="fixed_asset_purchase",
+            source_id=a.id,
+            posted=True,
+        )
+        db.add(entry)
+        await db.flush()
+        db.add(AccountingEntryLine(entry_id=entry.id, account_id=fixed_asset_acc.id, side="debit", amount=data.cost))
+        db.add(AccountingEntryLine(entry_id=entry.id, account_id=cash_acc.id, side="credit", amount=data.cost))
 
     a.name = data.name
     a.asset_type = data.asset_type
@@ -161,21 +231,80 @@ async def update_asset(asset_id: int, data: FixedAssetIn, db: AsyncSession = Dep
 
 @router.delete("/{asset_id}")
 async def delete_asset(asset_id: int, db: AsyncSession = Depends(get_db)):
+    tid = current_tenant_id.get() or 1
     a = await db.get(FixedAsset, asset_id)
     if not a:
         raise HTTPException(404, "الأصل غير موجود")
     if a.accumulated_depreciation and float(a.accumulated_depreciation) > 0:
         raise HTTPException(400, "لا يمكن حذف أصل له قيود إهلاك مسجلة — يمكن تغيير حالته إلى 'مستبعد' بدلاً من ذلك")
+    # إصلاح ثغرة تكامل: حذف الأصل كان يمسحه من FixedAsset فقط من غير ما يعكس
+    # قيد شرائه الأصلي (لو كان مُرحَّلاً) — فيفضل قيد "شراء أصل" يتيم في دليل
+    # الحسابات يشير لأصل غير موجود بعد الحذف.
+    from app.services.auto_journal import journal_reverse_entry
+    await journal_reverse_entry(db, tid, "fixed_asset_purchase", a.id, "حذف الأصل")
     await db.delete(a)
     await db.commit()
     return {"ok": True}
 
 
 @router.patch("/{asset_id}/dispose")
-async def dispose_asset(asset_id: int, db: AsyncSession = Depends(get_db)):
+async def dispose_asset(asset_id: int, data: DisposeAssetIn = DisposeAssetIn(), db: AsyncSession = Depends(get_db)):
+    """
+    استبعاد/بيع أصل ثابت — يشيله من سجل الأصول النشطة (status=disposed) ويرحّل
+    قيد محاسبي حقيقي: إقفال تكلفة الأصل ومجمع إهلاكه + إثبات ربح/خسارة الاستبعاد.
+
+    إصلاح ثغرة تكامل: قبل كده كان الـ endpoint ده بيغيّر status فقط من غير أي
+    أثر محاسبي — تكلفة الأصل (1400) ومجمع إهلاكه (1410) كانا يفضلوا واقفين في
+    دليل الحسابات للأبد رغم استبعاد الأصل فعلياً، وأي ربح/خسارة من البيع
+    (الفرق بين عائد البيع والقيمة الدفترية) كانت تضيع تماماً من غير ترحيل.
+    """
+    tid = current_tenant_id.get() or 1
     a = await db.get(FixedAsset, asset_id)
     if not a:
         raise HTTPException(404, "الأصل غير موجود")
+    if a.status == "disposed":
+        raise HTTPException(400, "الأصل مستبعد بالفعل")
+
+    cost = Decimal(str(a.cost or 0))
+    accum_dep = Decimal(str(a.accumulated_depreciation or 0))
+    book_value = cost - accum_dep
+    sale_amount = data.sale_amount
+    gain_or_loss = sale_amount - book_value   # موجب = ربح، سالب = خسارة
+
+    fixed_asset_acc = await _get_account(db, tid, "1400")
+    accum_dep_acc = await _get_account(db, tid, "1410")
+
+    lines = []
+    if accum_dep > 0:
+        lines.append((accum_dep_acc.id, "debit", accum_dep))
+    if sale_amount > 0:
+        cash_acc = await _get_account(db, tid, data.cash_account_code)
+        lines.append((cash_acc.id, "debit", sale_amount))
+    lines.append((fixed_asset_acc.id, "credit", cost))
+    if gain_or_loss > 0:
+        # ربح استبعاد — نعيد استخدام حساب إيرادات بيع الهالك (4400) بدل ما نضيف
+        # حساباً جديداً لمفهوم مقارب جداً (عائد غير متكرر من التخلص من أصل)
+        gain_acc = await _get_account(db, tid, "4400")
+        lines.append((gain_acc.id, "credit", gain_or_loss))
+    elif gain_or_loss < 0:
+        # خسارة استبعاد — نعيد استخدام حساب مصاريف هالك وإتلاف (5600)
+        loss_acc = await _get_account(db, tid, "5600")
+        lines.append((loss_acc.id, "debit", -gain_or_loss))
+
+    entry = AccountingEntry(
+        tenant_id=tid,
+        entry_date=date.today(),
+        reference=a.code,
+        description=f"استبعاد/بيع أصل ثابت: {a.name} ({a.code})",
+        source="fixed_asset_disposal",
+        source_id=asset_id,
+        posted=True,
+    )
+    db.add(entry)
+    await db.flush()
+    for acc_id, side, amount in lines:
+        db.add(AccountingEntryLine(entry_id=entry.id, account_id=acc_id, side=side, amount=amount))
+
     a.status = "disposed"
     await db.commit()
     await db.refresh(a)

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from decimal import Decimal
 from typing import Optional
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, validator
 
 from ..models.models import PriceCatalogItem, Equipment, Material, WorkOrder, CostLine, BOMLine
 from app.core.database import get_db
@@ -31,6 +31,19 @@ class CatalogItemIn(BaseModel):
     source_type:  Optional[str]     = None       # material | equipment
     source_id:    Optional[int]     = None
     is_active:    bool              = True
+
+    @validator("cost_price")
+    def _cost_price_not_negative(cls, v):
+        # تكلفة سالبة كانت بتعدي بصمت وتنتج سعر بيع سالب هو الآخر (auto mode)
+        if v is not None and v < 0:
+            raise ValueError("سعر التكلفة لا يمكن أن يكون سالباً")
+        return v
+
+    @validator("selling_price")
+    def _selling_price_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("سعر البيع لا يمكن أن يكون سالباً")
+        return v
 
 
 class CatalogItemOut(BaseModel):
@@ -61,8 +74,15 @@ def _calc_selling(cost: Decimal, margin: Decimal) -> Decimal:
 def _resolve_price(body) -> Decimal:
     """يحدد سعر البيع: يدوي لو price_mode=manual، أو محسوب لو auto"""
     if getattr(body, "price_mode", "auto") == "manual" and body.selling_price is not None:
-        return Decimal(str(body.selling_price))
-    return _calc_selling(body.cost_price, body.margin_pct)
+        price = Decimal(str(body.selling_price))
+    else:
+        price = _calc_selling(body.cost_price, body.margin_pct)
+    if price < 0:
+        # margin_pct سالب جداً (مثلاً -300%) مع cost_price موجب صالح كان بيطلّع
+        # سعر بيع سالب يعدي بصمت لسطر فاتورة بعدين — مفيش فحص على القيمة
+        # المشتقة دي، بس على المدخلات الخام فقط.
+        raise HTTPException(400, "سعر البيع الناتج لا يمكن أن يكون سالباً — راجع نسبة الهامش")
+    return price
 
 
 def _get_tenant(user) -> int:
@@ -308,11 +328,16 @@ async def update_price(
     item = await db.get(PriceCatalogItem, item_id)
     if not item or item.tenant_id != _get_tenant(user):
         raise HTTPException(404, "not found")
+    if cost_price is not None and cost_price < 0:
+        raise HTTPException(400, "سعر التكلفة لا يمكن أن يكون سالباً")
     if cost_price is not None:
         item.cost_price = cost_price
     if margin_pct is not None:
         item.margin_pct = margin_pct
-    item.selling_price = _calc_selling(item.cost_price, item.margin_pct)
+    new_selling = _calc_selling(item.cost_price, item.margin_pct)
+    if new_selling < 0:
+        raise HTTPException(400, "سعر البيع الناتج لا يمكن أن يكون سالباً — راجع نسبة الهامش")
+    item.selling_price = new_selling
     await db.commit()
     return {
         "id": item.id,

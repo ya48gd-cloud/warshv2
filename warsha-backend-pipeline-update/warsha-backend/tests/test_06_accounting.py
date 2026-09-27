@@ -211,3 +211,122 @@ async def test_manual_allocation_also_updates_installments(cli):
     rows = (await cli.get(f"{SALES_BASE}/invoices/{iid}/payment-schedule")).json()
     assert rows[0]["status"] == "paid"
     assert rows[1]["status"] == "pending"
+
+
+# ══ جولة 2 — إصلاح ثغرة تكامل: bند تكلفة بمبلغ صفري/سالب كان يعدي من غير
+# أي تحقق ويقلل wo.actual_cost بصمت من غير أي قيد محاسبي مقابل ═══════════
+@pytest.mark.asyncio
+async def test_cost_line_rejects_non_positive_amounts(cli):
+    eq_id = await _make_equipment(cli)
+    wo_id = await _make_wo(cli, eq_id)
+
+    r = await cli.post(f"{BASE}/cost-lines", json={
+        "work_order_id": wo_id, "cost_type": "labor",
+        "description": "عمالة", "qty": 1.0, "unit_cost": 0,
+    })
+    assert r.status_code == 422
+
+    r2 = await cli.post(f"{BASE}/cost-lines", json={
+        "work_order_id": wo_id, "cost_type": "labor",
+        "description": "عمالة", "qty": -2.0, "unit_cost": 50.0,
+    })
+    assert r2.status_code == 422
+
+
+# ══ جولة 2 — إصلاح ثغرة تكامل: حذف أمر إنتاج بالكامل كان يحذف بنود التكلفة
+# من غير عكس القيود المحاسبية المرتبطة بيها، فيفضل قيد "يتيم" في دليل
+# الحسابات يشير لأمر إنتاج غير موجود ═══════════════════════════════════
+@pytest.mark.asyncio
+async def test_delete_work_order_reverses_cost_line_journal_entries(cli):
+    ACC_BASE = "/api/v1/accounts"
+    await cli.post(f"{ACC_BASE}/chart/seed")
+
+    eq_id = await _make_equipment(cli)
+    wo_id = await _make_wo(cli, eq_id)
+
+    r = await cli.post(f"{BASE}/cost-lines", json={
+        "work_order_id": wo_id, "cost_type": "labor",
+        "description": "عمالة", "qty": 2.0, "unit_cost": 150.0,
+    })
+    assert r.status_code == 201
+
+    tb = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    wip_row = next(a for a in tb["accounts"] if a["code"] == "1320")
+    assert wip_row["balance"] == 300.0
+
+    dele = await cli.delete(f"{BASE}/work-orders/{wo_id}")
+    assert dele.status_code in (200, 204)
+
+    tb2 = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    wip_rows2 = [a for a in tb2["accounts"] if a["code"] == "1320"]
+    assert wip_rows2 and wip_rows2[0]["balance"] == 0.0, (
+        "بعد حذف أمر الإنتاج بالكامل، صافي حساب WIP لازم يرجع صفر (القيد المرتبط بالبند المحذوف لازم ينعكس)"
+    )
+
+
+# ══ جولة 2 — إصلاح ثغرة تكامل: القيد اليدوي (POST /accounts/entries) كان
+# يظهر في ميزان المراجعة فوراً حتى قبل ترحيله (posted=True) — فيفقد حقل
+# posted أي معنى ويقدر مستخدم يضيف قيد "مسودة" يشوّه كل التقارير المالية ═══
+@pytest.mark.asyncio
+async def test_manual_entry_hidden_from_reports_until_posted(cli):
+    ACC_BASE = "/api/v1/accounts"
+    await cli.post(f"{ACC_BASE}/chart/seed")
+    accounts = (await cli.get(f"{ACC_BASE}/chart")).json()
+    cash = next(a for a in accounts if a["code"] == "1110")
+    equity = next(a for a in accounts if a["code"] == "3100")
+
+    r = await cli.post(f"{ACC_BASE}/entries", json={
+        "entry_date": str(date.today()),
+        "description": "قيد افتتاحي يدوي",
+        "lines": [
+            {"account_id": cash["id"], "side": "debit", "amount": 500.0},
+            {"account_id": equity["id"], "side": "credit", "amount": 500.0},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    entry_id = r.json()["id"]
+    assert r.json()["posted"] is False
+
+    tb = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    assert not any(a["code"] == "1110" for a in tb["accounts"]), (
+        "قيد يدوي غير مرحّل (posted=False) لازم يكون غير ظاهر في ميزان المراجعة"
+    )
+
+    post_r = await cli.patch(f"{ACC_BASE}/entries/{entry_id}/post")
+    assert post_r.status_code == 200
+
+    tb2 = (await cli.get(f"{ACC_BASE}/trial-balance")).json()
+    cash_row = next(a for a in tb2["accounts"] if a["code"] == "1110")
+    assert cash_row["balance"] == 500.0
+
+
+# ══ جولة 2 — إصلاح ثغرة تكامل: AllocationIn.amount كان بلا أي تحقق —
+# amount=0 أو سالب كان يعدي ويسجل تخصيصاً وهمياً/يقلل paid_amount الفاتورة ═══
+@pytest.mark.asyncio
+async def test_allocate_payment_rejects_non_positive_amount(cli):
+    CUST_BASE = "/api/v1/customers"
+    SALES_BASE = "/api/v1/sales"
+    ACC_BASE = "/api/v1/accounts"
+
+    cust = await cli.post(CUST_BASE, json={"name": "عميل تخصيص", "phone": "0501112233"})
+    cid = cust.json()["id"]
+    pay = await cli.post(f"{CUST_BASE}/payments", json={
+        "customer_id": cid, "amount": 100.0,
+        "payment_type": "cash", "payment_date": str(date.today()),
+    })
+    pid = pay.json()["id"]
+    inv = await cli.post(f"{SALES_BASE}/invoices", json={
+        "customer_id": cid, "date": str(date.today()),
+        "lines": [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 500.0}],
+    })
+    iid = inv.json()["id"]
+
+    r = await cli.post(f"{ACC_BASE}/payments/{pid}/allocate", json=[
+        {"invoice_id": iid, "amount": 0}
+    ])
+    assert r.status_code == 422
+
+    r2 = await cli.post(f"{ACC_BASE}/payments/{pid}/allocate", json=[
+        {"invoice_id": iid, "amount": -50.0}
+    ])
+    assert r2.status_code == 422

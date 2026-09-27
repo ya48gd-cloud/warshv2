@@ -584,6 +584,47 @@ async def journal_cost_line_delete(
 # نفسها اللي بتتحول لـCOGS وقت البيع) بدل ما نضيف حساب جديد ومكرر معناه.
 # ══════════════════════════════════════════════════════════════════════════
 
+async def journal_reverse_all_for_wo(
+    db: AsyncSession, tenant_id: int, work_order_id: int, reason: str,
+):
+    """
+    يعكس كل القيود المحاسبية المرتبطة بأمر إنتاج معيّن — بكل أنواعها (بند تكلفة،
+    صرف مواد، تكلفة عمالة، إغلاق أمر، هالك) — دفعة واحدة.
+
+    ليه مش journal_reverse_entry العادية: تلك بتعكس آخر قيد واحد فقط مطابق لـ
+    (source, source_id)، بينما أمر إنتاج واحد ممكن يبقى عليه أكتر من بند تكلفة/
+    عملية صرف مواد بنفس (source, work_order_id) — لازم كل قيد ينعكس على حدة
+    وإلا يفضل معظمها يتيماً في دليل الحسابات بعد حذف الأمر بالكامل (اللي
+    بيحذف CostLine/JournalEntry القديمة لكن ملوش أي أثر على AccountingEntry).
+    """
+    sources = ("cost_line", "material_issue", "labor_cost", "work_order_complete", "scrap")
+    entries = (await db.execute(
+        select(AccountingEntry).where(
+            AccountingEntry.tenant_id == tenant_id,
+            AccountingEntry.source_id == work_order_id,
+            AccountingEntry.source.in_(sources),
+        ).order_by(AccountingEntry.id)
+    )).scalars().all()
+    for entry in entries:
+        lines = (await db.execute(
+            select(AccountingEntryLine).where(AccountingEntryLine.entry_id == entry.id)
+        )).scalars().all()
+        if not lines:
+            continue
+        reversed_lines = [
+            {"account_id": ln.account_id,
+             "side": "credit" if ln.side == "debit" else "debit",
+             "amount": ln.amount}
+            for ln in lines
+        ]
+        await _post_entry(
+            db, tenant_id, entry.entry_date,
+            f"عكس: {entry.description} ({reason})",
+            entry.reference, f"{entry.source}_reversal", entry.source_id,
+            reversed_lines,
+        )
+
+
 async def journal_cogs(
     db: AsyncSession, tenant_id: int, delivery_order_id: int,
     order_code: str, amount: Decimal, delivery_date: date,

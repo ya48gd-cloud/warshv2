@@ -197,3 +197,189 @@ async def test_delete_payroll_run(cli):
     run_id = rp.json()["id"]
     r = await cli.delete(f"{BASE}/payroll/{run_id}")
     assert r.status_code in (200, 204)
+
+
+# ════════════════ MONEY-CORRECTNESS REGRESSIONS ═══════════════════════
+# سلف/مكافآت العمال وكشف الرواتب: تتبع الحلقة الكاملة (سلفة → خصم في
+# الراتب → استرداد فعلي) من غير ازدواج أو ضياع مبلغ.
+
+TREASURY_BASE = "/api/v1/treasury"
+
+
+async def _make_treasury(cli, opening=1000.0):
+    r = await cli.post(f"{TREASURY_BASE}/accounts", json={
+        "name": f"خزينة اختبار {opening}", "kind": "cash", "opening_balance": opening,
+    })
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+async def _treasury_balance(cli, treasury_id):
+    r = await cli.get(f"{TREASURY_BASE}/accounts")
+    row = next(t for t in r.json() if t["id"] == treasury_id)
+    return row["balance"]
+
+
+@pytest.mark.asyncio
+async def test_advance_validation_rejects_bad_input(cli, cli2):
+    """Regression: add_advance never validated amount>0 / advance_type, and
+    never checked that worker_id actually belongs to the caller's tenant."""
+    rw = await cli.post(BASE, json=_worker("للتحقق"))
+    wid = rw.json()["id"]
+
+    bad_amount = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 0, "advance_type": "advance", "date": str(date.today()),
+    })
+    assert bad_amount.status_code == 400
+
+    bad_type = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 100, "advance_type": "not_a_type", "date": str(date.today()),
+    })
+    assert bad_type.status_code == 400
+
+    rw2 = await cli2.post(BASE, json=_worker("عامل مستأجر آخر"))
+    wid2 = rw2.json()["id"]
+    cross_tenant = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid2, "amount": 100, "advance_type": "advance", "date": str(date.today()),
+    })
+    assert cross_tenant.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_duplicate_worker_code_rejected_cleanly(cli):
+    """Regression: an explicit duplicate worker code hit the DB's unique
+    constraint directly (unhandled IntegrityError -> 500) instead of a clean
+    400 validation error."""
+    r1 = await cli.post(BASE, json={**_worker("الأول"), "code": "EMP-DUP-1"})
+    assert r1.status_code == 201
+    r2 = await cli.post(BASE, json={**_worker("الثاني"), "code": "EMP-DUP-1"})
+    assert r2.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_bonus_is_not_paid_twice(cli):
+    """Regression: a 'bonus' WorkerAdvance triggered an immediate treasury
+    cash-out at creation time AND was paid again through the payroll net
+    (its amount is added into gross+bonus) — the same bonus left the
+    treasury twice. It must leave the treasury exactly once, at payroll pay
+    time, and must never be re-included in a later payroll run."""
+    treasury_id = await _make_treasury(cli, opening=1000.0)
+    balance_before_bonus = await _treasury_balance(cli, treasury_id)
+
+    rw = await cli.post(BASE, json=_worker("عامل مكافأة"))
+    wid = rw.json()["id"]
+
+    week_start = date.today() - timedelta(days=date.today().weekday())
+    week_end = week_start + timedelta(days=6)
+    await cli.post("/api/v1/attendance", json={
+        "worker_id": wid, "attendance_date": str(week_start), "status": "present",
+    })
+
+    adv = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 50.0, "advance_type": "bonus", "date": str(week_start),
+    })
+    assert adv.status_code == 201
+
+    # لسه محصلتش المكافأة نقدًا وقت التسجيل — الخزنة لازم تفضل زي ما هي
+    balance_after_bonus = await _treasury_balance(cli, treasury_id)
+    assert balance_after_bonus == balance_before_bonus
+
+    rp1 = await cli.post(f"{BASE}/payroll", json={"week_start": str(week_start), "week_end": str(week_end)})
+    run1_id = rp1.json()["id"]
+    gen1 = await cli.post(f"{BASE}/payroll/{run1_id}/generate")
+    line1 = next(l for l in gen1.json()["lines"] if l["worker"] == "عامل مكافأة")
+    assert abs(line1["net"] - (150.0 + 50.0)) < 0.01  # يوم حضور واحد + المكافأة
+
+    # أسبوع تاني — نفس المكافأة القديمة لازم متترجعش تتحسب/تتدفع تاني
+    week2_start = week_start + timedelta(days=7)
+    week2_end = week2_start + timedelta(days=6)
+    await cli.post("/api/v1/attendance", json={
+        "worker_id": wid, "attendance_date": str(week2_start), "status": "present",
+    })
+    rp2 = await cli.post(f"{BASE}/payroll", json={"week_start": str(week2_start), "week_end": str(week2_end)})
+    run2_id = rp2.json()["id"]
+    gen2 = await cli.post(f"{BASE}/payroll/{run2_id}/generate")
+    line2 = next(l for l in gen2.json()["lines"] if l["worker"] == "عامل مكافأة")
+    assert abs(line2["net"] - 150.0) < 0.01
+
+    profile = await cli.get(f"{BASE}/{wid}/profile")
+    assert profile.json()["pending_bonus"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_advance_partial_recovery_not_written_off(cli):
+    """Regression: generate_from_attendance capped the *deduction* so net pay
+    never goes negative, but then marked the ENTIRE advance as settled even
+    when only part of it was actually recoverable that week — silently
+    forgiving the unrecovered remainder forever instead of carrying it to the
+    next payroll run."""
+    rw = await cli.post(BASE, json=_worker("عامل سلفة كبيرة"))
+    wid = rw.json()["id"]
+
+    week1_start = date.today() - timedelta(days=date.today().weekday())
+    week1_end = week1_start + timedelta(days=6)
+    await cli.post("/api/v1/attendance", json={
+        "worker_id": wid, "attendance_date": str(week1_start), "status": "present",
+    })  # gross = 150 فقط هذا الأسبوع
+
+    adv = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 300.0, "advance_type": "advance", "date": str(week1_start),
+    })
+    assert adv.status_code == 201
+
+    rp1 = await cli.post(f"{BASE}/payroll", json={"week_start": str(week1_start), "week_end": str(week1_end)})
+    run1_id = rp1.json()["id"]
+    gen1 = await cli.post(f"{BASE}/payroll/{run1_id}/generate")
+    line1 = next(l for l in gen1.json()["lines"] if l["worker"] == "عامل سلفة كبيرة")
+    # سعة الأسبوع (150) مش كافية لتغطية السلفة (300) بالكامل — لازم تتأجل
+    # بالكامل (net = gross كامل)، مش تتخصم جزئيًا وتُشطب باقيها.
+    assert line1["net"] == 150.0
+
+    profile1 = await cli.get(f"{BASE}/{wid}/profile")
+    assert profile1.json()["pending_advances"] == 300.0
+
+    week2_start = week1_start + timedelta(days=7)
+    week2_end = week2_start + timedelta(days=6)
+    for d in range(4):
+        await cli.post("/api/v1/attendance", json={
+            "worker_id": wid, "attendance_date": str(week2_start + timedelta(days=d)), "status": "present",
+        })  # gross = 600 — سعة كافية دلوقتي
+
+    rp2 = await cli.post(f"{BASE}/payroll", json={"week_start": str(week2_start), "week_end": str(week2_end)})
+    run2_id = rp2.json()["id"]
+    gen2 = await cli.post(f"{BASE}/payroll/{run2_id}/generate")
+    line2 = next(l for l in gen2.json()["lines"] if l["worker"] == "عامل سلفة كبيرة")
+    assert line2["net"] == 600.0 - 300.0
+
+    profile2 = await cli.get(f"{BASE}/{wid}/profile")
+    assert profile2.json()["pending_advances"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_cannot_delete_settled_advance_directly(cli):
+    """Regression: deleting an advance already settled into a payroll run only
+    reversed its own treasury/GL entry, leaving the payroll line's deduction
+    (and the worker's already-reduced net pay) with no advance record to
+    justify it — effectively pocketing that amount with no trace."""
+    rw = await cli.post(BASE, json=_worker("عامل حذف سلفة"))
+    wid = rw.json()["id"]
+    week_start = date.today() - timedelta(days=date.today().weekday())
+    week_end = week_start + timedelta(days=6)
+    await cli.post("/api/v1/attendance", json={
+        "worker_id": wid, "attendance_date": str(week_start), "status": "present",
+    })
+    adv = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 50.0, "advance_type": "advance", "date": str(week_start),
+    })
+    aid = adv.json()["id"]
+    rp = await cli.post(f"{BASE}/payroll", json={"week_start": str(week_start), "week_end": str(week_end)})
+    run_id = rp.json()["id"]
+    await cli.post(f"{BASE}/payroll/{run_id}/generate")
+
+    r = await cli.delete(f"{BASE}/advances/{aid}")
+    assert r.status_code == 400
+
+    # لسه ممكن تتحذف بعد ما تتلغى تسويتها (عن طريق حذف الكشف نفسه)
+    await cli.delete(f"{BASE}/payroll/{run_id}")
+    r2 = await cli.delete(f"{BASE}/advances/{aid}")
+    assert r2.status_code in (200, 204)

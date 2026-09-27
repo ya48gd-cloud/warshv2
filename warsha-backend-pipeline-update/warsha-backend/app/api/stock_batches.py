@@ -100,8 +100,19 @@ async def create_batch(data: BatchIn, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "المادة غير موجودة")
     if data.unit_cost is not None and data.unit_cost < 0:
         raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    if data.qty_received is None or data.qty_received <= 0:
+        raise HTTPException(400, "كمية الاستلام يجب أن تكون أكبر من صفر")
     if data.received_date and data.expiry_date and data.expiry_date < data.received_date:
         raise HTTPException(400, "تاريخ الصلاحية يجب أن يكون بعد تاريخ الاستلام")
+    if data.supplier_id is not None:
+        # رقم مورد صحيح بس تابع لتنانت تاني كان بيتقبل من غير أي فحص —
+        # الدُفعة كانت هتتربط بمورد مش بتاعها (يظهر اسمه لو الـ relationship
+        # اتحمّل بدون فلترة، أو يفضل مرجع يتيم لو اتحذف عند التاني).
+        owns_sup = await db.scalar(
+            select(Supplier.id).where(Supplier.id == data.supplier_id, Supplier.tenant_id == tid)
+        )
+        if not owns_sup:
+            raise HTTPException(400, "المورد المحدد غير موجود")
 
     batch = StockBatch(
         tenant_id=tid,

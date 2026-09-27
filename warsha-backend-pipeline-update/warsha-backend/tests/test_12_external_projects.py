@@ -236,6 +236,72 @@ async def test_delete_tool(cli):
     assert r2.status_code in (200, 204)
 
 
+@pytest.mark.asyncio
+async def test_tool_linked_to_material_deducts_and_restores_stock(cli):
+    """Regression: an ExtProjectTool linked to a real inventory Material
+    (material_id) never touched stock_qty on withdraw/return/delete — the
+    tool stayed counted as fully available in the warehouse the whole time
+    it was checked out to the project team."""
+    cid = await _make_client(cli)
+    pid = await _create_project(cli, cid)
+    mid = await _make_material(cli)  # unit_cost=5.0, stock starts at 0
+    r0 = await cli.post(f"{INV}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 10, "unit_cost": 5.0,
+    })
+    assert r0.status_code == 201
+
+    r = await cli.post(f"{BASE}/{pid}/tools", json={
+        "tool_name": "أداة من المخزون", "material_id": mid,
+        "quantity": 4, "unit": "قطعة", "withdrawn_date": str(date.today()),
+    })
+    assert r.status_code == 201
+    tid = r.json()["id"]
+    assert (await cli.get(f"{INV}/materials/{mid}")).json()["stock_qty"] == 6
+
+    r2 = await cli.patch(
+        f"{BASE}/{pid}/tools/{tid}/return",
+        params={"returned_qty": 3, "condition_in": "good"},
+    )
+    assert r2.status_code == 200
+    # 6 + 3 مرتجعة = 9 — الوحدة المفقودة (4-3=1) تفضل مخصومة نهائيًا
+    assert (await cli.get(f"{INV}/materials/{mid}")).json()["stock_qty"] == 9
+
+
+@pytest.mark.asyncio
+async def test_add_material_rejects_foreign_project_and_material(cli, cli2):
+    """Regression: add_material never checked that the project (pid) belongs
+    to the caller's tenant, nor that material_id does."""
+    cid2 = await _make_client(cli2)
+    pid_other = await _create_project(cli2, cid2)
+    r = await cli.post(f"{BASE}/{pid_other}/materials", json={
+        "description": "مادة", "quantity": 1.0, "unit_cost": 10.0,
+        "usage_date": str(date.today()),
+    })
+    assert r.status_code == 404
+
+    cid = await _make_client(cli)
+    pid = await _create_project(cli, cid)
+    mid_other = await _make_material(cli2)
+    r2 = await cli.post(f"{BASE}/{pid}/materials", json={
+        "source": "stock", "material_id": mid_other,
+        "description": "مادة", "quantity": 1.0, "unit_cost": 10.0,
+        "usage_date": str(date.today()),
+    })
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_project_rejects_foreign_client(cli, cli2):
+    """Regression: create_project never checked that client_id belongs to the
+    caller's tenant."""
+    cid_other = await _make_client(cli2)
+    r = await cli.post(BASE, json={
+        "code": "EP-FOREIGN", "title": "مشروع", "project_type": "installation",
+        "client_id": cid_other, "contract_value": 1000.0,
+    })
+    assert r.status_code == 404
+
+
 # ════════════════ MATERIALS ═══════════════════════════════════════════
 @pytest.mark.asyncio
 async def test_add_material(cli):

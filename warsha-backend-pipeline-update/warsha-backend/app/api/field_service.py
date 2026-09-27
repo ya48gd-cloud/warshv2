@@ -749,6 +749,9 @@ async def add_labor(oid: int, data: LaborEntryIn, db: AsyncSession = Depends(get
     tid_ple = _ctid_ple.get() or 1
     o = await db.get(FieldServiceOrder, oid)
     if not o or o.tenant_id != tid_ple: raise HTTPException(404)
+    w = await db.get(Worker, data.worker_id)
+    if not w or w.tenant_id != tid_ple:
+        raise HTTPException(404, "العامل غير موجود")
     if data.days is None or data.days <= 0:
         raise HTTPException(400, "عدد الأيام يجب أن يكون أكبر من صفر")
     if data.daily_wage is not None and data.daily_wage < 0:
@@ -839,7 +842,7 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
     o = await db.get(FieldServiceOrder, oid)
     if not o or o.tenant_id != tid_ptw: raise HTTPException(404)
     mat = await db.get(Material, data.material_id)
-    if not mat: raise HTTPException(404, "المادة غير موجودة")
+    if not mat or mat.tenant_id != tid_ptw: raise HTTPException(404, "المادة غير موجودة")
     if data.qty is None or data.qty <= 0:
         raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
 
@@ -854,6 +857,20 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
         notes=data.notes,
     )
     db.add(row)
+    await db.flush()
+
+    # ملاحظة إصلاح: العهدة كانت بتتسجل من غير أي أثر على رصيد المخزون —
+    # الأداة تفضل محسوبة "متاحة" في المخزن رغم إنها فعليًا خارج الورشة مع
+    # الفني. نصرفها فعليًا من المخزون زي أي مادة (post_issue بيتحقق من
+    # الرصيد المتاح تلقائيًا).
+    from app.services.inventory_ledger import post_issue
+    await post_issue(
+        db, material=mat, qty=row.qty, unit_cost=mat.unit_cost or Decimal("0"),
+        movement_date=data.withdrawn_date,
+        source_doc_type="field_service_tool", source_doc_id=row.id,
+        reference=f"FS-TOOL-{row.id}", notes=f"سحب عهدة عدة — أمر خدمة #{oid}",
+    )
+
     await db.commit()
     await db.refresh(row)
     return {"id": row.id, "status": row.status}
@@ -864,6 +881,11 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
 async def return_tool(oid: int, wid: int, data: ToolReturnIn, db: AsyncSession = Depends(get_db)):
     row = await db.get(ProjectToolWithdrawal, wid)
     if not row or row.service_order_id != oid: raise HTTPException(404)
+    if row.status != "withdrawn":
+        # كانت الدالة بتسمح بإعادة النداء عليها أكتر من مرة فتكتب فوق
+        # returned_qty/damaged_qty القديمة، وده كان هيسبب قيد مخزون مزدوج
+        # لو الأداة سُجّلت راجعة أكتر من مرة.
+        raise HTTPException(400, "تم إرجاع/تسوية هذه العهدة بالفعل")
 
     returned_qty = Decimal(str(data.returned_qty))
     damaged_qty  = Decimal(str(data.damaged_qty))
@@ -880,6 +902,21 @@ async def return_tool(oid: int, wid: int, data: ToolReturnIn, db: AsyncSession =
     if data.notes:
         row.notes = (row.notes or "") + f"\n{data.notes}"
 
+    # ملاحظة إصلاح: نرجّع للمخزون فقط الكمية اللي رجعت فعليًا سليمة/قابلة
+    # للاستخدام (returned_qty). الجزء التالف/المفقود (damaged_qty، أو أي
+    # فارق لم يُرجَّع) يفضل مخصومًا نهائيًا من رصيد المخزون — ده فعليًا
+    # إعدام (write-off) لجزء من قيمة الأصل، مش مجرد "لسه بره".
+    if returned_qty > 0:
+        from app.services.inventory_ledger import post_receipt
+        mat = await db.get(Material, row.material_id)
+        if mat:
+            await post_receipt(
+                db, material=mat, qty=returned_qty, unit_cost=mat.unit_cost or Decimal("0"),
+                movement_date=row.returned_date,
+                source_doc_type="field_service_tool_return", source_doc_id=row.id,
+                reference=f"FS-TOOL-{row.id}", notes=f"إرجاع عهدة عدة — أمر خدمة #{oid}",
+            )
+
     await db.commit()
     return {"id": row.id, "status": row.status}
 
@@ -891,6 +928,18 @@ async def delete_withdrawal(oid: int, wid: int, db: AsyncSession = Depends(get_d
     if not row or row.service_order_id != oid: raise HTTPException(404)
     if row.status != "withdrawn":
         raise HTTPException(400, "لا يمكن حذف عهدة مرتجعة أو تالفة")
+
+    # عكس متماثل لخصم المخزون اللي حصل وقت السحب (post_issue) — الحذف هنا معناه
+    # إلغاء عملية السحب بالكامل (لسه في حالة withdrawn، لم يُرجَّع أو يُتلَف بعد)
+    mat = await db.get(Material, row.material_id)
+    if mat:
+        from app.services.inventory_ledger import post_receipt
+        await post_receipt(
+            db, material=mat, qty=row.qty, unit_cost=mat.unit_cost or Decimal("0"),
+            source_doc_type="field_service_tool_delete", source_doc_id=row.id,
+            reference=f"FS-TOOL-{row.id}", notes=f"إلغاء سحب عهدة عدة — أمر خدمة #{oid}",
+        )
+
     await db.delete(row)
     await db.commit()
     return {"message": "تم الحذف"}
