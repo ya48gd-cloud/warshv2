@@ -56,7 +56,7 @@ export default function CreditNotes() {
 
   const [form, setForm] = useState({
     customer_id: '', invoice_id: '', date: today(),
-    reason: '', return_type: 'partial',
+    reason: '', return_type: 'partial', is_return: false,
     tax_pct: 0, discount_amt: 0, notes: '',
     lines: [emptyLine()],
   })
@@ -108,6 +108,7 @@ export default function CreditNotes() {
         date:         detail.date || today(),
         reason:       detail.reason || '',
         return_type:  detail.return_type || 'partial',
+        is_return:    !!detail.is_return,
         tax_pct:      detail.tax_pct || 0,
         discount_amt: detail.discount_amt || 0,
         notes:        detail.notes || '',
@@ -136,6 +137,7 @@ export default function CreditNotes() {
         date:         form.date,
         reason:       form.reason,
         return_type:  form.return_type,
+        is_return:    !!form.is_return,
         tax_pct:      parseFloat(form.tax_pct) || 0,
         discount_amt: parseFloat(form.discount_amt) || 0,
         notes:        form.notes,
@@ -165,7 +167,7 @@ export default function CreditNotes() {
 
   const resetForm = () => setForm({
     customer_id: '', invoice_id: '', date: today(),
-    reason: '', return_type: 'partial',
+    reason: '', return_type: 'partial', is_return: false,
     tax_pct: 0, discount_amt: 0, notes: '',
     lines: [emptyLine()],
   })
@@ -317,6 +319,7 @@ export default function CreditNotes() {
                   <td style={{ padding: '10px 14px', fontSize: 12 }}>{n.date}</td>
                   <td style={{ padding: '10px 14px', fontSize: 12 }}>
                     {n.return_type === 'full' ? '🔴 كامل' : '🟡 جزئي'}
+                    {n.is_return && <span title="مرتجع بضاعة فعلي — يرجّع المخزون" style={{ marginRight: 4 }}>🔄</span>}
                   </td>
                   <td style={{ padding: '10px 14px', fontWeight: 700, fontSize: 13 }}>{egp(n.total)}</td>
                   <td style={{ padding: '10px 14px' }}><StatusPill status={n.status} /></td>
@@ -358,6 +361,7 @@ export default function CreditNotes() {
               { label: 'الفاتورة المرجعية', val: selected.invoice_code || '—' },
               { label: 'التاريخ', val: selected.date },
               { label: 'نوع المرتجع', val: selected.return_type === 'full' ? 'مرتجع كامل' : 'مرتجع جزئي' },
+              { label: 'مرتجع بضاعة فعلي', val: selected.is_return ? '🔄 نعم — يرجّع المخزون' : 'لا (تسوية مالية فقط)' },
               { label: 'الحالة', val: <StatusPill status={selected.status} /> },
               { label: 'سبب الإشعار', val: selected.reason || '—' },
               { label: 'ضريبة', val: `${selected.tax_pct}%` },
@@ -503,6 +507,24 @@ export default function CreditNotes() {
                 <option value="full">مرتجع كامل</option>
               </select>
             </div>
+            {/* Is Return (Sales Return) */}
+            <div style={{ display: 'flex', alignItems: 'flex-end', paddingBottom: 8 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13,
+                fontWeight: 700, color: '#374151', cursor: 'pointer' }}>
+                <input type="checkbox" checked={!!form.is_return}
+                  onChange={e => setForm(f => ({ ...f, is_return: e.target.checked }))}
+                  style={{ width: 16, height: 16 }}/>
+                🔄 مرتجع بضاعة فعلي (Sales Return)
+              </label>
+            </div>
+            {form.is_return && (
+              <div style={{ gridColumn: '1 / -1', background: '#FFFBEB', border: '1px solid #FDE68A',
+                borderRadius: 8, padding: '8px 12px', fontSize: 12, color: '#92400E' }}>
+                ℹ️ لما تفعّل ده، الإصدار هيرجّع البضاعة فعليًا للمخزون ويعكس تكلفتها — لكن ده بيشتغل بس
+                لو الفاتورة المرجعية صادرة من أمر إنتاج (تصنيع معدة)، ولو بنود الإشعار مرتبطة ببنود
+                الفاتورة الأصلية (استخدم خيار "← مرتجع كامل من فاتورة" بدل الإدخال اليدوي لضمان الربط).
+              </div>
+            )}
             {/* Reason */}
             <div style={{ gridColumn: '1 / -1' }}>
               <label style={{ fontSize: 12, fontWeight: 700, color: '#374151', display: 'block', marginBottom: 5 }}>سبب الإشعار</label>

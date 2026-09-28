@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.api.auth import require_any
 from app.models.models import (
-    CreditNote, CreditNoteLine, Customer, Invoice, InvoiceLine,
+    CreditNote, CreditNoteLine, Customer, Invoice, InvoiceLine, WorkOrder, Material,
 )
 
 router = APIRouter(
@@ -45,6 +45,9 @@ class CNIn(BaseModel):
     date:         date
     reason:       Optional[str] = None
     return_type:  str = "partial"
+    # مرتجع بضاعة فعلي (Sales Return) — يرجّع رصيد المخزون ويعكس تكلفة
+    # البضاعة المباعة عند الإصدار، بخلاف إشعار دائن تسوية سعر/خطأ فاتورة.
+    is_return:    bool = False
     tax_pct:      Decimal = Decimal("0")
     discount_amt: Decimal = Decimal("0")
     notes:        Optional[str] = None
@@ -52,6 +55,28 @@ class CNIn(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+async def _restock_qty_for_wo_invoice(db: AsyncSession, cn: CreditNote, inv: Invoice) -> Decimal:
+    """
+    لو الفاتورة صادرة مباشرة من أمر إنتاج (work_order_to_invoice)، بترجّع
+    الكمية اللي المفروض ترجع لمخزون تام الصنع (FG-{wo.code}) — مجموع كميات
+    بنود الإشعار المرتبطة ببند الفاتورة، بحد أقصى الكمية الأصلية المنتَجة.
+    لأي حالة تانية (فاتورة مش من أمر إنتاج، أو مفيش رصيد FG أصلاً) بترجّع صفر —
+    مفيش رابط مخزون معروف للمنتج المُباع فنسيبه من غير أي أثر مخزني (سلوك
+    موثّق، مش خطأ).
+    """
+    if not inv.work_order_id:
+        return Decimal("0")
+    wo = await db.get(WorkOrder, inv.work_order_id)
+    if not wo:
+        return Decimal("0")
+    qty = sum((Decimal(str(l.qty)) for l in (cn.lines or []) if l.invoice_line_id), Decimal("0"))
+    if qty <= 0:
+        return Decimal("0")
+    return min(qty, wo.quantity or qty)
+
+
+
 
 async def _next_code(db: AsyncSession) -> str:
     count = await db.scalar(select(func.count()).select_from(CreditNote))
@@ -76,6 +101,7 @@ def _cn_dict(c: CreditNote) -> dict:
         "date": str(c.date),
         "reason": c.reason,
         "return_type": c.return_type,
+        "is_return": bool(c.is_return),
         "subtotal": float(c.subtotal),
         "tax_pct": float(c.tax_pct),
         "tax_amount": float(c.tax_amount),
@@ -184,6 +210,7 @@ async def create_credit_note(data: CNIn, db: AsyncSession = Depends(get_db)):
         date=data.date,
         reason=data.reason,
         return_type=data.return_type,
+        is_return=data.is_return,
         tax_pct=data.tax_pct,
         tax_amount=tax_amount,
         discount_amt=data.discount_amt,
@@ -251,6 +278,7 @@ async def update_credit_note(cn_id: int, data: CNIn, db: AsyncSession = Depends(
     cn.date = data.date
     cn.reason = data.reason
     cn.return_type = data.return_type
+    cn.is_return = data.is_return
     cn.tax_pct = data.tax_pct
     cn.tax_amount = tax_amount
     cn.discount_amt = data.discount_amt
@@ -323,6 +351,7 @@ async def credit_note_from_invoice(invoice_id: int, db: AsyncSession = Depends(g
         invoice_id=inv.id,
         date=date.today(),
         return_type="full",
+        is_return=True,
         reason=f"مرتجع كامل للفاتورة {inv.code}",
         tax_pct=inv.tax_pct,
         tax_amount=inv.tax_amount,
@@ -362,10 +391,11 @@ async def credit_note_from_invoice(invoice_id: int, db: AsyncSession = Depends(g
 
 @router.patch("/{cn_id}/issue")
 async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
-    """إصدار الإشعار — يُخفّض رصيد العميل"""
+    """إصدار الإشعار — يُخفّض رصيد العميل، ولو مرتجع بضاعة فعلي (is_return)
+    يرجّع رصيد المخزون ويعكس تكلفة البضاعة المباعة أيضاً."""
     res = await db.execute(
         select(CreditNote)
-        .options(selectinload(CreditNote.customer))
+        .options(selectinload(CreditNote.customer), selectinload(CreditNote.lines))
         .where(CreditNote.id == cn_id)
     )
     cn = res.scalar_one_or_none()
@@ -401,23 +431,58 @@ async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
     cn.issued_at = datetime.utcnow()
 
     from app.core.database import current_tenant_id as _ctid_cni
-    from app.services.auto_journal import journal_credit_note_issue
+    from app.services.auto_journal import journal_credit_note_issue, journal_cogs_reversal
     await journal_credit_note_issue(
         db, _ctid_cni.get() or 1, cn.id, cn.code,
         Decimal(str(cn.tax_amount or 0)), Decimal(str(cn.total)), cn.date,
     )
 
+    # مرتجع بضاعة فعلي: رجّع الكمية لمخزون تام الصنع واعكس قيد التكلفة —
+    # نفس النمط المستخدم في work_order_to_invoice/delivery_orders عند البيع،
+    # بس بالعكس. لو الفاتورة مش صادرة من أمر إنتاج (مفيش FG معروف) بيرجع صفر
+    # ومفيش أي أثر مخزني — سلوك موثّق ومقصود، مش خطأ.
+    restocked_qty = Decimal("0")
+    if cn.is_return and cn.invoice_id:
+        inv = await db.get(Invoice, cn.invoice_id)
+        if inv and inv.work_order_id:
+            restock_qty = await _restock_qty_for_wo_invoice(db, cn, inv)
+            if restock_qty > 0:
+                from app.services.inventory_ledger import get_or_create_warehouse_bin, post_receipt
+                wo = await db.get(WorkOrder, inv.work_order_id)
+                fg_mat = (await db.execute(
+                    select(Material).where(
+                        Material.tenant_id == (_ctid_cni.get() or 1),
+                        Material.code == f"FG-{wo.code}",
+                    )
+                )).scalar_one_or_none()
+                if fg_mat:
+                    unit_cost = fg_mat.unit_cost or Decimal("0")
+                    fg_bin = await get_or_create_warehouse_bin(db, _ctid_cni.get() or 1, "FG")
+                    await post_receipt(
+                        db, material=fg_mat, qty=restock_qty, unit_cost=unit_cost,
+                        source_doc_type="credit_note_return", source_doc_id=cn.id,
+                        destination_location_id=fg_bin.id,
+                        reference=cn.code, notes=f"مرتجع بضاعة — إشعار دائن {cn.code}",
+                    )
+                    restocked_qty = restock_qty
+                    await journal_cogs_reversal(
+                        db, _ctid_cni.get() or 1, cn.id, cn.code,
+                        restock_qty * unit_cost, cn.date,
+                    )
+
     await db.commit()
     return {"id": cn_id, "status": "issued", "total": float(cn.total),
-            "applied_to_invoice": float(applied_to_invoice)}
+            "applied_to_invoice": float(applied_to_invoice),
+            "restocked_qty": float(restocked_qty)}
 
 
 @router.patch("/{cn_id}/cancel")
 async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
-    """إلغاء الإشعار — يُعيد رصيد العميل إن كان صادراً"""
+    """إلغاء الإشعار — يُعيد رصيد العميل إن كان صادراً، ولو مرتجع بضاعة فعلي
+    (is_return) يسحب الكمية اللي رجعت المخزون تاني ويعكس قيد عكس التكلفة."""
     res = await db.execute(
         select(CreditNote)
-        .options(selectinload(CreditNote.customer))
+        .options(selectinload(CreditNote.customer), selectinload(CreditNote.lines))
         .where(CreditNote.id == cn_id)
     )
     cn = res.scalar_one_or_none()
@@ -447,11 +512,41 @@ async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
                         inv.status = "unpaid"
 
         from app.core.database import current_tenant_id as _ctid_cnc
-        from app.services.auto_journal import journal_credit_note_cancel
+        from app.services.auto_journal import journal_credit_note_cancel, journal_cogs
         await journal_credit_note_cancel(
             db, _ctid_cnc.get() or 1, cn.id, cn.code,
             Decimal(str(cn.tax_amount or 0)), Decimal(str(cn.total)), cn.date,
         )
+
+        # عكس المرتجع الفعلي (لو كان is_return وارجع مخزون عند الإصدار):
+        # اسحب نفس الكمية تاني من FG واعكس قيد عكس-التكلفة (يعني رجّع COGS
+        # الأصلي) — بالظبط عكس ما حصل في issue_credit_note.
+        if cn.is_return and cn.invoice_id:
+            inv = await db.get(Invoice, cn.invoice_id)
+            if inv and inv.work_order_id:
+                restock_qty = await _restock_qty_for_wo_invoice(db, cn, inv)
+                if restock_qty > 0:
+                    from app.services.inventory_ledger import get_or_create_warehouse_bin, post_issue
+                    wo = await db.get(WorkOrder, inv.work_order_id)
+                    fg_mat = (await db.execute(
+                        select(Material).where(
+                            Material.tenant_id == (_ctid_cnc.get() or 1),
+                            Material.code == f"FG-{wo.code}",
+                        )
+                    )).scalar_one_or_none()
+                    if fg_mat and (fg_mat.stock_qty or Decimal("0")) >= restock_qty:
+                        unit_cost = fg_mat.unit_cost or Decimal("0")
+                        fg_bin = await get_or_create_warehouse_bin(db, _ctid_cnc.get() or 1, "FG")
+                        await post_issue(
+                            db, material=fg_mat, qty=restock_qty, unit_cost=unit_cost,
+                            source_doc_type="credit_note_cancel", source_doc_id=cn.id,
+                            source_location_id=fg_bin.id,
+                            reference=cn.code, notes=f"إلغاء مرتجع بضاعة — إشعار دائن {cn.code}",
+                        )
+                        await journal_cogs(
+                            db, _ctid_cnc.get() or 1, cn.id, cn.code,
+                            restock_qty * unit_cost, cn.date,
+                        )
 
     cn.status = "cancelled"
     await db.commit()

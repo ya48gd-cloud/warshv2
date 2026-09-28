@@ -640,3 +640,23 @@ async def journal_cogs(
             {"account_code": "1330", "side": "credit", "amount": amount},
         ]
     )
+
+
+async def journal_cogs_reversal(
+    db: AsyncSession, tenant_id: int, credit_note_id: int,
+    cn_code: str, amount: Decimal, cn_date: date,
+):
+    """عكس تكلفة بضاعة مباعة عند مرتجع فعلي (إشعار دائن بضاعة تام الصنع
+    رجعت للمخزون) — قيد جديد مستقل مرتبط بالإشعار، مش تعديل على قيد
+    البيع الأصلي (نفس أسلوب journal_credit_note_issue مقابل الفاتورة)."""
+    if amount <= 0:
+        return
+    await _post_entry(
+        db, tenant_id, cn_date,
+        f"عكس تكلفة بضاعة مباعة — مرتجع: {cn_code}",
+        cn_code, "cogs_reversal", credit_note_id,
+        [
+            {"account_code": "1330", "side": "debit",  "amount": amount},
+            {"account_code": "5100", "side": "credit", "amount": amount},
+        ]
+    )

@@ -768,6 +768,112 @@ async def test_work_order_to_invoice_blocked_when_not_yet_produced(cli):
     assert "FG" in r.json()["detail"] or "تام الصنع" in r.json()["detail"]
 
 
+CN_BASE_PIPE = "/api/v1/credit-notes"
+
+
+@pytest.mark.asyncio
+async def test_credit_note_is_return_restocks_fg_and_reverses_cogs(cli):
+    """
+    مرتجع بضاعة فعلي (is_return=True) على فاتورة صادرة من أمر إنتاج لازم:
+    (1) يرجّع الكمية لمخزون تام الصنع (FG-{code})، (2) يعكس قيد تكلفة البضاعة
+    المباعة الأصلي. إلغاء الإشعار بعد كده لازم يسحب الكمية تاني ويرجّع القيد.
+    """
+    eq_id = await _make_equipment(cli)
+    cust_id = await _make_customer(cli)
+    quot = await _make_quotation(cli, cust_id, unit_price=1000, qty=2)
+    order_id = (await cli.post(f"/api/v1/sales/quotations/{quot['id']}/to-order", json={})).json()["id"]
+    wo_r = (await cli.post(f"/api/v1/sales/orders/{order_id}/to-work-order", json={
+        "equipment_id": eq_id, "quantity": 2, "quantity_unit": "وحدة",
+        "start_date": str(date.today()),
+    })).json()
+    wo_id, wo_code = wo_r["id"], wo_r["code"]
+    await cli.post(f"{COA}/chart/seed")
+    await cli.post(f"{ACC}/cost-lines", json={
+        "work_order_id": wo_id, "cost_type": "material",
+        "description": "صاج", "qty": 2, "unit_cost": 150,
+    })
+    await cli.post(f"{PROD}/complete/{wo_id}")
+
+    inv_r = await cli.post(f"/api/v1/sales/work-orders/{wo_id}/to-invoice", json={})
+    assert inv_r.status_code == 201, inv_r.text
+    inv_id = inv_r.json()["id"]
+
+    def _fg_stock(mats):
+        return next(m for m in mats if m["code"] == f"FG-{wo_code}")
+
+    mats_after_sale = (await cli.get("/api/v1/inventory/materials")).json()
+    assert float(_fg_stock(mats_after_sale)["stock_qty"]) == 0.0  # اتباع بالكامل
+
+    before_bal = await _trial_balance_map(cli)
+    cogs_before = float(before_bal.get("5100", {}).get("total_debit", 0))
+
+    cn_r = await cli.post(CN_BASE_PIPE, json={
+        "customer_id": cust_id, "invoice_id": inv_id, "date": str(date.today()),
+        "return_type": "full", "is_return": True,
+        "lines": [{"invoice_line_id": None, "description": "مرتجع", "qty": 2, "unit": "وحدة", "unit_price": 500}],
+    })
+    assert cn_r.status_code == 201, cn_r.text
+    cn_id = cn_r.json()["id"]
+
+    # لازم بند الإشعار يترتبط ببند الفاتورة عشان يترجع للمخزون — هات بند
+    # الفاتورة الوحيد وحدّث الإشعار بيه
+    inv_detail = (await cli.get(f"/api/v1/sales/invoices/{inv_id}")).json()
+    inv_line_id = inv_detail["lines"][0]["id"]
+    upd = await cli.put(f"{CN_BASE_PIPE}/{cn_id}", json={
+        "customer_id": cust_id, "invoice_id": inv_id, "date": str(date.today()),
+        "return_type": "full", "is_return": True,
+        "lines": [{"invoice_line_id": inv_line_id, "description": "مرتجع", "qty": 2, "unit": "وحدة", "unit_price": 500}],
+    })
+    assert upd.status_code == 200, upd.text
+
+    issue_r = await cli.patch(f"{CN_BASE_PIPE}/{cn_id}/issue")
+    assert issue_r.status_code == 200, issue_r.text
+    assert issue_r.json()["restocked_qty"] == 2.0
+
+    mats_after_return = (await cli.get("/api/v1/inventory/materials")).json()
+    assert float(_fg_stock(mats_after_return)["stock_qty"]) == 2.0, "FG stock must come back on a real return"
+
+    after_bal = await _trial_balance_map(cli)
+    cogs_after = float(after_bal.get("5100", {}).get("total_debit", 0))
+    cogs_credit_after = float(after_bal.get("5100", {}).get("total_credit", 0))
+    assert cogs_after == cogs_before, "no new COGS debit should be posted on a return"
+    assert cogs_credit_after > 0, "a COGS reversal (credit to 5100) must be posted"
+
+    # إلغاء الإشعار يسحب الكمية تاني ويرجّع قيد التكلفة
+    cancel_r = await cli.patch(f"{CN_BASE_PIPE}/{cn_id}/cancel")
+    assert cancel_r.status_code == 200, cancel_r.text
+
+    mats_after_cancel = (await cli.get("/api/v1/inventory/materials")).json()
+    assert float(_fg_stock(mats_after_cancel)["stock_qty"]) == 0.0, "cancelling the return must pull the stock back out"
+
+    final_bal = await _trial_balance_map(cli)
+    assert float(final_bal.get("5100", {}).get("total_debit", 0)) > cogs_before, (
+        "cancelling the return must re-post the original COGS"
+    )
+
+
+@pytest.mark.asyncio
+async def test_credit_note_is_return_noop_when_invoice_not_from_work_order(cli):
+    """مرتجع بضاعة (is_return=True) على فاتورة عادية (مش من أمر إنتاج) —
+    مفيش رابط مخزون معروف، فمفروض يعدي بسلام من غير أي أثر مخزني."""
+    cust_id = await _make_customer(cli)
+    inv_r = await cli.post("/api/v1/sales/invoices", json={
+        "customer_id": cust_id, "date": str(date.today()),
+        "lines": [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 300.0}],
+    })
+    inv_id = inv_r.json()["id"]
+
+    cn_r = await cli.post(CN_BASE_PIPE, json={
+        "customer_id": cust_id, "invoice_id": inv_id, "date": str(date.today()),
+        "return_type": "full", "is_return": True,
+        "lines": [{"description": "مرتجع", "qty": 1, "unit": "قطعة", "unit_price": 300.0}],
+    })
+    cn_id = cn_r.json()["id"]
+    issue_r = await cli.patch(f"{CN_BASE_PIPE}/{cn_id}/issue")
+    assert issue_r.status_code == 200, issue_r.text
+    assert issue_r.json()["restocked_qty"] == 0.0
+
+
 # ═══════════════════════════════════════════════════════════════
 # محطة 24 — استكشاف: استلام أمر شراء (create_invoice=True) — هل بيترحّل محاسبيًا؟
 # ═══════════════════════════════════════════════════════════════

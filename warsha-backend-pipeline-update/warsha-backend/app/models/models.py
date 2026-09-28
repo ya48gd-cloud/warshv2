@@ -2001,6 +2001,10 @@ class CreditNote(Base):
     reason:       Mapped[Optional[str]]  = mapped_column(String(200), nullable=True)
     # full | partial
     return_type:  Mapped[str]            = mapped_column(String(20), default="partial")
+    # هل الإشعار ده فعليًا مرتجع بضاعة حقيقي (البضاعة رجعت المخزون) — بخلاف
+    # إشعار دائن بيبقى تسوية سعر/خصم/خطأ فاتورة من غير أي حركة بضاعة فعلية.
+    # الاسم الشائع في أنظمة ERP لنفس المفهوم: "Sales Return" (مرتجع مبيعات).
+    is_return:    Mapped[bool]           = mapped_column(Boolean, default=False)
     subtotal:     Mapped[Decimal]        = mapped_column(Numeric(14,2), default=0)
     tax_pct:      Mapped[Decimal]        = mapped_column(Numeric(5,2),  default=0)
     tax_amount:   Mapped[Decimal]        = mapped_column(Numeric(14,2), default=0)
