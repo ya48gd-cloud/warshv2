@@ -170,7 +170,7 @@ function BarInput({ material, form, setForm }) {
       <div className="text-xs font-semibold" style={{ color: 'var(--teal)' }}>
         حديد بالطول — الوزن والتكلفة يحسبان تلقائياً
       </div>
-      <div className="grid gap-2" style={{ gridTemplateColumns: '1fr 1fr 1fr 1fr' }}>
+      <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))' }}>
         <div>
           <label className="field-label text-[11px]">عدد القطع</label>
           <input className="field-input text-sm text-center" type="number" step="1" min="1"
@@ -199,9 +199,11 @@ function BarInput({ material, form, setForm }) {
         </div>
       </div>
       <div className="grid gap-2" style={{ gridTemplateColumns: '1fr 1fr' }}>
-        <input className="field-input text-sm font-semibold" type="number" step="0.001"
+        <input className="field-input text-sm font-semibold" type="number" step="0.001" min="0"
+          placeholder="الوزن (كجم)" title="الوزن (كجم)" aria-label="الوزن (كجم)"
           value={form.qty || ''} onChange={e => setForm(f => ({ ...f, qty: e.target.value }))} />
-        <input className="field-input text-sm font-semibold" type="number" step="0.01"
+        <input className="field-input text-sm font-semibold" type="number" step="0.01" min="0"
+          placeholder="سعر الوحدة (ج/كجم)" title="سعر الوحدة (ج/كجم)" aria-label="سعر الوحدة (ج/كجم)"
           value={form.unit_cost || ''} onChange={e => setForm(f => ({ ...f, unit_cost: e.target.value }))} />
       </div>
     </div>
@@ -370,6 +372,14 @@ export default function BOM() {
 
   const viewEq = useMemo(() => allEqs?.find(e => String(e.id) === String(viewEqId)), [allEqs, viewEqId])
   const isMetricView = viewEq?.length_min != null
+  // طول خارج النطاق (أو أثناء الكتابة) كان بيضرب الـ API مع كل ضغطة زر ويرجّع 400 → toast خطأ متكرر.
+  // نتحقق محلياً بنفس قاعدة الباك-إند (length_min <= L <= length_max) قبل الاستدعاء.
+  const viewLengthNum = Number(viewLength)
+  const viewLengthInvalid = isMetricView && viewLength !== '' && (
+    !Number.isFinite(viewLengthNum) || viewLengthNum <= 0 ||
+    (viewEq?.length_min != null && viewLengthNum < Number(viewEq.length_min)) ||
+    (viewEq?.length_max != null && viewLengthNum > Number(viewEq.length_max))
+  )
 
   useEffect(() => {
     setViewLength(viewEq?.length_min != null ? String(viewEq.length_min) : '')
@@ -378,8 +388,8 @@ export default function BOM() {
   const { data: bomData, loading: bomLoading, reload: reloadBom } = useApi(
     () => {
       if (!viewEqId) return Promise.resolve(null)
-      if (isMetricView && viewLength !== '') {
-        return api.get(`/equipment/${viewEqId}/bom/parametric-length?length=${viewLength}`)
+      if (isMetricView && viewLength !== '' && !viewLengthInvalid) {
+        return api.get(`/equipment/${viewEqId}/bom/parametric-length?length=${encodeURIComponent(viewLength)}`)
       }
       return api.get(`/equipment/${viewEqId}/bom/cost`).catch(() =>
         api.equipment.bom(viewEqId).then(lines => ({
@@ -387,7 +397,7 @@ export default function BOM() {
           total_cost: lines.reduce((s, l) => s + Number(l.total_cost || 0), 0)
         })))
     },
-    [viewEqId, isMetricView, viewLength]
+    [viewEqId, isMetricView, viewLength, viewLengthInvalid]
   )
 
   const emptyForm = () => ({
@@ -432,6 +442,14 @@ export default function BOM() {
     if (!form.material_id) { toast('اختر المادة',             'error'); return }
     if (!form.qty || Number(form.qty) <= 0) { toast('الكمية (الوزن) مطلوبة', 'error'); return }
     if (form.unit_cost && Number(form.unit_cost) < 0) { toast('سعر الوحدة لا يمكن أن يكون سالباً', 'error'); return }
+    if ((isPlateMode || isBarMode) && (!Number.isInteger(Number(form.dim_count || 1)) || Number(form.dim_count || 1) < 1)) {
+      toast('العدد يجب أن يكون رقماً صحيحاً أكبر من صفر', 'error'); return
+    }
+    if (form.waste_g && Number(form.waste_g) < 0) { toast('الهالك لا يمكن أن يكون سالباً', 'error'); return }
+    if (isPlateMode && ((form.plate_length_cm && Number(form.plate_length_cm) <= 0) || (form.plate_width_cm && Number(form.plate_width_cm) <= 0))) {
+      toast('أبعاد اللوح يجب أن تكون أكبر من صفر', 'error'); return
+    }
+    if (isBarMode && form.bar_length_cm && Number(form.bar_length_cm) <= 0) { toast('طول القطعة يجب أن يكون أكبر من صفر', 'error'); return }
 
     const payload = {
       equipment_id: Number(addEqId),
@@ -457,11 +475,13 @@ export default function BOM() {
     await api.post('/equipment/bom', payload)
     toast('تمت إضافة سطر BOM')
     setForm(emptyForm())
-    if (viewEqId === addEqId) reloadBom()
+    // العارض يعرض الشجرة كاملة (المعدة الرئيسية + كل مكوّناتها) — إضافة سطر لمكوّن فرعي
+    // كانت بتسيب الجدول قديم لأن الشرط كان مساواة المعدة الرئيسية فقط.
+    if (viewEqId) reloadBom()
   })
 
   const [confirmBomId, setConfirmBomId] = useState(null)
-  const [delLine] = useAction(async (id) => {
+  const [delLine, deleting] = useAction(async (id) => {
     await api.delete(`/equipment/bom/${id}`)
     toast('تم الحذف')
     reloadBom()
@@ -491,7 +511,7 @@ export default function BOM() {
         <div className="card">
           <div className="text-sm font-semibold mb-4">+ إضافة سطر BOM</div>
 
-          <div className="grid gap-3 mb-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+          <div className="grid gap-3 mb-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))' }}>
             <div>
               <label className="field-label">المعدة / الوحدة / المكوّن *</label>
               <select className="field-select w-full" value={addEqId}
@@ -522,7 +542,7 @@ export default function BOM() {
             ) : isBarMode ? (
               <BarInput material={selectedMat} form={form} setForm={setForm} />
             ) : (
-              <div className="grid gap-3" style={{ gridTemplateColumns: '1fr 1fr 1fr 1fr' }}>
+              <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))' }}>
                 <div>
                   <label className="field-label">الكمية ({selectedMat?.unit || 'وحدة'}) *</label>
                   <input className="field-input" type="number" step="0.001" min="0.001"
@@ -566,7 +586,7 @@ export default function BOM() {
 
       {/* ── BOM viewer ── */}
       <div className="card p-0 overflow-hidden">
-        <div className="px-4 py-3 border-b border-erp-border flex items-center justify-between gap-4"
+        <div className="px-4 py-3 border-b border-erp-border flex items-center justify-between gap-4 flex-wrap"
              style={{ background: 'var(--bg)' }}>
           <div className="text-sm font-semibold">عرض تفكيك معدة (كامل الشجرة)</div>
           <div className="flex-1 max-w-md">
@@ -589,11 +609,13 @@ export default function BOM() {
                 value={viewLength}
                 onChange={e => setViewLength(e.target.value)}
               />
-              <span className="text-xs text-erp-muted whitespace-nowrap">({viewEq.length_min} - {viewEq.length_max})</span>
+              <span className="text-xs whitespace-nowrap" style={{ color: viewLengthInvalid ? 'var(--red)' : undefined }}>
+                ({viewEq.length_min} - {viewEq.length_max}){viewLengthInvalid ? ' — الطول خارج النطاق، يُعرض BOM القياسي' : ''}
+              </span>
             </div>
           )}
           {viewEqId && (
-            <button className="btn btn-sm flex-shrink-0" onClick={() => api.equipment.printBOM(viewEqId, isMetricView ? viewLength : null)}>
+            <button className="btn btn-sm flex-shrink-0" onClick={() => api.equipment.printBOM(viewEqId, isMetricView && !viewLengthInvalid ? viewLength : null)}>
               🖨️ تقرير تصنيع
             </button>
           )}
@@ -645,7 +667,7 @@ export default function BOM() {
 
       {/* ── ملخص المواد المطلوبة (إجمالي ألواح/أسياخ/قطع) ── */}
       {materialsSummary.length > 0 && (
-        <div className="card p-0 overflow-hidden">
+        <div className="card p-0 overflow-x-auto">
           <div className="px-4 py-3 border-b border-erp-border text-sm font-semibold" style={{ background: 'var(--bg)' }}>
             ملخص المواد المطلوبة (الإجمالي)
           </div>
@@ -682,7 +704,7 @@ export default function BOM() {
                     )}
                     {m.remnant_covered > 0 && (
                       <div className="text-xs text-erp-muted font-normal">
-                        (منها {m.remnant_covered} {m.unit_label.replace('كامل', '').trim()} متاح من النسالة)
+                        (منها {m.remnant_covered} {(m.unit_label || '').replace('كامل', '').trim()} متاح من النسالة)
                       </div>
                     )}
                   </td>
@@ -696,7 +718,7 @@ export default function BOM() {
       <ConfirmDialog
         open={!!confirmBomId}
         message="هل تريد حذف هذا السطر من BOM نهائياً؟"
-        onConfirm={() => { delLine(confirmBomId); setConfirmBomId(null) }}
+        onConfirm={() => { if (!deleting) delLine(confirmBomId); setConfirmBomId(null) }}
         onCancel={() => setConfirmBomId(null)}
       />
     </div>

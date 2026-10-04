@@ -91,15 +91,18 @@ export default function EquipmentPipeline() {
 
   const [q, setQ] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
-  const { data: rows, loading, reload } = useApi(() => api.production.pipeline(searchTerm), [searchTerm])
+  const { data: rowsRaw, loading, error: loadError, reload } = useApi(() => api.production.pipeline(searchTerm), [searchTerm])
+  const rows = Array.isArray(rowsRaw) ? rowsRaw : []
   const [expandedId, setExpandedId] = useState(null)
   const [backfillReport, setBackfillReport] = useState(null)
 
   const [runBackfill, backfilling] = useAction(async (dryRun) => {
+    // التشغيل الفعلي يسجّل حركات WIP/FG — نطلب تأكيداً قبله
+    if (!dryRun && !window.confirm('تشغيل Backfill سيسجّل حركات WIP/FG للأوامر القديمة غير المسجَّلة. هل تريد المتابعة؟')) return null
     const report = await api.production.pipelineBackfill(dryRun)
     setBackfillReport(report)
     if (!dryRun) {
-      toast(`تم: ${report.wip_created.length} WIP + ${report.fg_created.length} FG، وتخطّي ${report.skipped.length}`)
+      toast(`تم: ${report?.wip_created?.length ?? 0} WIP + ${report?.fg_created?.length ?? 0} FG، وتخطّي ${report?.skipped?.length ?? 0}`)
       reload()
     }
     return report
@@ -107,7 +110,7 @@ export default function EquipmentPipeline() {
 
   const onSearch = (e) => {
     e.preventDefault()
-    setSearchTerm(q)
+    setSearchTerm(q.trim())
   }
 
   return (
@@ -132,9 +135,9 @@ export default function EquipmentPipeline() {
       {backfillReport && (
         <div className="card text-sm">
           <div className="flex gap-6 flex-wrap">
-            <div>سيتم/تم تسجيل WIP: <b>{backfillReport.wip_created.length}</b></div>
-            <div>سيتم/تم تسجيل FG: <b>{backfillReport.fg_created.length}</b></div>
-            <div>تم تخطّيه (مسجَّل بالفعل): <b>{backfillReport.skipped.length}</b></div>
+            <div>سيتم/تم تسجيل WIP: <b>{backfillReport.wip_created?.length ?? 0}</b></div>
+            <div>سيتم/تم تسجيل FG: <b>{backfillReport.fg_created?.length ?? 0}</b></div>
+            <div>تم تخطّيه (مسجَّل بالفعل): <b>{backfillReport.skipped?.length ?? 0}</b></div>
             {backfillReport.dry_run && <span className="badge badge-gray">مراجعة فقط — لم يُعدَّل شيء بعد</span>}
           </div>
         </div>
@@ -170,7 +173,7 @@ export default function EquipmentPipeline() {
                 </tr>
               </thead>
               <tbody>
-                {(rows || []).map(row => (
+                {rows.map(row => (
                   <PipelineRow
                     key={row.work_order_id}
                     row={row}
@@ -178,8 +181,12 @@ export default function EquipmentPipeline() {
                     onToggle={() => setExpandedId(id => id === row.work_order_id ? null : row.work_order_id)}
                   />
                 ))}
-                {(!rows || rows.length === 0) && (
-                  <tr><td colSpan={10} className="text-center text-erp-muted py-4">لا توجد أوامر إنتاج مطابقة</td></tr>
+                {rows.length === 0 && (
+                  <tr><td colSpan={10} className="text-center text-erp-muted py-4">
+                    {loadError
+                      ? <>تعذّر تحميل البيانات: {loadError} <button type="button" className="btn btn-sm mr-2" onClick={reload}>إعادة المحاولة</button></>
+                      : 'لا توجد أوامر إنتاج مطابقة'}
+                  </td></tr>
                 )}
               </tbody>
             </table>

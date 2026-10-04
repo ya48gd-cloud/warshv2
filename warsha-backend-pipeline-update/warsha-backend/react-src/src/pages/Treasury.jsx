@@ -9,12 +9,15 @@ import { Input, Select, Textarea, FormGrid } from '../components/ui/Field'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
 import { PageSpinner } from '../components/ui/Spinner'
 
+// أقصى مبلغ يتسع له عمود Numeric(14, 2) في الباك إند (_MAX_AMOUNT)
+const MAX_AMOUNT = 999999999999.99
+
 export default function Treasury() {
   const toast = useToast()
   const { canWrite } = useAuth()
   const write = canWrite('accounting')
 
-  const { data: summary, loading, reload } = useApi(() => api.treasury.summary())
+  const { data: summary, loading, error: summaryError, reload } = useApi(() => api.treasury.summary())
   const { data: txns, reload: reloadTxns } = useApi(() => api.treasury.transactions().catch(bgErr('حركات الخزينة', [])))
   const { data: cats, reload: reloadCats } = useApi(() => api.treasury.categories().catch(bgErr('فئات الخزينة', [])))
   const { data: cheques, reload: reloadCheques } = useApi(() => api.treasury.cheques().catch(bgErr('الشيكات', [])))
@@ -39,8 +42,15 @@ export default function Treasury() {
   const [trForm, setTrForm] = useState({})
   const [newCat, setNewCat] = useState({ name: '', flow: 'out' })
   const [confirmCatDel, setConfirmCatDel] = useState(null)
+  // تأكيد تغيير حالة شيك (تحصيل/مرتجع) — المرتجع بيعكس أثره على رصيد الخزنة والقيود
+  const [confirmCheque, setConfirmCheque] = useState(null)   // { id, status, number, amount }
+  const [chequeBusyId, setChequeBusyId] = useState(null)
 
   const treasuries = summary?.treasuries || []
+  // الباك إند بيرفض تسجيل حركات على خزنة معطّلة (is_active=false) — نخفيها من
+  // قوائم الاختيار في المودالات فقط (مع الإبقاء على الخزنة المختارة حالياً وقت التعديل)
+  const selectableTreasuries = (keepId) => treasuries.filter(t =>
+    t.is_active !== false || (keepId != null && keepId !== '' && String(t.id) === String(keepId)))
 
   const filtered = useMemo(() => {
     let list = txns || []
@@ -66,7 +76,7 @@ export default function Treasury() {
       cheque_bank: t.cheque_bank || '',
     })
     setEditingTxnId(t.id)
-    setEditingOriginal({ treasury_id: t.treasury_id, direction: t.direction, amount: t.amount })
+    setEditingOriginal({ treasury_id: t.treasury_id, direction: t.direction, amount: t.amount, cheque_status: t.cheque_status })
     setTxnModal(t.direction)
   }
 
@@ -97,15 +107,43 @@ export default function Treasury() {
   // التحقق قبل فتح التأكيد
   const requestSaveTxn = () => {
     if (!form.treasury_id) { toast('اختر الخزنة', 'error'); return }
-    if (!form.amount || Number(form.amount) <= 0) { toast('أدخل مبلغ صحيح', 'error'); return }
-    if (form.payment_method === 'cheque' && (!form.cheque_number || !form.cheque_date)) {
+    const amt = Number(form.amount)
+    if (!form.amount || !Number.isFinite(amt) || amt <= 0) { toast('أدخل مبلغ صحيح', 'error'); return }
+    if (amt > MAX_AMOUNT) { toast('المبلغ أكبر من الحد المسموح', 'error'); return }
+    if (form.payment_method === 'cheque' && (!String(form.cheque_number || '').trim() || !form.cheque_date)) {
       toast('أدخل رقم الشيك وتاريخ الاستحقاق', 'error'); return
+    }
+    // نفس قاعدة الباك إند: الصرف لا يتجاوز رصيد الخزنة (مع إضافة مبلغ الحركة الأصلية
+    // لو بنعدّل مصروف قائم على نفس الخزنة)
+    // الباك إند مابيفحصش الرصيد عند تعديل شيك ملغي/مرتجع (أثره معكوس أصلاً ومش هيتطبق تاني)
+    const origInactive = editingOriginal && ['bounced', 'cancelled'].includes(editingOriginal.cheque_status)
+    if (txnModal === 'out' && !origInactive) {
+      const sel = treasuries.find(t => String(t.id) === String(form.treasury_id))
+      if (sel) {
+        const isEditingSameOut = editingOriginal
+          && String(editingOriginal.treasury_id) === String(form.treasury_id)
+          && editingOriginal.direction === 'out'
+        const available = Number(sel.balance || 0) + (isEditingSameOut ? Number(editingOriginal.amount || 0) : 0)
+        if (amt > available + 0.0001) {
+          toast(`المبلغ (${egp(amt)}) أكبر من الرصيد المتاح في الخزنة (${egp(available)})`, 'error'); return
+        }
+      }
     }
     setConfirmTxn(true)
   }
 
   const [saveTreasury, savingT] = useAction(async () => {
     if (!tForm.name?.trim()) { toast('أدخل اسم الخزنة', 'error'); return }
+    if (tForm.opening_balance !== undefined && tForm.opening_balance !== ''
+        && !Number.isFinite(Number(tForm.opening_balance))) {
+      toast('الرصيد الافتتاحي غير صحيح', 'error'); return
+    }
+    // نفس قاعدة الباك إند (_money allow_zero): الرصيد الافتتاحي لا يكون سالباً ولا يتجاوز الحد
+    if (Number(tForm.opening_balance || 0) < 0) { toast('الرصيد الافتتاحي لا يمكن أن يكون سالباً', 'error'); return }
+    if (Number(tForm.opening_balance || 0) > MAX_AMOUNT) { toast('الرصيد الافتتاحي أكبر من الحد المسموح', 'error'); return }
+    if (treasuries.some(t => (t.name || '').trim() === tForm.name.trim())) {
+      toast('خزنة بنفس الاسم موجودة', 'error'); return
+    }
     await api.treasury.createAccount({
       name: tForm.name.trim(),
       kind: tForm.kind || 'cash',
@@ -117,8 +155,15 @@ export default function Treasury() {
 
   const [doTransfer, transferring] = useAction(async () => {
     if (!trForm.from_treasury_id || !trForm.to_treasury_id) { toast('اختر الخزنتين', 'error'); return }
-    if (trForm.from_treasury_id === trForm.to_treasury_id) { toast('لا يمكن التحويل لنفس الخزنة', 'error'); return }
-    if (!trForm.amount || Number(trForm.amount) <= 0) { toast('أدخل مبلغ صحيح', 'error'); return }
+    if (String(trForm.from_treasury_id) === String(trForm.to_treasury_id)) { toast('لا يمكن التحويل لنفس الخزنة', 'error'); return }
+    const trAmt = Number(trForm.amount)
+    if (!trForm.amount || !Number.isFinite(trAmt) || trAmt <= 0) { toast('أدخل مبلغ صحيح', 'error'); return }
+    if (trAmt > MAX_AMOUNT) { toast('المبلغ أكبر من الحد المسموح', 'error'); return }
+    // نفس قاعدة الباك إند: مبلغ التحويل لا يتجاوز رصيد خزنة المصدر
+    const src = treasuries.find(t => String(t.id) === String(trForm.from_treasury_id))
+    if (src && trAmt > Number(src.balance || 0) + 0.0001) {
+      toast(`رصيد خزنة المصدر (${egp(src.balance)}) أقل من مبلغ التحويل`, 'error'); return
+    }
     await api.treasury.transfer({
       from_treasury_id: Number(trForm.from_treasury_id),
       to_treasury_id: Number(trForm.to_treasury_id),
@@ -131,21 +176,39 @@ export default function Treasury() {
 
   const [addCat, addingCat] = useAction(async () => {
     if (!newCat.name.trim()) { toast('أدخل اسم الفئة', 'error'); return }
+    if ((cats || []).some(c => (c.name || '').trim() === newCat.name.trim())) { toast('الفئة موجودة بالفعل', 'error'); return }
     await api.treasury.createCategory({ name: newCat.name.trim(), flow: newCat.flow })
     toast('تمت إضافة الفئة'); setNewCat({ name: '', flow: 'out' }); reloadCats()
   })
 
-  const [removeTxn] = useAction(async () => {
+  const [removeTxn, removingTxn] = useAction(async () => {
+    if (!deleteTxn?.id) return
     await api.treasury.deleteTxn(deleteTxn.id)
     toast('تم حذف الحركة'); setDeleteTxn(null); reload(); reloadTxns(); reloadCheques()
   })
 
   const [setChequeStatus] = useAction(async (id, status) => {
-    await api.treasury.updateChequeStatus(id, status)
-    toast('تم تحديث حالة الشيك'); reload(); reloadCheques(); reloadTxns()
+    if (chequeBusyId) return   // منع الضغط المزدوج على أزرار الشيك
+    setChequeBusyId(id)
+    try {
+      await api.treasury.updateChequeStatus(id, status)
+      toast('تم تحديث حالة الشيك'); reload(); reloadCheques(); reloadTxns()
+    } finally {
+      setChequeBusyId(null)
+    }
   })
 
-  if (loading) return <PageSpinner />
+  // السبينر الكامل فقط أول تحميل — إعادة التحميل بعد الحفظ ماتخفيش الصفحة كلها
+  if (loading && !summary) return <PageSpinner />
+  // فشل تحميل الملخص: بدل صفحة بأصفار مضللة، نعرض رسالة مع زر إعادة المحاولة
+  if (summaryError && !summary) {
+    return (
+      <div className="card text-center py-8 flex flex-col items-center gap-3">
+        <div className="text-sm" style={{ color: 'var(--red)' }}>تعذّر تحميل بيانات الخزنة: {summaryError}</div>
+        <button className="btn btn-sm" onClick={reload}>إعادة المحاولة</button>
+      </div>
+    )
+  }
 
   const kpis = [
     { label: 'إجمالي الرصيد', val: egp(summary?.total_balance || 0), color: 'var(--teal)' },
@@ -188,7 +251,10 @@ export default function Treasury() {
           <div key={t.id} className="card">
             <div className="flex items-center justify-between">
               <div className="font-semibold text-sm">{t.kind === 'bank' ? '🏦' : '💵'} {t.name}</div>
-              <span className="text-[11px] text-erp-muted">{t.kind === 'bank' ? 'بنك' : 'نقدي'}</span>
+              <span className="text-[11px] text-erp-muted">
+                {t.kind === 'bank' ? 'بنك' : 'نقدي'}
+                {t.is_active === false && <span className="badge mr-1" style={{ background: 'var(--surface-2)', fontSize: 10 }}>معطّلة</span>}
+              </span>
             </div>
             <div className="text-lg font-bold mt-2" style={{ color: 'var(--teal)' }}>{egp(t.balance)}</div>
           </div>
@@ -268,9 +334,9 @@ export default function Treasury() {
                         : 'var(--orange, #b45309)',
                       fontSize: 11,
                     }}>
-                      🧾 شيك #{t.cheque_number}
+                      🧾 شيك #{t.cheque_number || '—'}
                     </span>
-                  ) : (t.payment_method === 'wallet' ? '📱 محفظة' : '💵 نقدي')}
+                  ) : (t.payment_method === 'wallet' ? '📱 محفظة' : t.payment_method === 'other' ? 'أخرى' : '💵 نقدي')}
                 </td>
                 <td className="py-2 px-2 font-semibold" style={{ color: 'var(--green)' }}>
                   {t.direction === 'in' ? egp(t.amount) : ''}
@@ -284,18 +350,19 @@ export default function Treasury() {
                     🖨️
                   </button>
                   {write && t.source === 'manual' && !['cleared','bounced'].includes(t.cheque_status) && (
-                    <button className="btn btn-sm" style={{ marginRight:2 }}
+                    <button className="btn btn-sm" style={{ marginRight:2 }} title="تعديل الحركة"
                       onClick={() => openEditTxn(t)}>✏️</button>
                   )}
                   {write && t.source === 'manual' && (
                     <button className="btn btn-sm" style={{ color: 'var(--red)', marginRight:2 }}
+                      disabled={removingTxn} title="حذف الحركة"
                       onClick={() => setDeleteTxn(t)}>🗑</button>
                   )}
                 </td>
               </tr>
             ))}
             {!filtered.length && (
-              <tr><td colSpan={9} className="text-center text-erp-muted py-6">لا توجد حركات</td></tr>
+              <tr><td colSpan={9} className="text-center text-erp-muted py-6">{txns == null ? 'جارٍ التحميل…' : 'لا توجد حركات'}</td></tr>
             )}
           </tbody>
         </table>
@@ -323,7 +390,7 @@ export default function Treasury() {
                 const overdue = c.cheque_status === 'under_collection' && c.cheque_date && c.cheque_date < today()
                 return (
                   <tr key={c.id} className="border-b" style={{ borderColor: 'var(--border-lt)' }}>
-                    <td className="py-2 px-2 font-mono">{c.cheque_number}</td>
+                    <td className="py-2 px-2 font-mono">{c.cheque_number || '—'}</td>
                     <td className="py-2 px-2">{c.cheque_bank || '—'}</td>
                     <td className="py-2 px-2 whitespace-nowrap" style={{ color: overdue ? 'var(--red)' : undefined, fontWeight: overdue ? 700 : undefined }}>
                       {fmtDate(c.cheque_date)} {overdue && '⚠️ متأخر'}
@@ -357,9 +424,11 @@ export default function Treasury() {
                       {write && c.cheque_status === 'under_collection' && (
                         <>
                           <button className="btn btn-sm" style={{ color: 'var(--green)' }}
-                            onClick={() => setChequeStatus(c.id, 'cleared')}>✅ تحصيل</button>
+                            disabled={chequeBusyId === c.id}
+                            onClick={() => setConfirmCheque({ id: c.id, status: 'cleared', number: c.cheque_number, amount: c.amount })}>✅ تحصيل</button>
                           <button className="btn btn-sm" style={{ color: 'var(--red)', marginRight: 2 }}
-                            onClick={() => setChequeStatus(c.id, 'bounced')}>↩️ مرتجع</button>
+                            disabled={chequeBusyId === c.id}
+                            onClick={() => setConfirmCheque({ id: c.id, status: 'bounced', number: c.cheque_number, amount: c.amount })}>↩️ مرتجع</button>
                         </>
                       )}
                     </td>
@@ -367,7 +436,7 @@ export default function Treasury() {
                 )
               })}
               {!(cheques || []).length && (
-                <tr><td colSpan={9} className="text-center text-erp-muted py-6">لا توجد شيكات</td></tr>
+                <tr><td colSpan={9} className="text-center text-erp-muted py-6">{cheques == null ? 'جارٍ التحميل…' : 'لا توجد شيكات'}</td></tr>
               )}
             </tbody>
           </table>
@@ -382,7 +451,7 @@ export default function Treasury() {
             <Select label="الخزنة *" value={form.treasury_id || ''}
               onChange={e => setForm(f => ({ ...f, treasury_id: e.target.value }))}>
               <option value="">— اختر —</option>
-              {treasuries.map(t => <option key={t.id} value={t.id}>{t.name} ({egp(t.balance)})</option>)}
+              {selectableTreasuries(form.treasury_id).map(t => <option key={t.id} value={t.id}>{t.name} ({egp(t.balance)})</option>)}
             </Select>
             {txnModal === 'out' && form.treasury_id && (() => {
               const sel = treasuries.find(t => String(t.id) === String(form.treasury_id))
@@ -393,6 +462,7 @@ export default function Treasury() {
               const isEditingSameOut = editingOriginal
                 && String(editingOriginal.treasury_id) === String(form.treasury_id)
                 && editingOriginal.direction === 'out'
+                && !['bounced', 'cancelled'].includes(editingOriginal.cheque_status)
               const availableBalance = isEditingSameOut
                 ? Number(sel.balance) + Number(editingOriginal.amount)
                 : Number(sel.balance)
@@ -411,7 +481,7 @@ export default function Treasury() {
                 </div>
               )
             })()}
-            <Input label="المبلغ *" type="number" value={form.amount || ''}
+            <Input label="المبلغ *" type="number" min="0" step="0.01" value={form.amount || ''}
               onChange={e => setForm(f => ({ ...f, amount: e.target.value }))} />
             <Select label="الفئة" value={form.category_id || ''}
               onChange={e => setForm(f => ({ ...f, category_id: e.target.value }))}>
@@ -421,7 +491,7 @@ export default function Treasury() {
             </Select>
             <Input label="التاريخ" type="date" value={form.txn_date || today()}
               onChange={e => setForm(f => ({ ...f, txn_date: e.target.value }))} />
-            <Input label="مرجع (اختياري)" value={form.reference || ''}
+            <Input label="مرجع (اختياري)" maxLength={100} value={form.reference || ''}
               onChange={e => setForm(f => ({ ...f, reference: e.target.value }))} />
             <Select label="طريقة الدفع" value={form.payment_method || 'cash'}
               onChange={e => setForm(f => ({ ...f, payment_method: e.target.value }))}>
@@ -433,16 +503,16 @@ export default function Treasury() {
           </FormGrid>
           {form.payment_method === 'cheque' && (
             <FormGrid>
-              <Input label="رقم الشيك *" value={form.cheque_number || ''}
+              <Input label="رقم الشيك *" maxLength={50} value={form.cheque_number || ''}
                 onChange={e => setForm(f => ({ ...f, cheque_number: e.target.value }))} />
               <Input label="تاريخ الاستحقاق *" type="date" value={form.cheque_date || ''}
                 onChange={e => setForm(f => ({ ...f, cheque_date: e.target.value }))} />
-              <Input label="البنك" value={form.cheque_bank || ''}
+              <Input label="البنك" maxLength={100} value={form.cheque_bank || ''}
                 onChange={e => setForm(f => ({ ...f, cheque_bank: e.target.value }))} />
             </FormGrid>
           )}
           <div className="mt-3">
-            <Textarea label="البيان" value={form.description || ''}
+            <Textarea label="البيان" maxLength={2000} value={form.description || ''}
               onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />
           </div>
           <ModalFooter>
@@ -461,18 +531,22 @@ export default function Treasury() {
             <Select label="من خزنة *" value={trForm.from_treasury_id || ''}
               onChange={e => setTrForm(f => ({ ...f, from_treasury_id: e.target.value }))}>
               <option value="">— اختر —</option>
-              {treasuries.map(t => <option key={t.id} value={t.id}>{t.name} ({egp(t.balance)})</option>)}
+              {selectableTreasuries(trForm.from_treasury_id).map(t => <option key={t.id} value={t.id}>{t.name} ({egp(t.balance)})</option>)}
             </Select>
             <Select label="إلى خزنة *" value={trForm.to_treasury_id || ''}
               onChange={e => setTrForm(f => ({ ...f, to_treasury_id: e.target.value }))}>
               <option value="">— اختر —</option>
-              {treasuries.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              {selectableTreasuries(trForm.to_treasury_id).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
             </Select>
-            <Input label="المبلغ *" type="number" value={trForm.amount || ''}
+            <Input label="المبلغ *" type="number" min="0" step="0.01" value={trForm.amount || ''}
               onChange={e => setTrForm(f => ({ ...f, amount: e.target.value }))} />
             <Input label="التاريخ" type="date" value={trForm.txn_date || today()}
               onChange={e => setTrForm(f => ({ ...f, txn_date: e.target.value }))} />
           </FormGrid>
+          <div className="mt-3">
+            <Input label="البيان (اختياري)" maxLength={2000} value={trForm.description || ''}
+              onChange={e => setTrForm(f => ({ ...f, description: e.target.value }))} />
+          </div>
           <ModalFooter>
             <button className="btn" onClick={() => { setTransferModal(false); setTrForm({}) }}>إلغاء</button>
             <button className="btn btn-primary" disabled={transferring} onClick={doTransfer}>
@@ -486,16 +560,20 @@ export default function Treasury() {
       {treasuryModal && (
         <Modal open onClose={() => { setTreasuryModal(false); setTForm({}) }} title="+ خزنة جديدة">
           <FormGrid>
-            <Input label="اسم الخزنة *" value={tForm.name || ''}
+            <Input label="اسم الخزنة *" maxLength={100} value={tForm.name || ''}
               onChange={e => setTForm(f => ({ ...f, name: e.target.value }))} />
             <Select label="النوع" value={tForm.kind || 'cash'}
               onChange={e => setTForm(f => ({ ...f, kind: e.target.value }))}>
               <option value="cash">نقدي 💵</option>
               <option value="bank">بنك 🏦</option>
             </Select>
-            <Input label="الرصيد الافتتاحي" type="number" value={tForm.opening_balance || ''}
+            <Input label="الرصيد الافتتاحي" type="number" min="0" step="0.01" value={tForm.opening_balance || ''}
               onChange={e => setTForm(f => ({ ...f, opening_balance: e.target.value }))} />
           </FormGrid>
+          <div className="mt-3">
+            <Textarea label="ملاحظات (اختياري)" maxLength={2000} value={tForm.notes || ''}
+              onChange={e => setTForm(f => ({ ...f, notes: e.target.value }))} />
+          </div>
           <ModalFooter>
             <button className="btn" onClick={() => { setTreasuryModal(false); setTForm({}) }}>إلغاء</button>
             <button className="btn btn-primary" disabled={savingT} onClick={saveTreasury}>
@@ -511,7 +589,7 @@ export default function Treasury() {
           <div className="flex flex-col gap-4">
             <div className="flex items-end gap-2">
               <div className="flex-1">
-                <Input label="فئة جديدة" value={newCat.name}
+                <Input label="فئة جديدة" maxLength={100} value={newCat.name}
                   onChange={e => setNewCat(c => ({ ...c, name: e.target.value }))}
                   onKeyDown={e => { if (e.key === 'Enter') addCat() }} />
               </div>
@@ -554,6 +632,17 @@ export default function Treasury() {
         title="حذف فئة"
         message={`حذف فئة "${confirmCatDel?.name}"؟`}
         danger
+      />
+
+      <ConfirmDialog
+        open={!!confirmCheque}
+        onClose={() => setConfirmCheque(null)}
+        onConfirm={() => { const c = confirmCheque; if (c) setChequeStatus(c.id, c.status) }}
+        title={confirmCheque?.status === 'bounced' ? '↩️ تسجيل شيك مرتجع' : '✅ تحصيل شيك'}
+        danger={confirmCheque?.status === 'bounced'}
+        message={confirmCheque?.status === 'bounced'
+          ? `تسجيل الشيك #${confirmCheque?.number || '—'} بمبلغ ${egp(confirmCheque?.amount || 0)} كمرتجع؟ سيتم عكس أثره على رصيد الخزنة والقيود.`
+          : `تأكيد تحصيل الشيك #${confirmCheque?.number || '—'} بمبلغ ${egp(confirmCheque?.amount || 0)}؟`}
       />
 
       <ConfirmDialog open={!!deleteTxn} onClose={() => setDeleteTxn(null)} onConfirm={removeTxn}

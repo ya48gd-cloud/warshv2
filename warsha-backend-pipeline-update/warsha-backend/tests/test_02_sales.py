@@ -1441,3 +1441,244 @@ async def test_credit_note_rejects_invoice_belonging_to_other_customer(cli):
         "lines": [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 100.0}],
     })
     assert r2.status_code == 400
+
+
+
+# ════════════════ ROUND 3: SALES BACKEND VALIDATION / GAP FIXES ═════════════
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_write_sales_but_can_read(cli):
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.api.auth import create_token
+    tok = create_token(user_id=990, username="viewer_x", role="viewer", tenant_id=1)
+    cid = await _make_customer(cli)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {tok}"}) as vcli:
+        r = await vcli.post(f"{BASE}/invoices", json=_inv_payload(cid))
+        assert r.status_code == 403, r.text
+        r2 = await vcli.post("/api/v1/credit-notes", json={
+            "customer_id": cid, "date": str(date.today()),
+            "lines": [{"description": "x", "qty": 1, "unit_price": 10}]})
+        assert r2.status_code == 403
+        r3 = await vcli.post(CUST_BASE, json={"name": "x"})
+        assert r3.status_code == 403
+        assert (await vcli.get(f"{BASE}/invoices")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_invoice_rejects_negative_qty_price_and_bad_pct(cli):
+    cid = await _make_customer(cli)
+    p = _inv_payload(cid)
+    p["lines"] = [{"description": "x", "qty": -1, "unit_price": 100}]
+    assert (await cli.post(f"{BASE}/invoices", json=p)).status_code == 400
+    p["lines"] = [{"description": "x", "qty": 1, "unit_price": -100}]
+    assert (await cli.post(f"{BASE}/invoices", json=p)).status_code == 400
+    p = _inv_payload(cid)
+    p["discount_pct"] = 150
+    assert (await cli.post(f"{BASE}/invoices", json=p)).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_duplicate_invoice_code_returns_400(cli):
+    cid = await _make_customer(cli)
+    assert (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).status_code == 201
+    r = await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_invoice_without_code_keeps_existing_code(cli):
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    p = _inv_payload(cid)
+    p.pop("code")
+    r = await cli.put(f"{BASE}/invoices/{iid}", json=p)
+    assert r.status_code == 200, r.text
+    assert (await cli.get(f"{BASE}/invoices/{iid}")).json()["code"] == "INV-001"
+
+
+@pytest.mark.asyncio
+async def test_update_invoice_total_below_paid_rejected(cli):
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    await cli.post(f"{BASE}/invoices/{iid}/payment", json={"amount": 400.0})
+    p = _inv_payload(cid)
+    p["lines"] = [{"description": "x", "qty": 1, "unit_price": 100}]
+    r = await cli.put(f"{BASE}/invoices/{iid}", json=p)
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_quotation_cannot_be_invoiced_twice_or_deleted_after(cli):
+    cid = await _make_customer(cli)
+    qid = (await cli.post(f"{BASE}/quotations", json=_quot_payload(cid))).json()["id"]
+    r1 = await cli.post(f"{BASE}/quotations/{qid}/to-invoice", params={"invoice_code": "INV-Q-A"})
+    assert r1.status_code == 200, r1.text
+    r2 = await cli.post(f"{BASE}/quotations/{qid}/to-invoice", params={"invoice_code": "INV-Q-B"})
+    assert r2.status_code == 400
+    r3 = await cli.post(f"{BASE}/quotations/{qid}/to-order", json={})
+    assert r3.status_code == 400
+    assert (await cli.delete(f"{BASE}/quotations/{qid}")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_payment_schedule_after_partial_payment_preallocates(cli):
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    await cli.post(f"{BASE}/invoices/{iid}/payment", json={"amount": 300.0})
+    d1 = str(date.today() + timedelta(days=10))
+    d2 = str(date.today() + timedelta(days=40))
+    r = await cli.post(f"{BASE}/invoices/{iid}/payment-schedule", json={"installments": [
+        {"label": "1", "amount": 250, "due_date": d1},
+        {"label": "2", "amount": 250, "due_date": d2},
+    ]})
+    assert r.status_code == 201, r.text
+    rows = r.json()
+    assert rows[0]["status"] == "paid"
+    assert rows[1]["paid_amount"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_patch_installment_amount_below_paid_rejected(cli):
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    d1 = str(date.today() + timedelta(days=10))
+    d2 = str(date.today() + timedelta(days=40))
+    rows = (await cli.post(f"{BASE}/invoices/{iid}/payment-schedule", json={"installments": [
+        {"amount": 250, "due_date": d1}, {"amount": 250, "due_date": d2}]})).json()
+    await cli.post(f"{BASE}/invoices/{iid}/payment", json={"amount": 200.0})
+    r = await cli.patch(f"{BASE}/invoices/{iid}/payment-schedule/{rows[0]['id']}", json={"amount_due": 100})
+    assert r.status_code == 400
+
+
+def _cn_payload(cid, iid, price):
+    return {"customer_id": cid, "invoice_id": iid, "date": str(date.today()),
+            "lines": [{"description": "x", "qty": 1, "unit_price": price}]}
+
+
+@pytest.mark.asyncio
+async def test_credit_notes_cannot_exceed_invoice_total(cli):
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    c1 = (await cli.post(CN_BASE, json=_cn_payload(cid, iid, 400))).json()["id"]
+    assert (await cli.patch(f"{CN_BASE}/{c1}/issue")).status_code == 200
+    # 400 + 200 > 500 -> rejected on create
+    assert (await cli.post(CN_BASE, json=_cn_payload(cid, iid, 200))).status_code == 400
+    # full return after an issued partial return -> rejected
+    assert (await cli.post(f"{CN_BASE}/from-invoice/{iid}")).status_code == 400
+    # discount larger than subtotal -> rejected
+    bad = _cn_payload(cid, iid, 50)
+    bad["discount_amt"] = 60
+    assert (await cli.post(CN_BASE, json=bad)).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_cancel_credit_note_does_not_erase_cash_payment(cli):
+    """Fully cash-paid invoice + credit note (applied 0 to the invoice) then cancelled:
+    paid_amount must stay untouched (used to be reduced by the full CN total)."""
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    await cli.post(f"{BASE}/invoices/{iid}/payment", json={"amount": 500.0})
+    c1 = (await cli.post(CN_BASE, json=_cn_payload(cid, iid, 200))).json()["id"]
+    assert (await cli.patch(f"{CN_BASE}/{c1}/issue")).json()["applied_to_invoice"] == 0.0
+    assert (await cli.patch(f"{CN_BASE}/{c1}/cancel")).status_code == 200
+    inv = (await cli.get(f"{BASE}/invoices/{iid}")).json()
+    assert inv["paid_amount"] == 500.0
+    assert inv["status"] == "paid"
+
+
+@pytest.mark.asyncio
+async def test_delete_invoice_blocked_with_linked_credit_note(cli):
+    cid = await _make_customer(cli)
+    iid = (await cli.post(f"{BASE}/invoices", json=_inv_payload(cid))).json()["id"]
+    await cli.post(CN_BASE, json=_cn_payload(cid, iid, 100))
+    assert (await cli.delete(f"{BASE}/invoices/{iid}")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_print_invoice_escapes_script_in_code_and_unit(cli):
+    cid = await _make_customer(cli)
+    p = _inv_payload(cid)
+    p["code"] = "</title><script>alert(1)</script>"
+    p["lines"] = [{"description": "x", "qty": 1, "unit": "<img src=x onerror=alert(1)>", "unit_price": 10}]
+    iid = (await cli.post(f"{BASE}/invoices", json=p)).json()["id"]
+    html = (await cli.get(f"{BASE}/invoices/{iid}/print")).text
+    assert "<script>alert(1)</script>" not in html
+    assert "<img src=x onerror" not in html
+
+
+async def _wo_invoice_fixture(cli):
+    """quotation -> order -> work order -> complete -> invoice (FG issued)."""
+    from tests.test_20_pipeline_stations import _make_equipment, _make_quotation
+    eq_id = await _make_equipment(cli)
+    cust_id = await _make_customer(cli)
+    quot = await _make_quotation(cli, cust_id, unit_price=1000, qty=2)
+    order_id = (await cli.post(f"{BASE}/quotations/{quot['id']}/to-order", json={})).json()["id"]
+    wo = (await cli.post(f"{BASE}/orders/{order_id}/to-work-order", json={
+        "equipment_id": eq_id, "quantity": 2, "quantity_unit": "وحدة",
+        "start_date": str(date.today()),
+    })).json()
+    await cli.post("/api/v1/accounts/chart/seed")
+    await cli.post("/api/v1/accounting/cost-lines", json={
+        "work_order_id": wo["id"], "cost_type": "material",
+        "description": "صاج", "qty": 2, "unit_cost": 150,
+    })
+    await cli.post(f"/api/v1/production/complete/{wo['id']}")
+    inv_r = await cli.post(f"{BASE}/work-orders/{wo['id']}/to-invoice", json={})
+    assert inv_r.status_code == 201, inv_r.text
+    return cust_id, wo, inv_r.json()["id"]
+
+
+def _fg_qty(mats, wo_code):
+    return float(next(m for m in mats if m["code"] == f"FG-{wo_code}")["stock_qty"])
+
+
+@pytest.mark.asyncio
+async def test_delete_work_order_invoice_restores_fg_stock(cli):
+    cust_id, wo, inv_id = await _wo_invoice_fixture(cli)
+    mats = (await cli.get(f"{INV_BASE}/materials")).json()
+    assert _fg_qty(mats, wo["code"]) == 0.0
+    r = await cli.delete(f"{BASE}/invoices/{inv_id}")
+    assert r.status_code == 200, r.text
+    mats = (await cli.get(f"{INV_BASE}/materials")).json()
+    assert _fg_qty(mats, wo["code"]) == 2.0
+
+
+@pytest.mark.asyncio
+async def test_manual_invoice_cannot_double_bill_work_order(cli):
+    cust_id, wo, inv_id = await _wo_invoice_fixture(cli)
+    r = await cli.post(f"{BASE}/invoices", json={
+        "customer_id": cust_id, "work_order_id": wo["id"], "date": str(date.today()),
+        "lines": [{"description": "x", "qty": 1, "unit_price": 10}]})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_return_quantity_cannot_exceed_sold_quantity(cli):
+    cust_id, wo, inv_id = await _wo_invoice_fixture(cli)
+    line_id = (await cli.get(f"{BASE}/invoices/{inv_id}")).json()["lines"][0]["id"]
+    r = await cli.post(CN_BASE, json={
+        "customer_id": cust_id, "invoice_id": inv_id, "date": str(date.today()),
+        "is_return": True,
+        "lines": [{"invoice_line_id": line_id, "description": "x", "qty": 5, "unit_price": 1}]})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_delivery_order_code_unique_after_delete(cli):
+    cid = await _make_customer(cli)
+    body = {"order_date": str(date.today()), "customer_id": cid, "vehicle_plate": "ABC",
+            "driver_name": "d", "lines": [{"description": "x", "qty": "1"}]}
+    codes = []
+    ids = []
+    for _ in range(3):
+        r = await cli.post("/api/v1/delivery-orders", json=body)
+        assert r.status_code == 201, r.text
+        codes.append(r.json()["code"]); ids.append(r.json()["id"])
+    assert (await cli.delete(f"/api/v1/delivery-orders/{ids[1]}")).status_code == 204
+    r = await cli.post("/api/v1/delivery-orders", json=body)
+    assert r.status_code == 201
+    assert r.json()["code"] not in (codes[0], codes[2])
+    bad = {**body, "order_date": "not-a-date"}
+    assert (await cli.post("/api/v1/delivery-orders", json=bad)).status_code == 400

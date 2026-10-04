@@ -26,6 +26,20 @@ const PAGE_TITLES = {
   purchases:  'المشتريات',
   suppliers:  'الموردون',
   fieldservice: 'الخدمة الميدانية',
+  // صفحات كانت بتظهر بمفتاحها الإنجليزي الخام في الشريط العلوي
+  inventory:       'المخزون',
+  stockbatches:    'دفعات المخزون (Lot)',
+  warehouses:      'المخازن المنطقية',
+  pipeline:        'تتبع دورة حياة المعدة',
+  installments:    'الأقساط المستحقة',
+  purchaseorders:  'المشتريات (أوامر/فواتير)',
+  accounting:      'المحاسبة والحسابات',
+  extprojects:     'مشاريع التركيب والتشغيل',
+  pricecatalog:    'كتالوج الأسعار',
+  treasury:        'الخزينة والمدفوعات',
+  supplycontracts: 'عقود التوريد',
+  deliverynotes:   'أوامر التوريد',
+  workcompletioncerts: 'الشهادات (إتمام/ضمان)',
 }
 
 // ── Global Search ─────────────────────────────────────────────
@@ -118,7 +132,7 @@ function GlobalSearch({ onNavigate }) {
         />
         {loading && <span style={{ fontSize: 11, color: 'var(--erp-muted)', flexShrink: 0 }}>⟳</span>}
         {q && (
-          <button onClick={() => { setQ(''); setResults([]) }}
+          <button type="button" aria-label="مسح البحث" onClick={() => { setQ(''); setResults([]) }}
             style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--erp-muted)', fontSize: 12, lineHeight: 1, flexShrink: 0 }}>✕</button>
         )}
       </div>

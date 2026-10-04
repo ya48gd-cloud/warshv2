@@ -330,3 +330,159 @@ async def test_allocate_payment_rejects_non_positive_amount(cli):
         {"invoice_id": iid, "amount": -50.0}
     ])
     assert r2.status_code == 422
+
+
+
+# ══ جولة 3 — gap/validation analysis ═══════════════════════════════════
+@pytest.mark.asyncio
+async def test_manual_entry_validation(cli):
+    ACC_BASE = "/api/v1/accounts"
+    await cli.post(f"{ACC_BASE}/chart/seed")
+    accounts = (await cli.get(f"{ACC_BASE}/chart")).json()
+    cash = next(a for a in accounts if a["code"] == "1110")
+    equity = next(a for a in accounts if a["code"] == "3100")
+    base = {"entry_date": str(date.today()), "description": "قيد"}
+    # بدون سطور
+    assert (await cli.post(f"{ACC_BASE}/entries", json={**base, "lines": []})).status_code == 422
+    # فرق 0.01 = غير متوازن
+    r = await cli.post(f"{ACC_BASE}/entries", json={**base, "lines": [
+        {"account_id": cash["id"], "side": "debit", "amount": 100.01},
+        {"account_id": equity["id"], "side": "credit", "amount": 100.0},
+    ]})
+    assert r.status_code == 422
+    # source محجوز للقيود التلقائية
+    r = await cli.post(f"{ACC_BASE}/entries", json={**base, "source": "fixed_asset_purchase", "source_id": 1,
+                                                   "lines": [
+        {"account_id": cash["id"], "side": "debit", "amount": 10},
+        {"account_id": equity["id"], "side": "credit", "amount": 10},
+    ]})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_manual_entry_rejects_other_tenant_account(cli, cli2):
+    ACC_BASE = "/api/v1/accounts"
+    await cli.post(f"{ACC_BASE}/chart/seed")
+    await cli2.post(f"{ACC_BASE}/chart/seed")
+    t2 = (await cli2.get(f"{ACC_BASE}/chart")).json()
+    t1 = (await cli.get(f"{ACC_BASE}/chart")).json()
+    cash1 = next(a for a in t1 if a["code"] == "1110")
+    equity2 = next(a for a in t2 if a["code"] == "3100")
+    r = await cli.post(f"{ACC_BASE}/entries", json={
+        "entry_date": str(date.today()), "description": "عبر الورش",
+        "lines": [
+            {"account_id": cash1["id"], "side": "debit", "amount": 10},
+            {"account_id": equity2["id"], "side": "credit", "amount": 10},
+        ],
+    })
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_system_account_code_cannot_change(cli):
+    ACC_BASE = "/api/v1/accounts"
+    await cli.post(f"{ACC_BASE}/chart/seed")
+    cash = next(a for a in (await cli.get(f"{ACC_BASE}/chart")).json() if a["code"] == "1110")
+    r = await cli.put(f"{ACC_BASE}/chart/{cash['id']}", json={
+        "code": "1119", "name_ar": "الصندوق", "account_type": "asset", "normal_balance": "debit",
+        "parent_id": cash["parent_id"],
+    })
+    assert r.status_code == 400
+    # تعديل الاسم فقط مسموح
+    r2 = await cli.put(f"{ACC_BASE}/chart/{cash['id']}", json={
+        "code": "1110", "name_ar": "الخزنة الرئيسية", "account_type": "asset", "normal_balance": "debit",
+        "parent_id": cash["parent_id"],
+    })
+    assert r2.status_code == 200, r2.text
+    # الحساب أب لنفسه مرفوض
+    r3 = await cli.put(f"{ACC_BASE}/chart/{cash['id']}", json={
+        "code": "1110", "name_ar": "الخزنة", "account_type": "asset", "normal_balance": "debit",
+        "parent_id": cash["id"],
+    })
+    assert r3.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_tax_payment_with_bad_account_is_rejected_not_silently_ok(cli):
+    ACC_BASE = "/api/v1/accounts"
+    await cli.post(f"{ACC_BASE}/chart/seed")
+    r = await cli.post(f"{ACC_BASE}/tax-payment", json={
+        "tax_type": "vat", "amount": 100, "cash_account_code": "9999",
+    })
+    assert r.status_code == 400
+    r2 = await cli.post(f"{ACC_BASE}/tax-payment", json={
+        "tax_type": "vat", "amount": 100, "cash_account_code": "4100",
+    })
+    assert r2.status_code == 400
+    ok = await cli.post(f"{ACC_BASE}/tax-payment", json={
+        "tax_type": "vat", "amount": 100, "cash_account_code": "1120",
+    })
+    assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_write_accounts_or_work_orders(cli):
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.api.auth import create_token
+    eq_id = await _make_equipment(cli)
+    tok = create_token(user_id=990202, username="viewer_acc", role="viewer", tenant_id=1)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {tok}"}) as v:
+        assert (await v.post("/api/v1/accounts/chart/seed")).status_code == 403
+        assert (await v.post(f"{BASE}/work-orders", json={"equipment_id": eq_id})).status_code == 403
+        assert (await v.get("/api/v1/accounts/trial-balance")).status_code == 200
+        assert (await v.get(f"{BASE}/work-orders")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_work_order_validation(cli, cli2):
+    eq_id = await _make_equipment(cli)
+    # معدة ورشة تانية
+    eq2 = (await cli2.post(EQ, json={"name_ar": "معدة ورشة 2", "level": 1})).json()["id"]
+    r = await cli.post(f"{BASE}/work-orders", json={"equipment_id": eq2})
+    assert r.status_code == 400
+    r = await cli.post(f"{BASE}/work-orders", json={"equipment_id": eq_id, "quantity": 0})
+    assert r.status_code == 422
+    wo_id = await _make_wo(cli, eq_id)
+    bad = await cli.put(f"{BASE}/work-orders/{wo_id}", json={"equipment_id": eq_id, "status": "xyz"})
+    assert bad.status_code == 422
+    # بند تكلفة لأمر غير موجود / نوع غير معروف
+    r = await cli.post(f"{BASE}/cost-lines", json={
+        "work_order_id": 999999, "cost_type": "labor", "description": "x", "qty": 1, "unit_cost": 10,
+    })
+    assert r.status_code == 404
+    r = await cli.post(f"{BASE}/cost-lines", json={
+        "work_order_id": wo_id, "cost_type": "bogus", "description": "x", "qty": 1, "unit_cost": 10,
+    })
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_work_order_print_escapes_html(cli):
+    eq_id = await _make_equipment(cli)
+    r = await cli.post(f"{BASE}/work-orders", json={
+        "equipment_id": eq_id, "notes": "<script>alert(1)</script>",
+    })
+    wo_id = r.json()["id"]
+    html = (await cli.get(f"{BASE}/work-orders/{wo_id}/print")).text
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+@pytest.mark.asyncio
+async def test_allocate_payment_rejects_other_customers_invoice(cli):
+    CUST_BASE = "/api/v1/customers"
+    SALES_BASE = "/api/v1/sales"
+    ACC_BASE = "/api/v1/accounts"
+    c1 = (await cli.post(CUST_BASE, json={"name": "عميل أ", "phone": "0501110001"})).json()["id"]
+    c2 = (await cli.post(CUST_BASE, json={"name": "عميل ب", "phone": "0501110002"})).json()["id"]
+    pid = (await cli.post(f"{CUST_BASE}/payments", json={
+        "customer_id": c1, "amount": 100.0, "payment_type": "cash", "payment_date": str(date.today()),
+    })).json()["id"]
+    iid = (await cli.post(f"{SALES_BASE}/invoices", json={
+        "customer_id": c2, "date": str(date.today()),
+        "lines": [{"description": "بند", "qty": 1, "unit": "قطعة", "unit_price": 500.0}],
+    })).json()["id"]
+    r = await cli.post(f"{ACC_BASE}/payments/{pid}/allocate", json=[{"invoice_id": iid, "amount": 50.0}])
+    assert r.status_code == 400

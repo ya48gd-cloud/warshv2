@@ -9,7 +9,7 @@ import {
   LineChart, Line, AreaChart, Area,
   BarChart, Bar, ComposedChart,
   XAxis, YAxis, CartesianGrid, Tooltip,
-  Legend, ResponsiveContainer, ReferenceLine,
+  Legend, ResponsiveContainer, ReferenceLine, Cell,
 } from 'recharts'
 import api from '../api/client'
 import { useToast } from '../store/toast'
@@ -100,8 +100,11 @@ function buildPredictions(data) {
   // 5. Churn
   const now = Date.now()
   const churnBuckets = { high: 0, medium: 0, low: 0 }
-  ;(customers || []).forEach(c => {
-    const lastOrder = c.last_order_date ? new Date(c.last_order_date).getTime() : 0
+  ;(Array.isArray(customers) ? customers : []).forEach(c => {
+    // عميل بدون أي طلب مش "خطر فقدان" — كان بيتحسب كأن آخر طلب سنة 1970
+    if (!c.last_order_date) return
+    const lastOrder = new Date(c.last_order_date).getTime()
+    if (Number.isNaN(lastOrder)) return
     const days = Math.round((now - lastOrder) / 86400000)
     if (days > 90) churnBuckets.high++
     else if (days > 60) churnBuckets.medium++
@@ -169,6 +172,7 @@ function TickerStrip({ prices, lastUpdate }) {
     <div style={{ background: '#0B1F3A', borderRadius: 14, padding: '12px 16px', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 14 }}>
       <div style={{ fontSize: 10, color: '#64748B', marginLeft: 8 }}>
         أسعار السوق
+        <div style={{ fontSize: 8, color: '#475569', marginTop: 1 }}>أسعار استرشادية — ليست لحظية</div>
         <div style={{ fontSize: 9, color: '#475569', marginTop: 1 }}>{lastUpdate}</div>
       </div>
       {Object.values(prices).map((p, i) => {
@@ -193,6 +197,7 @@ function TickerStrip({ prices, lastUpdate }) {
 const ARABIC_MONTHS = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر']
 
 function RevenueChart({ history, forecastNext, forecastNext2 }) {
+  if (!history?.length) return <div style={{ textAlign: 'center', color: '#94A3B8', padding: '30px 0', fontSize: 12 }}>لا توجد بيانات مبيعات كافية</div>
   const now = new Date()
   const data = (history || []).map((v, i) => {
     const monthIdx = (now.getMonth() - (history.length - 1 - i) + 12) % 12
@@ -324,7 +329,7 @@ function ChurnBuckets({ buckets }) {
         <Tooltip formatter={(v) => [v + ' عميل', '']} contentStyle={{ fontSize: 11, direction: 'rtl' }} />
         <Bar dataKey="val" name="عملاء">
           {data.map((d, i) => (
-            <rect key={i} fill={d.fill} />
+            <Cell key={i} fill={d.fill} />
           ))}
         </Bar>
       </BarChart>
@@ -334,22 +339,19 @@ function ChurnBuckets({ buckets }) {
 
 /* ═══ Chart 6: Margin Bars — Recharts ══════════════════════ */
 function MarginChart({ margin }) {
-  const data = margin?.length ? margin : [
-    { name: 'مجارف', margin: 42 },
-    { name: 'مخلاطات', margin: 35 },
-    { name: 'صوامع', margin: 28 },
-    { name: 'ناقلات', margin: 19 },
-  ]
+  // كانت بتعرض أرقام وهمية (مجارف 42%...) لما مفيش بيانات — دلوقتي حالة فارغة صريحة
+  if (!margin?.length) return <div style={{ textAlign: 'center', color: '#94A3B8', padding: '20px 0', fontSize: 12 }}>لا توجد أوامر إنتاج منتهية لحساب الهامش</div>
+  const data = margin
   const COLORS = ['#22C55E', '#3B82F6', '#F59E0B', '#EF4444', '#8B5CF6', '#06B6D4']
   return (
     <ResponsiveContainer width="100%" height={160}>
       <BarChart data={data} layout="vertical" margin={{ top: 0, right: 30, left: 55, bottom: 0 }}>
-        <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 9, fill: '#94A3B8' }} tickLine={false} tickFormatter={v => v + '%'} />
+        <XAxis type="number" domain={[dataMin => Math.min(0, Math.floor(dataMin)), 100]} allowDataOverflow tick={{ fontSize: 9, fill: '#94A3B8' }} tickLine={false} tickFormatter={v => v + '%'} />
         <YAxis type="category" dataKey="name" tick={{ fontSize: 9, fill: '#64748B' }} tickLine={false} width={54} />
         <Tooltip formatter={(v) => [v + '%', 'هامش الربح']} contentStyle={{ fontSize: 11, direction: 'rtl' }} />
         <Bar dataKey="margin" name="هامش %">
-          {data.map((_, i) => (
-            <rect key={i} fill={COLORS[i % COLORS.length]} />
+          {data.map((d, i) => (
+            <Cell key={i} fill={d.margin < 0 ? '#EF4444' : COLORS[i % COLORS.length]} />
           ))}
         </Bar>
       </BarChart>
@@ -418,7 +420,8 @@ export default function Analytics() {
         customers,
         sales: {
           ...salesData,
-          monthly: salesSummary?.monthly_breakdown?.map(m => m.total) || [180000,210000,195000,240000,228000,305000],
+          // كان فيه fallback بأرقام مبيعات وهمية لو الطلب فشل — دلوقتي فاضي
+          monthly: (salesSummary?.monthly_breakdown || []).map(m => Number(m.total) || 0),
         },
         purchases: { ...(execDash.purchases || {}), ...purchSummary },
         production: {
@@ -432,6 +435,7 @@ export default function Analytics() {
       setLastUpdate(new Date().toLocaleTimeString('ar-EG'))
     } catch (e) {
       console.warn('Analytics load error:', e)
+      if (!silent) toast(e?.message || 'تعذّر تحميل بيانات التحليلات', 'error')
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -465,11 +469,17 @@ export default function Analytics() {
     alerts.push({ type: 'warn', icon: '📈', title: `${preds.riskWOs.filter(w=>w.riskScore>70).length} أوامر إنتاج تجاوزت الميزانية`, sub: `انحراف تكلفة > 15% — راجع أوامر الإنتاج`, badge: 'تحذير' })
   if (preds?.cashFlow?.cf90 < 0)
     alerts.push({ type: 'info', icon: '💵', title: 'تدفق نقدي سلبي متوقع بعد 90 يوم', sub: `المستحقات: ${fmtEGP(sal.total_receivable || 0)} — تسريع التحصيل ضروري`, badge: 'متابعة' })
-  if ((preds?.churnBuckets?.high || 0) === 0 || (sal.collection_rate || 0) > 80)
+  // كان بيعرض "ممتاز" حتى لو نسبة التحصيل 0% طالما مفيش عملاء خاملين
+  if ((sal.collection_rate || 0) > 80)
     alerts.push({ type: 'ok', icon: '✅', title: `نسبة التحصيل ${(sal.collection_rate || 0).toFixed(0)}%`, sub: 'أداء جيد — استمر في متابعة المستحقات', badge: 'ممتاز' })
   while (alerts.length < 4) alerts.push({ type: 'info', icon: '📊', title: 'النظام يعمل بشكل طبيعي', sub: 'لا توجد تنبيهات إضافية', badge: 'OK' })
 
   const collectionRate = sal.collection_rate || 0
+  // تغيّر المبيعات الحقيقي (الشهر الحالي مقابل السابق) من monthly_breakdown —
+  // كانت نسب التغيير (8.5% / -3.2% / 2.1%) أرقام ثابتة وهمية
+  const hist = preds?.salesHistory || []
+  const prevMonth = hist.length >= 2 ? hist[hist.length - 2] : 0
+  const salesChange = prevMonth > 0 ? ((hist[hist.length - 1] - prevMonth) / prevMonth) * 100 : null
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14, fontFamily: "'Cairo', sans-serif" }}>
@@ -505,17 +515,17 @@ export default function Analytics() {
       </div>
 
       {/* KPI Grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 10 }}>
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6" style={{ gap: 10 }}>
         <KpiCard label="أوامر إنتاج نشطة"  value={prod.open_work_orders || 0}                       icon="🏭" color="#3B82F6" bar={Math.min(100, (prod.open_work_orders || 0) * 4)} />
         <KpiCard label="قيمة المخزون"       value={fmtK(inv.total_value)}                            icon="📦" color="#8B5CF6" bar={65} />
-        <KpiCard label="مبيعات الشهر"       value={fmtK(sal.mtd_invoiced)}                           icon="💰" color="#22C55E" bar={80} change={8.5} />
-        <KpiCard label="المستحقات"          value={fmtK(sal.total_receivable)}                       icon="⏰" color="#F59E0B" bar={55} change={-3.2} />
+        <KpiCard label="مبيعات الشهر"       value={fmtK(sal.mtd_invoiced)}                           icon="💰" color="#22C55E" bar={80} change={salesChange} />
+        <KpiCard label="المستحقات"          value={fmtK(sal.total_receivable)}                       icon="⏰" color="#F59E0B" bar={55} change={null} />
         <KpiCard label="تكلفة الإنتاج"      value={fmtK(prod.mtd_production_cost)}                   icon="🔧" color="#EF4444" bar={70} />
-        <KpiCard label="نسبة التحصيل"       value={collectionRate.toFixed(0) + '%'}                  icon="📈" color="#0B1F3A" bar={collectionRate} change={2.1} />
+        <KpiCard label="نسبة التحصيل"       value={collectionRate.toFixed(0) + '%'}                  icon="📈" color="#0B1F3A" bar={collectionRate} change={null} />
       </div>
 
       {/* Charts Row 1 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr 1fr', gap: 12 }}>
+      <div className="grid grid-cols-1 lg:grid-cols-[1.6fr_1fr_1fr]" style={{ gap: 12 }}>
         <Card title="تنبؤ المبيعات — الشهرين القادمين" badge="تنبؤ خطي" badgeColor="blue">
           <div style={{ fontSize: 10, color: '#94A3B8', marginBottom: 6 }}>ج.م | الخط المتقطع = تنبؤ | مرر على النقاط لتفاصيل أكثر</div>
           <RevenueChart history={preds?.salesHistory} forecastNext={preds?.forecastNext} forecastNext2={preds?.forecastNext2} />
@@ -531,7 +541,7 @@ export default function Analytics() {
       </div>
 
       {/* Charts Row 2 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+      <div className="grid grid-cols-1 md:grid-cols-3" style={{ gap: 12 }}>
         <Card title="توقع نفاد المخزون" badge="الأيام المتبقية" badgeColor="red">
           <div style={{ fontSize: 10, color: '#94A3B8', marginBottom: 4 }}>بناءً على معدل الاستهلاك اليومي</div>
           <StockoutChart items={preds?.stockoutItems} />

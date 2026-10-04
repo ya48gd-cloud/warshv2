@@ -3,7 +3,7 @@
 آمن: لو مفيش خزنة، مايعملش حاجة ومايكسرش الدفع.
 """
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from sqlalchemy import select, func
 from app.models.models import Treasury, TreasuryTransaction, TreasuryCategory
 
@@ -57,8 +57,14 @@ async def record_payment_in_treasury(db, *, amount, direction, source,
     if not treasury:
         return None  # مفيش خزنة — مايعملش حاجة
 
-    amt = Decimal(str(amount or 0))
-    if amt <= 0:
+    try:
+        # تقريب لقرشين: العمود Numeric(14,2) — بدون التقريب الرصيد يتحدّث بقيمة غير المخزّنة
+        amt = Decimal(str(amount or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not amt.is_finite() or amt <= 0:
+        return None
+    if direction not in ("in", "out"):
         return None
 
     tid = _get_tenant_id()
@@ -70,6 +76,7 @@ async def record_payment_in_treasury(db, *, amount, direction, source,
                 TreasuryTransaction.linked_type == linked_type,
                 TreasuryTransaction.linked_id == linked_id,
                 TreasuryTransaction.source == source,
+                TreasuryTransaction.tenant_id == tid,
             )
         )
         if (ex.scalar() or 0) > 0:

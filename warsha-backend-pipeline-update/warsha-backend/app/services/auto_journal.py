@@ -496,6 +496,33 @@ async def journal_scrap(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# STOCK COUNT ADJUSTMENT (تسوية جرد)
+# عجز:   مدين مصاريف هالك وإتلاف (5600)   دائن حساب المخزون
+# زيادة: مدين حساب المخزون                  دائن 5600 (تخفيض خسائر المخزون)
+# قبل كده إغلاق الجرد كان بيعدّل الكميات بس — قيمة المخزون في الميزانية
+# مكانتش بتتغير، فالميزانية ورصيد المخازن بيبعدوا عن بعض مع كل جرد.
+# ══════════════════════════════════════════════════════════════════════════
+
+async def journal_stock_count_adjustment(
+    db: AsyncSession, tenant_id: int, count_id: int,
+    inventory_account: str, signed_amount: Decimal, count_date: date,
+):
+    if not signed_amount:
+        return
+    amount = abs(signed_amount)
+    inv_side, loss_side = ("debit", "credit") if signed_amount > 0 else ("credit", "debit")
+    await _post_entry(
+        db, tenant_id, count_date,
+        f"تسوية جرد #{count_id} — {'زيادة' if signed_amount > 0 else 'عجز'}",
+        f"STOCKCOUNT-{count_id}", "stock_count", count_id,
+        [
+            {"account_code": inventory_account, "side": inv_side,  "amount": amount},
+            {"account_code": "5600",            "side": loss_side, "amount": amount},
+        ]
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # SCRAP SALE (بيع الهالك)
 # مدين: الصندوق (1110)   دائن: إيرادات بيع الهالك (4400)
 # ══════════════════════════════════════════════════════════════════════════

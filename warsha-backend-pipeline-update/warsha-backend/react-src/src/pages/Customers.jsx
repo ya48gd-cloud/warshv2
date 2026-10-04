@@ -115,7 +115,7 @@ function CustomerProfile({ customer, onBack, write, onNavigate }) {
       try {
         const data = await api.get(`/sales/invoices/${id}`)
         setInvLines(prev => ({ ...prev, [id]: data?.lines || [] }))
-      } catch (_) {}
+      } catch (e) { toast(e?.message || 'تعذّر تحميل بنود الفاتورة', 'error') }
     }
   }, [invLines])
 
@@ -1266,7 +1266,7 @@ export default function Customers({ onNavigate }) {
         onClose={() => setDeleteTarget(null)}
         onConfirm={doDelete}
         title="حذف العميل"
-        message={`حذف "${deleteTarget?.name}"?`}
+        message={`حذف العميل "${deleteTarget?.name}"؟ لا يمكن التراجع.`}
         danger
       />
     </div>

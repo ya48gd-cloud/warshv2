@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useToast } from '../store/toast'
 import api, { bgErr } from '../api/client'
-import { egp, fmtDate } from '../utils/fmt'
+import { egp, fmtDate, today } from '../utils/fmt'
 import Modal, { ModalFooter } from '../components/ui/Modal'
 import { Input, Select } from '../components/ui/Field'
 import { PageSpinner } from '../components/ui/Spinner'
@@ -22,27 +22,37 @@ const TABS = [
 const PAY_METHODS = [
   { value: 'cash',     label: 'نقداً' },
   { value: 'transfer', label: 'تحويل بنكي' },
-  { value: 'check',    label: 'شيك' },
+  // الباك إند (InvoicePaymentIn) بيستخدم 'cheque' — القيمة القديمة 'check' كانت
+  // بتتسجل بقيمة مختلفة عن باقي شاشات الدفع فتتفرق في التقارير
+  { value: 'cheque',   label: 'شيك' },
+  { value: 'bill',     label: 'كمبيالة' },
   { value: 'other',    label: 'أخرى' },
 ]
 
 // ── مودال تسجيل دفعة ─────────────────────────────────────────
 function PayModal({ installment, onClose, onDone }) {
   const toast = useToast()
-  const remaining = installment.remaining_amount
+  const remaining = Number(installment.remaining_amount || 0)
   const [amount, setAmount]   = useState(remaining.toFixed(2))
   const [method, setMethod]   = useState('cash')
   const [notes, setNotes]     = useState('')
+  const [payDate, setPayDate] = useState(today())
+  const [reference, setReference] = useState('')
   const [loading, setLoading] = useState(false)
 
   async function submit() {
     const amt = parseFloat(amount)
     if (!amt || amt <= 0) return toast('أدخل مبلغ صحيح', 'error')
     if (amt > remaining + 0.01) return toast(`المبلغ أكبر من المتبقي (${remaining.toFixed(2)})`, 'error')
+    if (!payDate) return toast('حدد تاريخ الدفع', 'error')
+    if (loading) return
     setLoading(true)
     try {
       await api.sales.payInstallment(installment.invoice_id, installment.installment_id, {
-        amount: amt, payment_type: method, notes,
+        amount: amt, payment_type: method, notes: notes || null,
+        // من غير تاريخ صريح الباك إند كان بيسجّل الدفعة بتاريخ الفاتورة نفسها
+        payment_date: payDate,
+        reference: reference || null,
       })
       toast(`✅ تم تسجيل دفعة ${egp(amt)} بنجاح`)
       onDone()
@@ -77,6 +87,17 @@ function PayModal({ installment, onClose, onDone }) {
             options={PAY_METHODS}
           />
           <Input
+            label="تاريخ الدفع"
+            type="date"
+            value={payDate}
+            onChange={e => setPayDate(e.target.value)}
+          />
+          <Input
+            label="رقم المرجع (رقم الشيك / التحويل) — اختياري"
+            value={reference}
+            onChange={e => setReference(e.target.value)}
+          />
+          <Input
             label="ملاحظات (اختياري)"
             value={notes}
             onChange={e => setNotes(e.target.value)}
@@ -97,11 +118,17 @@ function PayModal({ installment, onClose, onDone }) {
 function EditInstallmentModal({ installment, onClose, onDone }) {
   const toast = useToast()
   const [dueDate, setDueDate] = useState(installment.due_date)
-  const [amount, setAmount]   = useState(installment.amount_due.toFixed(2))
+  const [amount, setAmount]   = useState(Number(installment.amount_due || 0).toFixed(2))
   const [label, setLabel]     = useState(installment.label || '')
   const [loading, setLoading] = useState(false)
 
   async function submit() {
+    const paid = Number(installment.paid_amount || 0)
+    if (amount !== '' && !(parseFloat(amount) > 0)) return toast('قيمة القسط يجب أن تكون أكبر من صفر', 'error')
+    if (amount !== '' && parseFloat(amount) + 0.005 < paid)
+      return toast(`قيمة القسط لا يمكن أن تقل عن المسدد منه (${egp(paid)})`, 'error')
+    if (!dueDate) return toast('حدد تاريخ الاستحقاق', 'error')
+    if (loading) return
     setLoading(true)
     try {
       await api.sales.patchInstallment(installment.invoice_id, installment.installment_id, {
@@ -158,7 +185,9 @@ function InstallmentRow({ ins, onPay, onEdit, onNavigate }) {
   const isOverdue  = ins.days_overdue > 0
   const daysLabel  = isOverdue
     ? <span style={{ color: 'var(--red)', fontWeight: 700 }}>متأخر {ins.days_overdue} يوم</span>
-    : <span style={{ color: 'var(--amber)' }}>خلال {-ins.days_overdue} يوم</span>
+    : ins.days_overdue === 0
+      ? <span style={{ color: 'var(--amber)', fontWeight: 700 }}>مستحق اليوم</span>
+      : <span style={{ color: 'var(--amber)' }}>خلال {-ins.days_overdue} يوم</span>
 
   return (
     <tr style={{ borderBottom: '1px solid var(--border)' }}>

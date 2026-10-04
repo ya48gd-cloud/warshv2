@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func as sqlfunc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,10 +20,21 @@ from app.core.database import get_db, current_tenant_id
 from app.api.auth import require_any
 from app.models.models import DeliveryOrder, DeliveryOrderLine, Customer
 
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر ينشئ/يسلّم أوامر
+    توريد (بتخصم مخزون FG وتسجّل COGS) بطلب API مباشر."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
 router = APIRouter(
     prefix="/delivery-orders",
     tags=["delivery-orders"],
-    dependencies=[Depends(require_any)],
+    dependencies=[Depends(require_any), Depends(_block_viewer_writes)],
 )
 
 
@@ -115,7 +126,25 @@ async def _next_code(db: AsyncSession, tid: int) -> str:
         select(sqlfunc.count(DeliveryOrder.id)).where(DeliveryOrder.tenant_id == tid)
     )
     n = (res.scalar() or 0) + 1
-    return f"DO-{n:04d}"
+    # إصلاح: الترقيم بالعدد بس كان بيكرر كود موجود بعد حذف أي مسودة
+    # (مثلاً DO-0001..DO-0003 ثم حذف DO-0002 → الجديد ياخد DO-0003 تاني).
+    while True:
+        code = f"DO-{n:04d}"
+        exists = await db.scalar(
+            select(DeliveryOrder.id).where(DeliveryOrder.tenant_id == tid, DeliveryOrder.code == code)
+        )
+        if not exists:
+            return code
+        n += 1
+
+
+def _parse_date(v: Optional[str], label: str) -> Optional[date]:
+    if v is None or v == "":
+        return None
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except ValueError:
+        raise HTTPException(400, f"{label} غير صالح: '{v}'")
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -142,6 +171,30 @@ async def create_order(data: DeliveryOrderIn, db: AsyncSession = Depends(get_db)
         raise HTTPException(400, "اسم السائق مطلوب")
     if not data.vehicle_plate.strip():
         raise HTTPException(400, "رقم اللوحة مطلوب")
+    order_date = _parse_date(data.order_date, "تاريخ الأمر")
+    if order_date is None:
+        raise HTTPException(400, "تاريخ الأمر مطلوب")
+    delivery_date = _parse_date(data.delivery_date, "تاريخ التسليم")
+    if delivery_date and delivery_date < order_date:
+        raise HTTPException(400, "تاريخ التسليم لا يمكن أن يكون قبل تاريخ الأمر")
+    from decimal import Decimal as _D, InvalidOperation as _IO
+    from app.models.models import WorkOrder as _WO, Equipment as _Eq
+    for l in data.lines:
+        if not (l.description or "").strip():
+            raise HTTPException(400, "وصف كل بند مطلوب")
+        # إصلاح ثغرة تحقق: ربط البند بأمر إنتاج/معدة من tenant تاني أو غير
+        # موجودين كان بيتقبل، والكمية الغلط ماكانتش بتظهر غير وقت التسليم.
+        if l.work_order_id is not None:
+            if not await db.get(_WO, l.work_order_id):
+                raise HTTPException(404, f"البند '{l.description}': أمر الإنتاج المرتبط غير موجود")
+            try:
+                _q = _D(str(l.qty).strip())
+            except (_IO, ValueError):
+                raise HTTPException(400, f"البند '{l.description}': الكمية '{l.qty}' غير رقمية")
+            if _q <= 0:
+                raise HTTPException(400, f"البند '{l.description}': الكمية لازم تكون أكبر من صفر")
+        if l.equipment_id is not None and not await db.get(_Eq, l.equipment_id):
+            raise HTTPException(404, f"البند '{l.description}': المعدة المرتبطة غير موجودة")
 
     # تحقق من وجود العميل
     cust = await db.get(Customer, data.customer_id)
@@ -154,11 +207,11 @@ async def create_order(data: DeliveryOrderIn, db: AsyncSession = Depends(get_db)
         tenant_id=        tid,
         code=             code,
         status=           "draft",
-        order_date=       date.fromisoformat(data.order_date),
+        order_date=       order_date,
         customer_id=      data.customer_id,
         reference=        data.reference,
         notes=            data.notes,
-        delivery_date=    date.fromisoformat(data.delivery_date) if data.delivery_date else None,
+        delivery_date=    delivery_date,
         delivery_address= data.delivery_address,
         received_by=      data.received_by,
         receiver_title=   data.receiver_title,
@@ -245,6 +298,10 @@ async def _check_fg_availability(db: AsyncSession, tid: int, line: DeliveryOrder
 
     if qty <= 0:
         raise HTTPException(400, f"البند '{line.description}': الكمية لازم تكون أكبر من صفر")
+    # لو المعدة اتفوترت قبل التسليم، الفاتورة هي اللي خصمتها من FG بالفعل —
+    # التسليم مش لازم يخصمها تاني (كان بيترفض بـ"الرصيد غير كافٍ")
+    from app.services.inventory_ledger import fg_qty_to_release
+    qty = await fg_qty_to_release(db, wo, fg_mat, extra_delivered=qty)
     if qty > (fg_mat.stock_qty or Decimal("0")):
         raise HTTPException(
             400,
@@ -260,6 +317,8 @@ async def _release_fg_stock_for_line(db: AsyncSession, tid: int, order: Delivery
     from app.services.inventory_ledger import get_or_create_warehouse_bin, post_issue
     from app.services.auto_journal import journal_cogs
 
+    if not qty or qty <= 0:
+        return  # اتخصمت بالفعل وقت الفاتورة
     unit_cost = fg_mat.unit_cost or Decimal("0")
     cogs_amount = qty * unit_cost  # نحسبها قبل post_issue عشان نستخدم نفس أساس التكلفة بالظبط
 
@@ -300,6 +359,20 @@ async def update_status(order_id: int, body: StatusIn, db: AsyncSession = Depend
         linked_lines = [l for l in (o.lines or []) if l.work_order_id]
         # المرحلة 1: تحقق فقط — من غير أي تعديل. أول مشكلة بترفض العملية كاملة.
         checked = [(line, *(await _check_fg_availability(db, tid, line))) for line in linked_lines]
+        # إصلاح: كل بند كان بيتفحص لوحده مقابل نفس الرصيد — بندين على نفس أمر
+        # الإنتاج (كل واحد ≤ الرصيد ومجموعهم أكبر) كانوا بيعدّوا الفحص ويقع
+        # post_issue في النص بعد ما جزء اتخصم. نفحص المجموع لكل مادة FG.
+        need: dict = {}
+        for line, fg_mat, qty in checked:
+            need.setdefault(fg_mat.id, [fg_mat, 0])
+            need[fg_mat.id][1] += qty
+        for fg_mat, total_qty in need.values():
+            if total_qty > (fg_mat.stock_qty or 0):
+                raise HTTPException(
+                    400,
+                    f"مجموع الكميات المطلوب تسليمها من {fg_mat.code} ({total_qty}) أكبر من "
+                    f"الرصيد الفعلي المتاح ({fg_mat.stock_qty})",
+                )
         # المرحلة 2: التنفيذ الفعلي — مضمون ينجح لأن التحقق عدّى بالفعل.
         for line, fg_mat, qty in checked:
             await _release_fg_stock_for_line(db, tid, o, fg_mat, qty)

@@ -17,6 +17,10 @@ const COLORS = [
 
 let nextId = 1
 
+const isPosNum = (v) => v !== '' && v != null && Number.isFinite(Number(v)) && Number(v) > 0
+const isValidQty = (v) => Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 10000
+const STOCK_SOURCE_AR = { remnant: 'نسالة', bulk: 'مخزون عام' }
+
 function groupLinesByMaterial(lines) {
   const groups = {}
   for (const l of lines) {
@@ -55,6 +59,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
   const [useStock, setUseStock] = useState(false)
   const [stockItems, setStockItems] = useState([])
   const [loadingStock, setLoadingStock] = useState(false)
+  const [stockBusy, setStockBusy] = useState(false)
   const [newStock, setNewStock] = useState({ length_cm: '', width_cm: '', qty: 1, source: 'purchased' })
 
   // ── تقطيع الحديد/القضبان (1D) ───────────────────────────────────────
@@ -74,6 +79,9 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
   // ── الهالك المتبقي بعد التقطيع: قرارات نسالة/هالك نهائي ───────────────
   const [wasteDecisions, setWasteDecisions] = useState({})
   const [committing, setCommitting] = useState(false)
+  // منع تأكيد نفس المخطط مرتين (كان بيسجّل نسالة/هالك مكرر في المخزون)
+  const [committedSheetResult, setCommittedSheetResult] = useState(null)
+  const [committedBarResult, setCommittedBarResult] = useState(null)
 
   // ── تحميل القطع من BOM (مشترك) ───────────────────────────────────────
   const [bomEquipmentId, setBomEquipmentId] = useState(equipmentId ? String(equipmentId) : '')
@@ -104,6 +112,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
     try {
       const items = await api.inventory.sheetStock(id)
       setStockItems(items || [])
+    } catch (e) {
+      toast(e?.message || 'تعذّر تحميل مخزون الألواح', 'error')
     } finally {
       setLoadingStock(false)
     }
@@ -122,19 +132,42 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       toast('أدخل مقاس اللوح (الطول والعرض)', 'error')
       return
     }
-    await api.inventory.createSheetStock({
-      material_id: Number(materialId),
-      length_cm: Number(newStock.length_cm),
-      width_cm: Number(newStock.width_cm),
-      qty: Number(newStock.qty || 1),
-      source: newStock.source,
-    })
-    setNewStock({ length_cm: '', width_cm: '', qty: 1, source: 'purchased' })
-    loadStockItems(materialId)
+    if (!isPosNum(newStock.length_cm) || !isPosNum(newStock.width_cm)) {
+      toast('الأبعاد يجب أن تكون أكبر من صفر', 'error')
+      return
+    }
+    if (!(Number.isInteger(Number(newStock.qty || 1)) && Number(newStock.qty || 1) >= 1)) {
+      toast('العدد يجب أن يكون رقماً صحيحاً 1 على الأقل', 'error')
+      return
+    }
+    if (stockBusy) return
+    setStockBusy(true)
+    try {
+      await api.inventory.createSheetStock({
+        material_id: Number(materialId),
+        length_cm: Number(newStock.length_cm),
+        width_cm: Number(newStock.width_cm),
+        qty: Number(newStock.qty || 1),
+        source: newStock.source,
+      })
+      toast('تمت إضافة المقاس', 'success')
+      setNewStock({ length_cm: '', width_cm: '', qty: 1, source: 'purchased' })
+      loadStockItems(materialId)
+    } catch (e) {
+      toast(e?.message || 'تعذّر إضافة المقاس', 'error')
+    } finally {
+      setStockBusy(false)
+    }
   }
 
   const removeStockItem = async (id) => {
-    await api.inventory.deleteSheetStock(id)
+    if (!window.confirm('حذف هذا المقاس من مخزون الألواح؟')) return
+    try {
+      await api.inventory.deleteSheetStock(id)
+      toast('تم الحذف', 'success')
+    } catch (e) {
+      toast(e?.message || 'تعذّر الحذف', 'error')
+    }
     loadStockItems(materialId)
   }
 
@@ -144,6 +177,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
     try {
       const items = await api.inventory.barStock(id)
       setBarStockItems(items || [])
+    } catch (e) {
+      toast(e?.message || 'تعذّر تحميل مخزون الأسياخ', 'error')
     } finally {
       setLoadingBarStock(false)
     }
@@ -162,18 +197,41 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       toast('أدخل طول السيخ', 'error')
       return
     }
-    await api.inventory.createBarStock({
-      material_id: Number(barMaterialId),
-      length_cm: Number(newBarStock.length_cm),
-      qty: Number(newBarStock.qty || 1),
-      source: newBarStock.source,
-    })
-    setNewBarStock({ length_cm: '', qty: 1, source: 'purchased' })
-    loadBarStockItems(barMaterialId)
+    if (!isPosNum(newBarStock.length_cm)) {
+      toast('الطول يجب أن يكون أكبر من صفر', 'error')
+      return
+    }
+    if (!(Number.isInteger(Number(newBarStock.qty || 1)) && Number(newBarStock.qty || 1) >= 1)) {
+      toast('العدد يجب أن يكون رقماً صحيحاً 1 على الأقل', 'error')
+      return
+    }
+    if (stockBusy) return
+    setStockBusy(true)
+    try {
+      await api.inventory.createBarStock({
+        material_id: Number(barMaterialId),
+        length_cm: Number(newBarStock.length_cm),
+        qty: Number(newBarStock.qty || 1),
+        source: newBarStock.source,
+      })
+      toast('تمت إضافة الطول', 'success')
+      setNewBarStock({ length_cm: '', qty: 1, source: 'purchased' })
+      loadBarStockItems(barMaterialId)
+    } catch (e) {
+      toast(e?.message || 'تعذّر إضافة الطول', 'error')
+    } finally {
+      setStockBusy(false)
+    }
   }
 
   const removeBarStockItem = async (id) => {
-    await api.inventory.deleteBarStock(id)
+    if (!window.confirm('حذف هذا الطول من مخزون الأسياخ؟')) return
+    try {
+      await api.inventory.deleteBarStock(id)
+      toast('تم الحذف', 'success')
+    } catch (e) {
+      toast(e?.message || 'تعذّر الحذف', 'error')
+    }
     loadBarStockItems(barMaterialId)
   }
 
@@ -244,6 +302,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       const barGroups = groupLinesByMaterial(barLines)
       if (barGroups.length === 1) applyBomBarGroup(barGroups[0])
       else if (barGroups.length > 1) setBomBarGroups(barGroups)
+    } catch (e) {
+      toast(e?.message || 'تعذّر تحميل BOM المعدة', 'error')
     } finally {
       setBomLoading(false)
     }
@@ -273,10 +333,31 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
     } else if (!sheetW || !sheetH) {
       toast('حدد مقاس اللوح (طول وعرض)', 'error')
       return
+    } else if (!isPosNum(sheetW) || !isPosNum(sheetH)) {
+      toast('مقاس اللوح يجب أن يكون أكبر من صفر', 'error')
+      return
     }
-    const validPieces = pieces.filter(p => p.label && p.width && p.height && Number(p.qty) > 0)
+    if (kerf !== '' && !(Number(kerf) >= 0)) {
+      toast('سُمك القطع (kerf) لا يمكن أن يكون سالباً', 'error')
+      return
+    }
+    // صفوف فيها أبعاد بدون اسم كانت بتتشال بصمت من الحساب — ننبّه بدل ما نسقطها
+    const partial = pieces.filter(p => (p.width || p.height) && !(p.label || '').trim())
+    if (partial.length) {
+      toast('أدخل الكود/الاسم لكل قطعة لها مقاسات', 'error')
+      return
+    }
+    const validPieces = pieces.filter(p => (p.label || '').trim() && p.width && p.height && Number(p.qty) > 0)
     if (!validPieces.length) {
       toast('أضف قطعة واحدة على الأقل بمقاساتها', 'error')
+      return
+    }
+    if (validPieces.some(p => !isPosNum(p.width) || !isPosNum(p.height))) {
+      toast('أبعاد القطعة يجب أن تكون أكبر من صفر', 'error')
+      return
+    }
+    if (validPieces.some(p => !isValidQty(p.qty))) {
+      toast('عدد القطع يجب أن يكون رقماً صحيحاً بين 1 و 10000', 'error')
       return
     }
     const payload = {
@@ -291,7 +372,9 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       })),
     }
     const res = await api.inventory.cuttingPlan(payload)
-    setResult(res)
+    // نتيجة جديدة → قرارات الهالك القديمة (بنفس المفاتيح s1-0…) لا تنطبق عليها
+    setWasteDecisions(d => Object.fromEntries(Object.entries(d).filter(([k]) => !k.startsWith('s'))))
+    setResult(res ? { ...res, _materialId: materialId } : res)
   })
 
   const [runBar, computingBar] = useAction(async () => {
@@ -303,10 +386,30 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
     } else if (!barLength) {
       toast('حدد طول القضيب', 'error')
       return
+    } else if (!isPosNum(barLength)) {
+      toast('طول القضيب يجب أن يكون أكبر من صفر', 'error')
+      return
     }
-    const validPieces = barPieces.filter(p => p.label && p.length && Number(p.qty) > 0)
+    if (barKerf !== '' && !(Number(barKerf) >= 0)) {
+      toast('سُمك القطع (kerf) لا يمكن أن يكون سالباً', 'error')
+      return
+    }
+    const partial = barPieces.filter(p => p.length && !(p.label || '').trim())
+    if (partial.length) {
+      toast('أدخل الكود/الاسم لكل قطعة لها طول', 'error')
+      return
+    }
+    const validPieces = barPieces.filter(p => (p.label || '').trim() && p.length && Number(p.qty) > 0)
     if (!validPieces.length) {
       toast('أضف قطعة واحدة على الأقل بمقاسها', 'error')
+      return
+    }
+    if (validPieces.some(p => !isPosNum(p.length))) {
+      toast('طول القطعة يجب أن يكون أكبر من صفر', 'error')
+      return
+    }
+    if (validPieces.some(p => !isValidQty(p.qty))) {
+      toast('عدد القطع يجب أن يكون رقماً صحيحاً بين 1 و 10000', 'error')
       return
     }
     const payload = {
@@ -319,7 +422,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       })),
     }
     const res = await api.inventory.barCuttingPlan(payload)
-    setBarResult(res)
+    setWasteDecisions(d => Object.fromEntries(Object.entries(d).filter(([k]) => !k.startsWith('b'))))
+    setBarResult(res ? { ...res, _materialId: barMaterialId } : res)
   })
 
   // ── هالك الألواح: تصنيف النسالة القابلة للحفظ مقابل الهالك النهائي ──────
@@ -329,7 +433,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
   const sheetWasteItems = useMemo(() => {
     if (!result) return []
     const items = []
-    result.sheets.forEach(sheet => {
+    ;(result.sheets || []).forEach(sheet => {
       ;(sheet.waste_rects || []).forEach((r, i) => {
         const areaM2 = (r.width * r.height) / 10000
         if (areaM2 < 0.001) return
@@ -352,7 +456,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
   const barWasteItems = useMemo(() => {
     if (!barResult) return []
     const items = []
-    barResult.bars.forEach(bar => {
+    ;(barResult.bars || []).forEach(bar => {
       if (bar.waste_length > 0.01) {
         items.push({
           key: `b${bar.index}`,
@@ -389,6 +493,13 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       toast('اختر المادة أولاً', 'error')
       return
     }
+    if (committing || committedSheetResult === result) return
+    // المخطط اتحسب لمادة مختلفة عن المختارة حالياً → تسجيل النسالة على المادة الغلط
+    if (result?._materialId && String(result._materialId) !== String(materialId)) {
+      toast('تم تغيير المادة بعد حساب المخطط — أعد حساب المخطط أولاً', 'error')
+      return
+    }
+    if (!window.confirm('تأكيد تسجيل الهالك/النسالة في المخزون؟ لا يمكن التراجع عن هذه العملية من هنا.')) return
     setCommitting(true)
     try {
       const waste_items = sheetWasteItems.map(it => ({
@@ -399,8 +510,11 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
         action: wasteDecisions[it.key] || (it.eligible ? 'remnant' : 'scrap'),
       }))
       const res = await api.inventory.commitCuttingPlan({ material_id: Number(materialId), waste_items })
-      toast(`تم تحديث المخزون — ${res.remnants_created.length} نسالة جديدة، ${res.scrap_records.length} سجل هالك`, 'success')
+      toast(`تم تحديث المخزون — ${res?.remnants_created?.length ?? 0} نسالة جديدة، ${res?.scrap_records?.length ?? 0} سجل هالك`, 'success')
+      setCommittedSheetResult(result)
       loadStockItems(materialId)
+    } catch (e) {
+      toast(e?.message || 'تعذّر تحديث المخزون', 'error')
     } finally {
       setCommitting(false)
     }
@@ -411,6 +525,12 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
       toast('اختر المادة أولاً', 'error')
       return
     }
+    if (committing || committedBarResult === barResult) return
+    if (barResult?._materialId && String(barResult._materialId) !== String(barMaterialId)) {
+      toast('تم تغيير المادة بعد حساب المخطط — أعد حساب المخطط أولاً', 'error')
+      return
+    }
+    if (!window.confirm('تأكيد تسجيل الهالك/النسالة في المخزون؟ لا يمكن التراجع عن هذه العملية من هنا.')) return
     setCommitting(true)
     try {
       const waste_items = barWasteItems.map(it => ({
@@ -420,8 +540,11 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
         action: wasteDecisions[it.key] || (it.eligible ? 'remnant' : 'scrap'),
       }))
       const res = await api.inventory.commitCuttingPlan({ material_id: Number(barMaterialId), waste_items })
-      toast(`تم تحديث المخزون — ${res.remnants_created.length} نسالة جديدة، ${res.scrap_records.length} سجل هالك`, 'success')
+      toast(`تم تحديث المخزون — ${res?.remnants_created?.length ?? 0} نسالة جديدة، ${res?.scrap_records?.length ?? 0} سجل هالك`, 'success')
+      setCommittedBarResult(barResult)
       loadBarStockItems(barMaterialId)
+    } catch (e) {
+      toast(e?.message || 'تعذّر تحديث المخزون', 'error')
     } finally {
       setCommitting(false)
     }
@@ -502,9 +625,9 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
               <option key={m.id} value={m.id}>{m.code} — {m.name_ar}</option>
             ))}
           </Select>
-          <Input label="عرض اللوح (سم)" type="number" value={sheetW} onChange={e => setSheetW(e.target.value)} disabled={useStock} />
-          <Input label="ارتفاع اللوح (سم)" type="number" value={sheetH} onChange={e => setSheetH(e.target.value)} disabled={useStock} />
-          <Input label="سُمك القص - kerf (مم)" type="number" value={kerf} onChange={e => setKerf(e.target.value)} />
+          <Input label="عرض اللوح (سم)" type="number" min="0" value={sheetW} onChange={e => setSheetW(e.target.value)} disabled={useStock} />
+          <Input label="ارتفاع اللوح (سم)" type="number" min="0" value={sheetH} onChange={e => setSheetH(e.target.value)} disabled={useStock} />
+          <Input label="سُمك القص - kerf (مم)" type="number" min="0" value={kerf} onChange={e => setKerf(e.target.value)} />
           <label className="flex items-center gap-2 mt-6">
             <input type="checkbox" checked={allowRotation} onChange={e => setAllowRotation(e.target.checked)} />
             <span className="text-sm">السماح بتدوير القطع 90°</span>
@@ -540,7 +663,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
                         <td>{item.length_cm}</td>
                         <td>{item.width_cm}</td>
                         <td>{item.qty}</td>
-                        <td>{item.source === 'remnant' ? 'نسالة' : 'لوح جديد'}</td>
+                        <td>{STOCK_SOURCE_AR[item.source] || 'لوح جديد'}</td>
                         <td>
                           <button className="btn btn-sm btn-secondary" onClick={() => removeStockItem(item.id)}>حذف</button>
                         </td>
@@ -561,7 +684,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
                 <option value="purchased">لوح جديد</option>
                 <option value="remnant">نسالة</option>
               </Select>
-              <button className="btn btn-sm btn-primary" onClick={addStockItem}>+ إضافة مقاس</button>
+              <button className="btn btn-sm btn-primary" onClick={addStockItem} disabled={stockBusy}>{stockBusy ? '…' : '+ إضافة مقاس'}</button>
             </div>
           </div>
         )}
@@ -604,7 +727,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
 
       {result && (
         <div className="flex flex-col gap-4">
-          <div className="card flex items-center gap-6">
+          <div className="card flex items-center gap-6 flex-wrap">
             <div>
               <div className="text-xs text-erp-muted">عدد الألواح المطلوبة</div>
               <div className="text-2xl font-bold" style={{ color: 'var(--teal)' }}>{result.total_sheets}</div>
@@ -639,14 +762,14 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {result.sheets.map(sheet => (
+            {(result.sheets || []).map(sheet => (
               <div key={sheet.index} className="card flex flex-col gap-2">
                 <div className="flex items-center justify-between">
                   <div className="font-bold">
                     لوح #{sheet.index}
                     {sheet.source && (
                       <span className="text-xs font-normal text-erp-muted">
-                        {' '}— {sheet.source === 'remnant' ? 'نسالة' : 'لوح جديد'} ({sheet.sheet_width}×{sheet.sheet_height})
+                        {' '}— {STOCK_SOURCE_AR[sheet.source] || 'لوح جديد'} ({sheet.sheet_width}×{sheet.sheet_height})
                       </span>
                     )}
                   </div>
@@ -696,8 +819,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
                 </table>
               </div>
               <div>
-                <button className="btn btn-primary" onClick={commitSheetWaste} disabled={committing}>
-                  {committing ? 'جارٍ التحديث...' : 'تأكيد وتحديث المخزون'}
+                <button className="btn btn-primary" onClick={commitSheetWaste} disabled={committing || committedSheetResult === result}>
+                  {committing ? 'جارٍ التحديث...' : committedSheetResult === result ? '✓ تم تحديث المخزون لهذا المخطط' : 'تأكيد وتحديث المخزون'}
                 </button>
               </div>
             </div>
@@ -720,8 +843,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
               <option key={m.id} value={m.id}>{m.code} — {m.name_ar}</option>
             ))}
           </Select>
-          <Input label="طول القضيب (سم)" type="number" value={barLength} onChange={e => setBarLength(e.target.value)} disabled={useBarStock} />
-          <Input label="سُمك القص - kerf (مم)" type="number" value={barKerf} onChange={e => setBarKerf(e.target.value)} />
+          <Input label="طول القضيب (سم)" type="number" min="0" value={barLength} onChange={e => setBarLength(e.target.value)} disabled={useBarStock} />
+          <Input label="سُمك القص - kerf (مم)" type="number" min="0" value={barKerf} onChange={e => setBarKerf(e.target.value)} />
         </div>
 
         <label className="flex items-center gap-2">
@@ -752,7 +875,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
                       <tr key={item.id}>
                         <td>{item.length_cm}</td>
                         <td>{item.qty}</td>
-                        <td>{item.source === 'remnant' ? 'نسالة' : 'سيخ جديد'}</td>
+                        <td>{STOCK_SOURCE_AR[item.source] || 'سيخ جديد'}</td>
                         <td>
                           <button className="btn btn-sm btn-secondary" onClick={() => removeBarStockItem(item.id)}>حذف</button>
                         </td>
@@ -772,7 +895,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
                 <option value="purchased">سيخ جديد</option>
                 <option value="remnant">نسالة</option>
               </Select>
-              <button className="btn btn-sm btn-primary" onClick={addBarStockItem}>+ إضافة مقاس</button>
+              <button className="btn btn-sm btn-primary" onClick={addBarStockItem} disabled={stockBusy}>{stockBusy ? '…' : '+ إضافة مقاس'}</button>
             </div>
           </div>
         )}
@@ -814,7 +937,7 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
 
       {barResult && (
         <div className="flex flex-col gap-4">
-          <div className="card flex items-center gap-6">
+          <div className="card flex items-center gap-6 flex-wrap">
             <div>
               <div className="text-xs text-erp-muted">عدد القضبان المطلوبة</div>
               <div className="text-2xl font-bold" style={{ color: 'var(--teal)' }}>{barResult.total_bars}</div>
@@ -827,21 +950,34 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
               <div className="text-xs text-erp-muted">نسبة الاستفادة الكلية</div>
               <div className="text-2xl font-bold">{barResult.overall_efficiency_pct}%</div>
             </div>
-            <div>
-              <div className="text-xs text-erp-muted">طول القضيب</div>
-              <div className="text-lg font-bold">{barResult.bar_length} سم</div>
-            </div>
+            {barResult.bar_length != null && (
+              <div>
+                <div className="text-xs text-erp-muted">طول القضيب</div>
+                <div className="text-lg font-bold">{barResult.bar_length} سم</div>
+              </div>
+            )}
           </div>
 
+          {barResult.shortage && barResult.shortage.length > 0 && (
+            <div className="card" style={{ borderColor: '#f87171' }}>
+              <div className="font-bold text-sm" style={{ color: '#dc2626' }}>⚠️ نواقص — لا يكفي المخزون المتاح لتغطية:</div>
+              <ul className="text-sm mt-1">
+                {barResult.shortage.map((s, i) => (
+                  <li key={i}>{s.label}: {s.qty} قطعة</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="flex flex-col gap-3">
-            {barResult.bars.map(bar => (
+            {(barResult.bars || []).map(bar => (
               <div key={bar.index} className="card flex flex-col gap-2">
                 <div className="flex items-center justify-between">
                   <div className="font-bold">
                     قضيب #{bar.index}
                     {bar.source && (
                       <span className="text-xs font-normal text-erp-muted">
-                        {' '}— {bar.source === 'remnant' ? 'نسالة' : 'سيخ جديد'} ({bar.bar_length})
+                        {' '}— {STOCK_SOURCE_AR[bar.source] || 'سيخ جديد'} ({bar.bar_length})
                       </span>
                     )}
                   </div>
@@ -890,8 +1026,8 @@ export default function CuttingPlan({ equipmentId, plannedLength }) {
                 </table>
               </div>
               <div>
-                <button className="btn btn-primary" onClick={commitBarWaste} disabled={committing}>
-                  {committing ? 'جارٍ التحديث...' : 'تأكيد وتحديث المخزون'}
+                <button className="btn btn-primary" onClick={commitBarWaste} disabled={committing || committedBarResult === barResult}>
+                  {committing ? 'جارٍ التحديث...' : committedBarResult === barResult ? '✓ تم تحديث المخزون لهذا المخطط' : 'تأكيد وتحديث المخزون'}
                 </button>
               </div>
             </div>
@@ -908,7 +1044,7 @@ function BarSVG({ bar }) {
   return (
     <svg viewBox={`0 0 ${barLength} 20`} style={{ width: '100%', height: '60px', background: '#f8fafc', border: '1px solid var(--erp-border)' }}>
       <rect x="0" y="0" width={barLength} height="20" fill="none" stroke="#94a3b8" strokeWidth="0.4" />
-      {bar.cuts.map((c, i) => {
+      {(bar.cuts || []).map((c, i) => {
         const cx = x + c.length / 2
         const el = (
           <g key={i}>
@@ -1001,7 +1137,7 @@ function SheetSVG({ sheet, sheetW, sheetH }) {
           </g>
         )
       })}
-      {sheet.placements.map((p, i) => (
+      {(sheet.placements || []).map((p, i) => (
         <g key={i}>
           <rect
             x={p.x} y={p.y} width={p.width} height={p.height}

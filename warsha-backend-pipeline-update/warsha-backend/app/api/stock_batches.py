@@ -8,14 +8,17 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 
 from app.core.database import get_db
 from app.api.auth import require_any
 from app.models.models import StockBatch, Material, Supplier
 from app.services.inventory_ledger import post_receipt, post_issue
 
-router = APIRouter(prefix="/inventory/batches", tags=["stock_batches"], dependencies=[Depends(require_any)])
+from app.api.inventory import require_inventory_write
+
+router = APIRouter(prefix="/inventory/batches", tags=["stock_batches"],
+                   dependencies=[Depends(require_any), Depends(require_inventory_write)])
 
 
 class BatchIn(BaseModel):
@@ -29,10 +32,25 @@ class BatchIn(BaseModel):
     expiry_date: Optional[date] = None
     notes: Optional[str] = None
 
+    @validator("lot_number")
+    def _lot_required(cls, v):
+        # رقم دُفعة فاضي/مسافات كان بيتقبل، و" L1" و"L1" بيتحسبوا دفعتين مختلفتين
+        if v is None or not v.strip():
+            raise ValueError("رقم الدُفعة مطلوب")
+        if len(v.strip()) > 100:
+            raise ValueError("رقم الدُفعة طويل جداً (الحد الأقصى 100 حرف)")
+        return v.strip()
+
 
 class BatchIssueIn(BaseModel):
     qty: Decimal
     reference: Optional[str] = None
+
+    @validator("qty")
+    def _qty_positive(cls, v):
+        if v is None or v <= 0:
+            raise ValueError("كمية الصرف يجب أن تكون أكبر من صفر")
+        return v
 
 
 def batch_dict(b: StockBatch) -> dict:
@@ -113,6 +131,14 @@ async def create_batch(data: BatchIn, db: AsyncSession = Depends(get_db)):
         )
         if not owns_sup:
             raise HTTPException(400, "المورد المحدد غير موجود")
+    if data.purchase_invoice_id is not None:
+        # نفس فحص المورد: فاتورة شراء تنانت تاني (أو id وهمي) مكانتش بتتفحص
+        from app.models.models import PurchaseInvoice as _PI_batch
+        owns_pi = await db.scalar(
+            select(_PI_batch.id).where(_PI_batch.id == data.purchase_invoice_id, _PI_batch.tenant_id == tid)
+        )
+        if not owns_pi:
+            raise HTTPException(400, "فاتورة الشراء المحددة غير موجودة")
 
     batch = StockBatch(
         tenant_id=tid,

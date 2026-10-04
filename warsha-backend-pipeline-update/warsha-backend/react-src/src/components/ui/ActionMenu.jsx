@@ -16,7 +16,15 @@ export default function ActionMenu({ items, title = 'إجراءات أخرى' })
     return () => document.removeEventListener('mousedown', h)
   }, [])
 
-  const visibleItems = items.filter(Boolean)
+  // Escape يقفل القائمة
+  useEffect(() => {
+    if (!open) return
+    const k = (e) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('keydown', k)
+    return () => document.removeEventListener('keydown', k)
+  }, [open])
+
+  const visibleItems = (items || []).filter(Boolean)
   if (visibleItems.length === 0) return null
 
   return (
@@ -25,12 +33,15 @@ export default function ActionMenu({ items, title = 'إجراءات أخرى' })
         type="button"
         className="btn btn-sm text-xs"
         title={title}
+        aria-label={title}
+        aria-haspopup="menu"
+        aria-expanded={open}
         onClick={() => setOpen(o => !o)}
         style={{ padding: '4px 8px' }}
       >⋮</button>
 
       {open && (
-        <div style={{
+        <div role="menu" style={{
           position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 30,
           minWidth: 160, background: 'var(--bg)', border: '1px solid var(--erp-border)',
           borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', overflow: 'hidden',
@@ -39,8 +50,9 @@ export default function ActionMenu({ items, title = 'إجراءات أخرى' })
             <button
               key={i}
               type="button"
+              role="menuitem"
               disabled={item.disabled}
-              onClick={() => { setOpen(false); item.onClick() }}
+              onClick={() => { setOpen(false); item.onClick?.() }}
               style={{
                 display: 'flex', alignItems: 'center', gap: 8, width: '100%',
                 padding: '8px 12px', fontSize: 13, textAlign: 'right',

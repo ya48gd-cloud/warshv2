@@ -12,6 +12,24 @@ from dataclasses import dataclass, field
 
 TOL = 1e-6
 
+# حد أقصى لإجمالي عدد القطع في مخطط واحد — حماية من استهلاك ذاكرة/معالج غير
+# محدود (كل قطعة بتتفرد كعنصر مستقل في الخوارزمية)
+MAX_TOTAL_PIECES = 200000
+
+
+def _validate_inputs(pieces: list[dict], kerf: float) -> None:
+    """فحوصات مشتركة لكل مولّدات مخططات التقطيع (دفاع إضافي فوق فحوصات الـAPI)."""
+    if kerf is None or kerf < 0:
+        raise ValueError("سُمك القطع (kerf) لا يمكن أن يكون سالباً")
+    total = 0
+    for p in pieces or []:
+        qty = int(p.get("qty", 1))
+        if qty < 0:
+            raise ValueError(f"عدد القطع '{p.get('label', '')}' لا يمكن أن يكون سالباً")
+        total += qty
+    if total > MAX_TOTAL_PIECES:
+        raise ValueError(f"إجمالي عدد القطع ({total}) يتجاوز الحد الأقصى ({MAX_TOTAL_PIECES})")
+
 
 def _merge_free_rects(rects: list[dict]) -> list[dict]:
     """يدمج مستطيلات الهالك المتجاورة (نفس العرض/الارتفاع ومتلاصقة) في مستطيل واحد أكبر،
@@ -338,6 +356,7 @@ def build_cutting_plan(sheet_w: float, sheet_h: float, pieces: list[dict],
     """
     if sheet_w <= 0 or sheet_h <= 0:
         raise ValueError("مقاس اللوح غير صالح")
+    _validate_inputs(pieces, kerf)
 
     items_grouped = []
     items_free = []
@@ -447,6 +466,7 @@ def build_cutting_plan_from_stock(stock_items: list[dict], pieces: list[dict],
     stock_items: [{"id": int, "length": float, "width": float, "qty": int, "source": "purchased"|"remnant"}]
     pieces: [{"label": str, "width": float, "height": float, "qty": int}]
     """
+    _validate_inputs(pieces, kerf)
     items = []
     for p in pieces:
         w = float(p["width"]) + kerf
@@ -537,6 +557,7 @@ def build_bar_cutting_plan_from_stock(stock_items: list[dict], pieces: list[dict
     stock_items: [{"id": int, "length": float, "qty": int, "source": "purchased"|"remnant"}]
     pieces: [{"label": str, "length": float, "qty": int}]
     """
+    _validate_inputs(pieces, kerf)
     items = []
     for p in pieces:
         length = float(p["length"])
@@ -615,6 +636,7 @@ def build_bar_cutting_plan(bar_length: float, pieces: list[dict], kerf: float = 
     """
     if bar_length <= 0:
         raise ValueError("طول القضيب غير صالح")
+    _validate_inputs(pieces, kerf)
 
     items = []
     for p in pieces:

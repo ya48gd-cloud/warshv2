@@ -70,7 +70,9 @@ export default function Orders() {
 
   // ── Open add modal ────────────────────────────────────────────
   const openAdd = async () => {
-    const { code } = await api.customers.nextOrderCode().catch(bgErr('كود الطلب التالي', { code: '' }))
+    const { code } = (await api.customers.nextOrderCode().catch(bgErr('كود الطلب التالي', { code: '' }))) || { code: '' }
+    // إصلاح: فتح "طلب جديد" بعد إلغاء تعديل طلب قديم كان بيحفظ فوق الطلب القديم
+    setEditingOrderId(null)
     setForm({ code, status: 'pending', order_date: today(), delivery_date: '' })
     setLines([{ ...EMPTY_LINE }])
     setModal('add')
@@ -87,6 +89,8 @@ export default function Orders() {
       notes:         o.notes || '',
     })
     setLines((o.lines || []).map(l => ({
+      // الحفاظ على ربط البند بالمعدة (OrderLineIn.equipment_id) عند التعديل
+      equipment_id: l.equipment_id ?? null,
       description: l.description,
       qty:         l.qty,
       unit:        l.unit,
@@ -100,7 +104,14 @@ export default function Orders() {
   // ── Create ────────────────────────────────────────────────────
   const [save, saving] = useAction(async () => {
     if (!form.customer_id) { toast('اختر العميل', 'error'); return }
-    const validLines = lines.filter(l => l.description.trim() && +l.qty > 0)
+    // بدل ما البنود الناقصة تتشال بصمت من الطلب، ننبّه المستخدم
+    const touched = lines.filter(l => (l.description || '').trim() || l.unit_price !== '' && l.unit_price != null && Number(l.unit_price) !== 0)
+    if (touched.some(l => !(l.description || '').trim())) { toast('أدخل وصف لكل البنود (أو احذف البند الفاضي)', 'error'); return }
+    if (touched.some(l => !(Number(l.qty) > 0))) { toast('كمية كل بند يجب أن تكون أكبر من صفر', 'error'); return }
+    if (touched.some(l => l.unit_price !== '' && l.unit_price != null && (isNaN(Number(l.unit_price)) || Number(l.unit_price) < 0))) {
+      toast('سعر الوحدة لا يمكن أن يكون سالباً', 'error'); return
+    }
+    const validLines = lines.filter(l => (l.description || '').trim() && +l.qty > 0)
     if (!validLines.length) { toast('أضف بنداً واحداً على الأقل', 'error'); return }
     if (form.order_date && form.delivery_date && form.delivery_date < form.order_date) {
       toast('تاريخ التسليم لازم يكون بعد تاريخ الطلب', 'error'); return
@@ -110,14 +121,16 @@ export default function Orders() {
       customer_id:   Number(form.customer_id),
       location_id:   form.location_id ? Number(form.location_id) : null,
       description:   validLines.map(l => l.description).join('، '),
-      quantity:      validLines.reduce((s, l) => s + (+l.qty || 0), 0),
+      // OrderIn.quantity في الباك إند int — مجموع كميات كسرية (1.5) كان بيترفض 422
+      quantity:      Math.max(1, Math.round(validLines.reduce((s, l) => s + (+l.qty || 0), 0))),
       unit_price:    0,
       order_date:    form.order_date || today(),
       delivery_date: form.delivery_date || null,
       status:        form.status || 'pending',
       notes:         form.notes || null,
       lines: validLines.map(l => ({
-        description: l.description,
+        ...(l.equipment_id ? { equipment_id: Number(l.equipment_id) } : {}),
+        description: l.description.trim(),
         qty:         Number(l.qty || 1),
         unit:        l.unit || 'قطعة',
         unit_price:  Number(l.unit_price || 0),
@@ -146,6 +159,7 @@ export default function Orders() {
   // ── Create WO from order (via new conversion endpoint) ───────
   const [startProduction, starting] = useAction(async () => {
     if (!woForm.equipment_id) { toast('اختر معدة', 'error'); return }
+    if (!(Number(woForm.quantity) > 0)) { toast('كمية الإنتاج يجب أن تكون أكبر من صفر', 'error'); return }
     await api.sales.toWorkOrder(woModal.order.id, {
       equipment_id:  Number(woForm.equipment_id),
       quantity:      Number(woForm.quantity  || 1),
@@ -171,9 +185,10 @@ export default function Orders() {
   }, [form.customer_id])
 
   const handleAdvPayment = async () => {
-    if (!advForm.amount || Number(advForm.amount) <= 0) {
-      toast('أدخل المبلغ', 'error'); return
+    if (!advForm.amount || !(Number(advForm.amount) > 0)) {
+      toast('أدخل مبلغ صحيح أكبر من صفر', 'error'); return
     }
+    if (payingAdv) return
     setPayingAdv(true)
     try {
       await api.sales.advancePayment(advModal.id, {
@@ -194,9 +209,11 @@ export default function Orders() {
   }
 
   // ── Print ─────────────────────────────────────────────────────
+  // إصلاح: window.open على رابط الطباعة مباشرة مش بيبعت توكن المصادقة
+  // (الراوت محمي بـ require_any) فكان بيفتح صفحة 401. printPopup بيجيبها
+  // بـ fetch مصادَق وبيكتبها في النافذة.
   const handlePrint = useCallback((order) => {
-    const url = api.customers.printOrderUrl(order.id)
-    window.open(url, '_blank')
+    api.print(`/customers/orders/${order.id}/print`)
   }, [])
 
   if (loading) return <PageSpinner />
@@ -423,7 +440,7 @@ export default function Orders() {
             onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
         </div>
         <ModalFooter>
-          <button className="btn" onClick={() => setModal(null)}>إلغاء</button>
+          <button className="btn" onClick={() => { setModal(null); setEditingOrderId(null) }}>إلغاء</button>
           <button className="btn btn-primary" onClick={save} disabled={saving}>
             {saving ? '…' : 'حفظ الطلب'}
           </button>
@@ -560,8 +577,10 @@ export default function Orders() {
                 value={advForm.payment_type || 'cash'}
                 onChange={e => setAdvForm(f => ({ ...f, payment_type: e.target.value }))}>
                 <option value="cash">نقدي</option>
-                <option value="bank">تحويل بنكي</option>
-                <option value="check">شيك</option>
+                {/* القيم الموحّدة في الموديل: cash|transfer|cheque|bill */}
+                <option value="transfer">تحويل بنكي</option>
+                <option value="cheque">شيك</option>
+                <option value="bill">كمبيالة</option>
               </Select>
             </FormGrid>
             <FormGrid cols={2}>
@@ -593,6 +612,7 @@ export default function Orders() {
 
       <ConfirmDialog
         open={!!confirmCancelId}
+        title="إلغاء الطلب" confirmLabel="إلغاء الطلب" danger
         message="هل تريد إلغاء هذا الطلب؟"
         onConfirm={() => { updateStatus(confirmCancelId, 'cancelled'); setConfirmCancelId(null) }}
         onCancel={() => setConfirmCancelId(null)}

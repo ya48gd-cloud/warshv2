@@ -1,6 +1,8 @@
 export default function Spinner({ size = 20, className = '' }) {
   return (
     <div
+      role="status"
+      aria-label="جاري التحميل"
       className={`animate-spin rounded-full border-2 border-erp-border ${className}`}
       style={{
         width: size,

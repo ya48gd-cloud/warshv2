@@ -73,16 +73,23 @@ async def _get_kpis(db: AsyncSession) -> dict:
             Invoice.tenant_id == tid,
             Invoice.date >= last_month_start,
             Invoice.date < month_start,
+            Invoice.status != 'cancelled',
         )
     )).scalar()
-    sales_last_month = float(sales_last_month or 1)
-    sales_trend = round((sales_month - sales_last_month) / sales_last_month * 100, 1)
+    sales_last_month = float(sales_last_month or 0)
+    # كان `or 1` — لو الشهر السابق بدون مبيعات، الـ trend كان بيطلع رقم وهمي
+    # ضخم (مبيعات الشهر × 100%). None = مفيش أساس للمقارنة (الواجهة بتخفيه).
+    sales_trend = (
+        round((sales_month - sales_last_month) / sales_last_month * 100, 1)
+        if sales_last_month > 0 else None
+    )
 
     # 4. المستحقات للتحصيل
     receivables = (await db.execute(
         select(func.sum(Invoice.total - Invoice.paid_amount)).where(
             Invoice.tenant_id == tid,
-            Invoice.status.in_(['unpaid', 'partial'])
+            # "overdue" حالة فعلية بيكتبها installment_scheduler — لازم تتحسب في المستحقات
+            Invoice.status.in_(['unpaid', 'partial', 'overdue'])
         )
     )).scalar()
     receivables = float(receivables or 0)
@@ -206,8 +213,11 @@ async def _get_production_chart(db: AsyncSession) -> dict:
     rows = []
     today = date.today()
     for i in range(5, -1, -1):
-        month_date = (today.replace(day=1) - timedelta(days=i * 30)).replace(day=1)
-        next_month = (month_date + timedelta(days=32)).replace(day=1)
+        # حساب الشهر بالـ (سنة، شهر) مباشرة — الطريقة القديمة (طرح i×30 يوم)
+        # كانت بتكرر/تتخطى شهور (مثلاً من 1 مارس: 30 يوم ورا = 30 يناير فبراير يضيع)
+        m_idx = today.year * 12 + (today.month - 1) - i
+        month_date = date(m_idx // 12, m_idx % 12 + 1, 1)
+        next_month = date((m_idx + 1) // 12, (m_idx + 1) % 12 + 1, 1)
 
         count = (await db.execute(
             select(func.count(WorkOrder.id)).where(
@@ -313,12 +323,15 @@ async def get_full_dashboard():
         async with AsyncSessionLocal() as session:
             return await fn(session)
 
+    tid = _tid()
     kpis, alerts, active_wos, low_stock, mrp = await asyncio.gather(
         with_session(_get_kpis),
-        with_session(get_smart_alerts),
+        # tenant_id صريح: الخدمتين دول بيرجعوا لـ tenant 1 لو الـ ContextVar
+        # مش واصلة (fail-open) — نمرّره هنا عشان نضمن العزل.
+        with_session(lambda s: get_smart_alerts(s, tid)),
         with_session(_get_active_work_orders),
         with_session(_get_low_stock),
-        with_session(run_mrp),
+        with_session(lambda s: run_mrp(s, tid)),
     )
     return {
         "kpis":         kpis,
@@ -337,7 +350,7 @@ async def get_kpis(db: AsyncSession = Depends(get_db)):
 
 @router.get("/alerts")
 async def get_alerts(db: AsyncSession = Depends(get_db)):
-    return await get_smart_alerts(db)
+    return await get_smart_alerts(db, _tid())
 
 
 @router.get("/charts/production")

@@ -1,7 +1,47 @@
 import { useState, useEffect } from "react";
 
-const SA_API = (import.meta.env.VITE_API_URL || "http://localhost:8000") + "/api/v1/super-admin";
-const CAT_API = (import.meta.env.VITE_API_URL || "http://localhost:8000") + "/api/v1/catalog";
+// إصلاح: كان العنوان ثابت على http://localhost:8000 لو VITE_API_URL مش متضبط —
+// يعني لوحة Super Admin ماكانتش بتشتغل خالص لما النظام يتنشر على سيرفر (نفس
+// الـ origin عبر /api/v1). دلوقتي نفس منطق api/client.js: نجرّب المسار النسبي
+// الأول (يشتغل مع vite proxy ومع الـ production)، ولو فشل الاتصال نرجع لـ localhost:8000.
+const API_ROOTS = import.meta.env.VITE_API_URL
+  ? [import.meta.env.VITE_API_URL]
+  : ["", "http://localhost:8000"];
+const SA_PATH = "/api/v1/super-admin";
+const CAT_PATH = "/api/v1/catalog";
+
+async function _fetchWithFallback(prefix, path, init) {
+  let lastErr;
+  for (const root of API_ROOTS) {
+    try {
+      const res = await fetch(root + prefix + path, init);
+      // سيرفر static بدون API بيرجّع 404 HTML — نجرّب العنوان التالي
+      const ct = res.headers.get("content-type") || "";
+      if (res.status === 404 && !ct.includes("json") && root !== API_ROOTS[API_ROOTS.length - 1]) continue;
+      return res;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("network");
+}
+
+// أخطاء validation من FastAPI (422) بترجع detail كـ array — نحوّلها لنص مقروء
+// بدل ما تظهر "[object Object]" في رسالة الخطأ.
+function _normalizeDetail(data) {
+  if (data && Array.isArray(data.detail)) {
+    const text = data.detail.map(e => {
+      const loc = Array.isArray(e?.loc) ? e.loc.filter(p => p !== "body").join(" → ") : "";
+      const m = e?.msg || "قيمة غير صالحة";
+      return loc ? `${loc}: ${m}` : m;
+    }).join("، ");
+    return { ...data, detail: text };
+  }
+  return data;
+}
+
+const SA_API = { fetch: (path, init) => _fetchWithFallback(SA_PATH, path, init) };
+const CAT_API = { fetch: (path, init) => _fetchWithFallback(CAT_PATH, path, init) };
 
 // إصلاح: النسخة القديمة كانت تعمل .then(r => r.json()) بدون أي معالجة —
 // أي خطأ شبكة، أو استجابة بدون JSON (500 من الخادم، انقطاع الاتصال...)
@@ -13,7 +53,7 @@ const CAT_API = (import.meta.env.VITE_API_URL || "http://localhost:8000") + "/ap
 async function saFetch(path, method = "GET", body = null, token = "") {
   let res;
   try {
-    res = await fetch(SA_API + path, {
+    res = await SA_API.fetch(path, {
       method,
       headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: body ? JSON.stringify(body) : null,
@@ -25,7 +65,7 @@ async function saFetch(path, method = "GET", body = null, token = "") {
     window.dispatchEvent(new CustomEvent("erp:sa-session-expired"));
   }
   try {
-    return await res.json();
+    return _normalizeDetail(await res.json());
   } catch {
     return res.ok ? {} : { detail: `خطأ في الخادم (${res.status})` };
   }
@@ -34,7 +74,7 @@ async function saFetch(path, method = "GET", body = null, token = "") {
 async function catFetch(path, method = "GET", body = null, token = "") {
   let res;
   try {
-    res = await fetch(CAT_API + path, {
+    res = await CAT_API.fetch(path, {
       method,
       headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: body ? JSON.stringify(body) : null,
@@ -46,7 +86,7 @@ async function catFetch(path, method = "GET", body = null, token = "") {
     window.dispatchEvent(new CustomEvent("erp:sa-session-expired"));
   }
   try {
-    return await res.json();
+    return _normalizeDetail(await res.json());
   } catch {
     return res.ok ? {} : { detail: `خطأ في الخادم (${res.status})` };
   }
@@ -79,13 +119,18 @@ export default function SuperAdmin() {
   const [catMsg, setCatMsg] = useState("");
   const [showBulk, setShowBulk] = useState(false);
   const [bulkText, setBulkText] = useState("");
+  // منع الإرسال المزدوج (ضغطتين ورا بعض = ورشتين/مادتين أو طلبين toggle يلغوا بعض)
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (token) { loadWorkshops(); loadCatalog(); }
   }, [token]);
 
+  // بحث الكتالوج: تأخير بسيط (debounce) بدل طلب مع كل حرف
   useEffect(() => {
-    if (token && tab === "catalog") loadCatalog();
+    if (!(token && tab === "catalog")) return;
+    const t = setTimeout(() => loadCatalog(), 300);
+    return () => clearTimeout(t);
   }, [catQ]);
 
   // إصلاح: جلسة Super Admin (sa_token) لم تكن تُعالَج عند انتهائها/رفضها —
@@ -99,7 +144,13 @@ export default function SuperAdmin() {
 
   async function login(e) {
     e.preventDefault();
+    if (busy) return;
     setLoginErr("");
+    if (!loginData.username.trim() || !loginData.password) {
+      setLoginErr("أدخل اسم المستخدم وكلمة المرور");
+      return;
+    }
+    setBusy(true);
     try {
       const res = await saFetch("/login", "POST", loginData);
       if (res.token) {
@@ -110,6 +161,8 @@ export default function SuperAdmin() {
       }
     } catch {
       setLoginErr("خطأ في الاتصال");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -128,31 +181,73 @@ export default function SuperAdmin() {
     }
   }
 
-  async function toggleWorkshop(id) {
-    const res = await saFetch(`/workshops/${id}/toggle`, "PUT", null, token);
-    if (res?.detail && !res?.message) { setMsg(`❌ ${res.detail}`); return; }
-    loadWorkshops();
+  async function toggleWorkshop(id, name, isActive) {
+    if (busy) return;
+    // إيقاف ورشة بيقفل الدخول على كل مستخدميها فوراً — نطلب تأكيد
+    if (isActive && !confirm(`إيقاف ورشة "${name || id}"؟ لن يستطيع أي مستخدم فيها تسجيل الدخول حتى يُعاد تفعيلها.`)) return;
+    setBusy(true);
+    try {
+      const res = await saFetch(`/workshops/${id}/toggle`, "PUT", null, token);
+      if (res?.detail && !res?.message) { setMsg(`❌ ${res.detail}`); return; }
+      setMsg(`✅ ${res?.message || "تم تحديث حالة الورشة"}`);
+      loadWorkshops();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function deleteWorkshop(id, name) {
+    if (busy) return;
     if (!confirm(`هل أنت متأكد من حذف ورشة "${name}"؟ هذا الإجراء لا يمكن التراجع عنه.`)) return;
-    const res = await saFetch(`/workshops/${id}`, "DELETE", null, token);
-    if (res?.detail && !res?.message) { setMsg(`❌ ${res.detail}`); return; }
-    loadWorkshops();
+    setBusy(true);
+    try {
+      const res = await saFetch(`/workshops/${id}`, "DELETE", null, token);
+      if (res?.detail && !res?.message) { setMsg(`❌ ${res.detail}`); return; }
+      setMsg(`✅ ${res?.message || "تم حذف الورشة"}`);
+      loadWorkshops();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function createWorkshop(e) {
     e.preventDefault();
+    if (busy) return;
     setMsg("");
-    const res = await saFetch("/workshops", "POST", createData, token);
-    if (res.tenant) {
-      setMsg(`✅ تم إنشاء ورشة "${res.tenant.name}" بنجاح`);
-      setCreateData({ workshop_name: "", workshop_slug: "", admin_username: "", admin_password: "", admin_full_name: "", plan: "trial" });
-      setShowCreate(false);
-      loadWorkshops();
-    } else {
-      setMsg(`❌ ${res.detail || "خطأ في الإنشاء"}`);
+    // تحقق مطابق لقواعد الباك (super_admin.create_workshop + auth.signup)
+    const slug = (createData.workshop_slug || "").trim().toLowerCase();
+    if (!createData.workshop_name?.trim()) { setMsg("❌ اسم الورشة مطلوب"); return; }
+    if (!slug) { setMsg("❌ معرّف الورشة (slug) مطلوب"); return; }
+    if (!/^[a-z0-9_-]+$/.test(slug)) { setMsg("❌ معرّف الورشة يقبل حروف إنجليزية صغيرة وأرقام وشرطات فقط"); return; }
+    if (!createData.admin_username?.trim()) { setMsg("❌ اسم مستخدم المدير مطلوب"); return; }
+    if (!createData.admin_password || createData.admin_password.length < 6) { setMsg("❌ كلمة مرور المدير 6 أحرف على الأقل"); return; }
+    setBusy(true);
+    try {
+      const res = await saFetch("/workshops", "POST", {
+        ...createData,
+        workshop_name: createData.workshop_name.trim(),
+        workshop_slug: slug,
+        admin_username: createData.admin_username.trim(),
+        admin_full_name: createData.admin_full_name?.trim() || null,
+      }, token);
+      if (res?.tenant) {
+        setMsg(`✅ تم إنشاء ورشة "${res.tenant.name}" بنجاح`);
+        setCreateData({ workshop_name: "", workshop_slug: "", admin_username: "", admin_password: "", admin_full_name: "", plan: "trial" });
+        setShowCreate(false);
+        loadWorkshops();
+      } else {
+        setMsg(`❌ ${res?.detail || "خطأ في الإنشاء"}`);
+      }
+    } finally {
+      setBusy(false);
     }
+  }
+
+  // خروج يدوي: نلغي التوكن على السيرفر كمان (مش بس محلياً)
+  function manualLogout() {
+    const t = token;
+    if (t) saFetch("/logout", "POST", null, t).catch(() => {});
+    logout();
   }
 
   function logout() {
@@ -203,47 +298,89 @@ export default function SuperAdmin() {
 
   async function saveItem(e) {
     e.preventDefault();
+    if (busy) return;
     setCatMsg("");
+    if (!itemForm.code?.trim() || !itemForm.name_ar?.trim()) { setCatMsg("❌ الكود والاسم بالعربي مطلوبين"); return; }
     const path = editItem ? `/${editItem.id}` : "";
     const method = editItem ? "PUT" : "POST";
-    const res = await catFetch(path, method, itemForm, token);
-    if (res.message) {
-      setCatMsg(`✅ ${res.message}`);
-      setShowAddItem(false);
-      loadCatalog();
-    } else {
-      setCatMsg(`❌ ${res.detail || "خطأ"}`);
+    // إصلاح: PUT في الباك بيكتب كل حقول CatalogItemIn (model_dump كامل) — الفورم
+    // مفيهوش حقول الألواح/القضبان، فالتعديل كان بيمسح is_plate/السمك/الأبعاد/الوزن.
+    // نحافظ على القيم الموجودة اللي الـ API بيرجعها.
+    const preserved = editItem ? {
+      is_plate: editItem.is_plate ?? false,
+      thickness_mm: editItem.thickness_mm ?? null,
+      plate_length_cm: editItem.plate_length_cm ?? null,
+      plate_width_cm: editItem.plate_width_cm ?? null,
+      plate_weight_kg: editItem.plate_weight_kg ?? null,
+      weight_per_meter_kg: editItem.weight_per_meter_kg ?? null,
+    } : {};
+    setBusy(true);
+    try {
+      const res = await catFetch(path, method, {
+        ...preserved,
+        ...itemForm,
+        code: itemForm.code.trim(),
+        name_ar: itemForm.name_ar.trim(),
+      }, token);
+      if (res?.message) {
+        setCatMsg(`✅ ${res.message}`);
+        setShowAddItem(false);
+        loadCatalog();
+      } else {
+        setCatMsg(`❌ ${res?.detail || "خطأ"}`);
+      }
+    } finally {
+      setBusy(false);
     }
   }
 
   async function deleteItem(id, name) {
+    if (busy) return;
     if (!confirm(`حذف "${name}" من الكتالوج؟`)) return;
-    const res = await catFetch(`/${id}`, "DELETE", null, token);
-    if (res?.detail && !res?.message) { setCatMsg(`❌ ${res.detail}`); return; }
-    loadCatalog();
+    setBusy(true);
+    try {
+      const res = await catFetch(`/${id}`, "DELETE", null, token);
+      if (res?.detail && !res?.message) { setCatMsg(`❌ ${res.detail}`); return; }
+      setCatMsg(`✅ ${res?.message || "تم الحذف"}`);
+      loadCatalog();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function doBulkImport() {
+    if (busy) return;
     setCatMsg("");
+    const lines = bulkText.trim().split("\n").filter(l => l.trim());
+    if (!lines.length) { setCatMsg("❌ لا توجد بيانات للاستيراد"); return; }
+    const items = [];
+    for (let i = 0; i < lines.length; i++) {
+      const [code, name_ar, unit, category, name_en] = lines[i].split("|").map(s => s.trim());
+      if (!code || !name_ar) { setCatMsg(`❌ السطر ${i + 1}: الكود والاسم بالعربي مطلوبين`); return; }
+      items.push({ code, name_ar, unit: unit || "قطعة", category: category || "", name_en: name_en || "" });
+    }
+    setBusy(true);
     try {
-      const lines = bulkText.trim().split("\n").filter(l => l.trim());
-      const items = lines.map(line => {
-        const [code, name_ar, unit, category, name_en] = line.split("|").map(s => s.trim());
-        return { code, name_ar, unit: unit || "قطعة", category: category || "", name_en: name_en || "" };
-      });
       const res = await catFetch("/bulk", "POST", { items }, token);
-      setCatMsg(`✅ تمت إضافة ${res.added} مادة، تخطي ${res.skipped} (مكررة)`);
+      // catFetch لا يرمي استثناء — الخطأ بيرجع كـ { detail }
+      if (res?.detail || typeof res?.added !== "number") {
+        setCatMsg(`❌ ${typeof res?.detail === "string" ? res.detail : "خطأ في تنسيق البيانات"}`);
+        return;
+      }
+      setCatMsg(`✅ تمت إضافة ${res.added} مادة، تخطي ${res.skipped ?? 0} (مكررة)`);
       setBulkText("");
       setShowBulk(false);
       loadCatalog();
     } catch {
       setCatMsg("❌ خطأ في تنسيق البيانات");
+    } finally {
+      setBusy(false);
     }
   }
 
   if (!token) return (
-    <div style={{ minHeight: "100vh", background: "#0F172A", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Cairo, sans-serif", direction: "rtl" }}>
-      <div style={{ background: "#1E293B", borderRadius: 16, padding: "40px 48px", width: 380, boxShadow: "0 20px 60px rgba(0,0,0,.5)", border: "1px solid #334155" }}>
+    <div style={{ minHeight: "100vh", background: "#0F172A", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Cairo, sans-serif", direction: "rtl", padding: 16 }}>
+      <div style={{ background: "#1E293B", borderRadius: 16, padding: "40px 32px", width: "100%", maxWidth: 380, boxSizing: "border-box", boxShadow: "0 20px 60px rgba(0,0,0,.5)", border: "1px solid #334155" }}>
         <div style={{ textAlign: "center", marginBottom: 32 }}>
           <div style={{ fontSize: 36, marginBottom: 8 }}>⚙️</div>
           <h1 style={{ color: "#F1F5F9", fontSize: 22, fontWeight: 800, margin: 0 }}>Super Admin</h1>
@@ -262,8 +399,8 @@ export default function SuperAdmin() {
               style={{ width: "100%", background: "#0F172A", border: "1px solid #334155", borderRadius: 8, padding: "10px 14px", color: "#F1F5F9", fontSize: 14, outline: "none", boxSizing: "border-box" }} />
           </div>
           {loginErr && <div style={{ background: "#450A0A", border: "1px solid #7F1D1D", borderRadius: 8, padding: "10px 14px", color: "#FCA5A5", fontSize: 13, marginBottom: 16 }}>{loginErr}</div>}
-          <button type="submit" style={{ width: "100%", background: "linear-gradient(135deg,#6366F1,#8B5CF6)", color: "#fff", border: "none", borderRadius: 8, padding: "12px", fontSize: 15, fontWeight: 700, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
-            دخول
+          <button type="submit" disabled={busy} style={{ width: "100%", background: "linear-gradient(135deg,#6366F1,#8B5CF6)", color: "#fff", border: "none", borderRadius: 8, padding: "12px", fontSize: 15, fontWeight: 700, cursor: busy ? "wait" : "pointer", opacity: busy ? 0.7 : 1, fontFamily: "Cairo, sans-serif" }}>
+            {busy ? "جاري الدخول..." : "دخول"}
           </button>
         </form>
       </div>
@@ -284,7 +421,7 @@ export default function SuperAdmin() {
             <div style={{ color: "#64748B", fontSize: 12 }}>إدارة ورش ERP</div>
           </div>
         </div>
-        <button onClick={logout}
+        <button onClick={manualLogout}
           style={{ background: "#1E293B", color: "#94A3B8", border: "1px solid #334155", borderRadius: 8, padding: "8px 18px", fontSize: 13, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
           خروج
         </button>
@@ -321,7 +458,7 @@ export default function SuperAdmin() {
               <div style={{ background: "#1E293B", border: "1px solid #334155", borderRadius: 12, padding: 24, marginBottom: 24 }}>
                 <h3 style={{ color: "#F1F5F9", margin: "0 0 20px", fontSize: 16 }}>إنشاء ورشة جديدة</h3>
                 <form onSubmit={createWorkshop}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
                     {[
                       ["اسم الورشة", "workshop_name", "ورشة الأمل"],
                       ["معرّف الورشة (slug)", "workshop_slug", "al-amal"],
@@ -348,14 +485,14 @@ export default function SuperAdmin() {
                     </div>
                   </div>
                   <div style={{ marginTop: 16, display: "flex", gap: 10 }}>
-                    <button type="submit" style={{ background: "#6366F1", color: "#fff", border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>إنشاء</button>
+                    <button type="submit" disabled={busy} style={{ background: "#6366F1", color: "#fff", border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: busy ? "wait" : "pointer", opacity: busy ? 0.7 : 1, fontFamily: "Cairo, sans-serif" }}>{busy ? "جاري الإنشاء..." : "إنشاء"}</button>
                     <button type="button" onClick={() => setShowCreate(false)} style={{ background: "transparent", color: "#94A3B8", border: "1px solid #334155", borderRadius: 8, padding: "10px 24px", fontSize: 14, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>إلغاء</button>
                   </div>
                 </form>
               </div>
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 16, marginBottom: 24 }}>
               {[
                 ["🏭", "إجمالي الورش", workshops.length],
                 ["✅", "ورش نشطة", workshops.filter(w => w.is_active).length],
@@ -379,7 +516,7 @@ export default function SuperAdmin() {
               ) : workshops.length === 0 ? (
                 <div style={{ padding: 40, textAlign: "center", color: "#64748B" }}>لا توجد ورش بعد</div>
               ) : (
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <div style={{ overflowX: "auto" }}><table style={{ width: "100%", minWidth: 640, borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ background: "#0F172A" }}>
                       {["#", "اسم الورشة", "المعرّف", "الباقة", "المستخدمون", "الحالة", "إجراءات"].map(h => (
@@ -406,11 +543,11 @@ export default function SuperAdmin() {
                         </td>
                         <td style={{ padding: "12px 16px" }}>
                           <div style={{ display: "flex", gap: 8 }}>
-                            <button onClick={() => toggleWorkshop(w.id)}
+                            <button onClick={() => toggleWorkshop(w.id, w.name, w.is_active)} disabled={busy}
                               style={{ background: w.is_active ? "#422006" : "#052E16", color: w.is_active ? "#FED7AA" : "#86EFAC", border: "none", borderRadius: 6, padding: "5px 12px", fontSize: 11, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
                               {w.is_active ? "إيقاف" : "تفعيل"}
                             </button>
-                            <button onClick={() => deleteWorkshop(w.id, w.name)}
+                            <button onClick={() => deleteWorkshop(w.id, w.name)} disabled={busy}
                               style={{ background: "#450A0A", color: "#FCA5A5", border: "none", borderRadius: 6, padding: "5px 12px", fontSize: 11, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
                               حذف
                             </button>
@@ -419,7 +556,7 @@ export default function SuperAdmin() {
                       </tr>
                     ))}
                   </tbody>
-                </table>
+                </table></div>
               )}
             </div>
           </>
@@ -430,7 +567,7 @@ export default function SuperAdmin() {
           <>
             {catMsg && <div style={{ background: catMsg.startsWith("✅") ? "#052E16" : "#450A0A", border: `1px solid ${catMsg.startsWith("✅") ? "#166534" : "#7F1D1D"}`, borderRadius: 8, padding: "12px 16px", color: catMsg.startsWith("✅") ? "#86EFAC" : "#FCA5A5", marginBottom: 20, fontSize: 14 }}>{catMsg}</div>}
 
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, gap: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, gap: 10, flexWrap: "wrap" }}>
               <input value={catQ} onChange={e => setCatQ(e.target.value)} placeholder="🔍 بحث في الكتالوج..."
                 style={{ ...inputStyle, maxWidth: 320 }} />
               <div style={{ display: "flex", gap: 10 }}>
@@ -450,7 +587,7 @@ export default function SuperAdmin() {
               <div style={{ background: "#1E293B", border: "1px solid #334155", borderRadius: 12, padding: 24, marginBottom: 24 }}>
                 <h3 style={{ color: "#F1F5F9", margin: "0 0 18px", fontSize: 16 }}>{editItem ? "تعديل المادة" : "إضافة مادة جديدة للكتالوج"}</h3>
                 <form onSubmit={saveItem}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 14 }}>
                     <div>
                       <label style={labelStyle}>الكود *</label>
                       <input required value={itemForm.code} onChange={e => setItemForm({ ...itemForm, code: e.target.value })} placeholder="STL-001" style={inputStyle} />
@@ -492,7 +629,7 @@ export default function SuperAdmin() {
                     <input value={itemForm.description} onChange={e => setItemForm({ ...itemForm, description: e.target.value })} placeholder="مواصفات إضافية..." style={inputStyle} />
                   </div>
                   <div style={{ marginTop: 16, display: "flex", gap: 10 }}>
-                    <button type="submit" style={{ background: "#6366F1", color: "#fff", border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
+                    <button type="submit" disabled={busy} style={{ background: "#6366F1", color: "#fff", border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: busy ? "wait" : "pointer", opacity: busy ? 0.7 : 1, fontFamily: "Cairo, sans-serif" }}>
                       {editItem ? "حفظ التعديلات" : "إضافة"}
                     </button>
                     <button type="button" onClick={() => setShowAddItem(false)} style={{ background: "transparent", color: "#94A3B8", border: "1px solid #334155", borderRadius: 8, padding: "10px 24px", fontSize: 14, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>إلغاء</button>
@@ -513,13 +650,13 @@ export default function SuperAdmin() {
                   rows={8}
                   style={{ ...inputStyle, fontFamily: "monospace", resize: "vertical" }} />
                 <div style={{ marginTop: 16, display: "flex", gap: 10 }}>
-                  <button onClick={doBulkImport} style={{ background: "#6366F1", color: "#fff", border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>استيراد</button>
+                  <button onClick={doBulkImport} disabled={busy} style={{ background: "#6366F1", color: "#fff", border: "none", borderRadius: 8, padding: "10px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>استيراد</button>
                   <button onClick={() => setShowBulk(false)} style={{ background: "transparent", color: "#94A3B8", border: "1px solid #334155", borderRadius: 8, padding: "10px 24px", fontSize: 14, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>إلغاء</button>
                 </div>
               </div>
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 16, marginBottom: 24 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16, marginBottom: 24 }}>
               <div style={{ background: "#1E293B", border: "1px solid #334155", borderRadius: 12, padding: "20px 24px" }}>
                 <div style={{ fontSize: 28 }}>📦</div>
                 <div style={{ color: "#94A3B8", fontSize: 12, marginTop: 8 }}>إجمالي المواد في الكتالوج</div>
@@ -542,7 +679,7 @@ export default function SuperAdmin() {
               ) : catItems.length === 0 ? (
                 <div style={{ padding: 40, textAlign: "center", color: "#64748B" }}>لا توجد مواد بعد — ابدأ بإضافة مواد للكتالوج</div>
               ) : (
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <div style={{ overflowX: "auto" }}><table style={{ width: "100%", minWidth: 640, borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ background: "#0F172A" }}>
                       {["الكود", "الاسم", "الوحدة", "التصنيف", "الاستخدام", "إجراءات"].map(h => (
@@ -568,7 +705,7 @@ export default function SuperAdmin() {
                               style={{ background: "#1E1B4B", color: "#A5B4FC", border: "none", borderRadius: 6, padding: "5px 12px", fontSize: 11, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
                               تعديل
                             </button>
-                            <button onClick={() => deleteItem(item.id, item.name_ar)}
+                            <button onClick={() => deleteItem(item.id, item.name_ar)} disabled={busy}
                               style={{ background: "#450A0A", color: "#FCA5A5", border: "none", borderRadius: 6, padding: "5px 12px", fontSize: 11, cursor: "pointer", fontFamily: "Cairo, sans-serif" }}>
                               حذف
                             </button>
@@ -577,7 +714,7 @@ export default function SuperAdmin() {
                       </tr>
                     ))}
                   </tbody>
-                </table>
+                </table></div>
               )}
             </div>
           </>

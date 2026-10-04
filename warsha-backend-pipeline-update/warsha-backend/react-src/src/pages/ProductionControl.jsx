@@ -69,6 +69,7 @@ function WOStagesCard({ wo }) {
   const [team, setTeam]             = useState(null)
   const [workers, setWorkers]       = useState(null)
   const [teamForm, setTeamForm]     = useState({ worker_id: '', role: 'فني', hourly_rate: '', planned_hours: '' })
+  const [teamBusy, setTeamBusy]     = useState(false)
 
   const loadTeam = useCallback(async () => {
     try {
@@ -101,7 +102,13 @@ function WOStagesCard({ wo }) {
   }
 
   const handleAddMember = async () => {
+    if (teamBusy) return
     if (!teamForm.worker_id) { toast('اختر عامل', 'error'); return }
+    // الباك-إند يقبل Decimal بدون قيد — نمنع القيم السالبة من الواجهة حتى لا تُحسب تكلفة عمالة سالبة
+    if (Number(teamForm.hourly_rate) < 0 || Number(teamForm.planned_hours) < 0) {
+      toast('أجر الساعة والساعات المخططة لا يمكن أن تكون سالبة', 'error'); return
+    }
+    setTeamBusy(true)
     try {
       await api.production.team.add(wo.id, {
         worker_id: Number(teamForm.worker_id),
@@ -114,10 +121,17 @@ function WOStagesCard({ wo }) {
       loadTeam()
     } catch (e) {
       toast(e?.message || 'حدث خطأ', 'error')
+    } finally {
+      setTeamBusy(false)
     }
   }
 
-  const handleUpdateHours = async (mid, hours) => {
+  const handleUpdateHours = async (mid, hours, prev) => {
+    // حقل فاضي كان بيبعت actual_hours= → خطأ 422 خام من الخادم؛ وقيمة سالبة كانت بتتقبل
+    if (hours === '' || hours == null) return
+    const h = Number(hours)
+    if (!Number.isFinite(h) || h < 0) { toast('ساعات العمل الفعلية يجب أن تكون رقماً غير سالب', 'error'); return }
+    if (prev != null && Number(prev) === h) return
     try {
       await api.production.team.hours(wo.id, mid, hours)
       loadTeam()
@@ -126,7 +140,8 @@ function WOStagesCard({ wo }) {
     }
   }
 
-  const handleRemoveMember = async (mid) => {
+  const handleRemoveMember = async (mid, name) => {
+    if (!window.confirm(`حذف ${name || 'العامل'} من فريق العمل؟`)) return
     try {
       await api.production.team.remove(wo.id, mid)
       toast('تم حذف العامل من الفريق')
@@ -166,7 +181,8 @@ function WOStagesCard({ wo }) {
     loadStages()
   })
 
-  const handleSkip = (id) => act(async () => {
+  const handleSkip = (id, name) => act(async () => {
+    if (!window.confirm(`تخطّي مرحلة "${name || ''}"؟`)) return
     await api.stages.skip(id)
     toast('تم تخطّي المرحلة')
     loadStages()
@@ -270,7 +286,7 @@ function WOStagesCard({ wo }) {
               ) : (
                 <div className="flex flex-col gap-2">
                   {stageList.map((s, i) => {
-                    const isCutting = s.stage_name.includes('قطع')
+                    const isCutting = (s.stage_name || '').includes('قطع')
                     // الباك-إند يمنع بدء مرحلة قبل إنهاء/تخطّي كل ما يسبقها بالترتيب (400 error).
                     // بدل ما نسيب المستخدم يضغط "بدء" ويشوف رسالة خطأ بعد استدعاء الشبكة،
                     // نعطّل الزر مقدماً ونوضّح السبب.
@@ -320,7 +336,7 @@ function WOStagesCard({ wo }) {
                         {(s.status === 'pending' || s.status === 'in_progress') && (
                           <button className="btn btn-sm text-xs"
                             style={{ color: 'var(--text-secondary)' }}
-                            onClick={() => handleSkip(s.id)} disabled={acting}>تخطّي</button>
+                            onClick={() => handleSkip(s.id, s.stage_name)} disabled={acting}>تخطّي</button>
                         )}
                       </div>
                     </div>
@@ -350,15 +366,16 @@ function WOStagesCard({ wo }) {
                     <div style={{ flex: 1 }}>
                       <div className="font-medium text-sm">{m.worker_name}</div>
                       <div className="text-xs text-erp-muted">
-                        {m.role} — {m.hourly_rate} ج/ساعة — مخطط {m.planned_hours} ساعة — تكلفة فعلية {m.labor_cost.toFixed(2)} ج
+                        {m.role} — {m.hourly_rate} ج/ساعة — مخطط {m.planned_hours} ساعة — تكلفة فعلية {Number(m.labor_cost || 0).toFixed(2)} ج
                       </div>
                     </div>
                     <input type="number" className="input input-sm" style={{ width: 90 }}
+                           min="0" step="0.5"
                            defaultValue={m.actual_hours}
-                           onBlur={e => handleUpdateHours(m.id, e.target.value)}
+                           onBlur={e => handleUpdateHours(m.id, e.target.value, m.actual_hours)}
                            title="ساعات العمل الفعلية" />
                     <button className="btn btn-sm text-xs" style={{ color: 'var(--red)' }}
-                            onClick={() => handleRemoveMember(m.id)}>حذف</button>
+                            onClick={() => handleRemoveMember(m.id, m.worker_name)}>حذف</button>
                   </div>
                 ))}
               </div>
@@ -375,11 +392,11 @@ function WOStagesCard({ wo }) {
               </Select>
               <Input label="الدور" value={teamForm.role}
                      onChange={e => setTeamForm(f => ({ ...f, role: e.target.value }))} />
-              <Input label="أجر الساعة" type="number" value={teamForm.hourly_rate}
+              <Input label="أجر الساعة" type="number" min="0" value={teamForm.hourly_rate}
                      onChange={e => setTeamForm(f => ({ ...f, hourly_rate: e.target.value }))} />
-              <Input label="ساعات مخططة" type="number" value={teamForm.planned_hours}
+              <Input label="ساعات مخططة" type="number" min="0" value={teamForm.planned_hours}
                      onChange={e => setTeamForm(f => ({ ...f, planned_hours: e.target.value }))} />
-              <button className="btn btn-sm" onClick={handleAddMember}>+ إضافة للفريق</button>
+              <button className="btn btn-sm" onClick={handleAddMember} disabled={teamBusy}>{teamBusy ? '…' : '+ إضافة للفريق'}</button>
             </div>
           </div>
         </div>
@@ -400,7 +417,7 @@ export default function ProductionControl() {
   }
 
   // ── Work orders (shared across tabs) ──────────────────────────────────────
-  const { data: allWOs, loading: wosLoading } = useApi(() => api.accounting.workOrders())
+  const { data: allWOs, loading: wosLoading, reload: reloadWOs } = useApi(() => api.accounting.workOrders())
 
   // ── Schedule tab ──────────────────────────────────────────────────────────
   const { data: schedules, loading: schLoading, reload: reloadSch } = useApi(
@@ -416,6 +433,8 @@ export default function ProductionControl() {
     // كنا بنسيب الرسالة الخام تظهر من الـ API. تحقق مبكر بدل رسالة validation مربكة.
     if (!schForm.scheduled_start || !schForm.scheduled_end) { toast('حدد تاريخ البدء وتاريخ الانتهاء المخططين', 'error'); return }
     if (schForm.scheduled_end < schForm.scheduled_start) { toast('تاريخ الانتهاء يجب أن يكون بعد تاريخ البدء', 'error'); return }
+    const pr = Number(schForm.priority)
+    if (!Number.isInteger(pr) || pr < 1 || pr > 10) { toast('الأولوية يجب أن تكون رقماً صحيحاً من 1 إلى 10', 'error'); return }
     await api.schedule.create({
       ...schForm,
       work_order_id: Number(schForm.work_order_id),
@@ -423,18 +442,23 @@ export default function ProductionControl() {
     })
     toast('✅ تمت الجدولة')
     setShowCreateSch(false)
+    setSchForm({ work_order_id: '', scheduled_start: '', scheduled_end: '', priority: '5' })
     reloadSch()
   })
 
-  const handleStartSch    = (id) => act(async () => { await api.schedule.start(id);    toast('✅ بدأ الإنتاج');      reloadSch() })
-  const handleCompleteSch = (id) => act(async () => { await api.schedule.complete(id); toast('✅ تم إنهاء الجدول'); reloadSch() })
+  // بدء الجدول يحوّل أمر الإنتاج من draft إلى in_progress في الباك-إند → نعيد تحميل الأوامر أيضاً
+  const handleStartSch    = (id) => act(async () => { await api.schedule.start(id);    toast('✅ بدأ الإنتاج');      reloadSch(); reloadWOs() })
+  const handleCompleteSch = (id) => act(async () => {
+    if (!window.confirm('تأكيد إنهاء هذا الجدول؟')) return
+    await api.schedule.complete(id); toast('✅ تم إنهاء الجدول'); reloadSch()
+  })
 
   // ── Stages tab — active WOs ───────────────────────────────────────────────
   const activeWOs = (allWOs || []).filter(wo => ACTIVE_WO_STATUSES.has(wo.status))
 
   // ── QC tab ────────────────────────────────────────────────────────────────
   const [selectedWO, setSelectedWO] = useState('')
-  const { data: qcDash } = useApi(() => api.qc.dashboard(), [tab === 'qc'])
+  const { data: qcDash, reload: reloadQCDash } = useApi(() => api.qc.dashboard(), [tab === 'qc'])
   const { data: inspections, loading: qcLoading, reload: reloadQC } = useApi(
     () => api.qc.list(selectedWO ? { work_order_id: selectedWO } : {}),
     [tab === 'qc', selectedWO]
@@ -455,6 +479,10 @@ export default function ProductionControl() {
     const qtyRework     = Number(qcForm.qty_rework || 0)
     if (!qcForm.qty_inspected || !(qtyInspected > 0)) { toast('أدخل الكمية المفحوصة', 'error'); return }
     if (qcForm.qty_passed === '' || qcForm.qty_passed == null || qtyPassed < 0) { toast('أدخل الكمية المقبولة', 'error'); return }
+    if (!Number.isFinite(qtyFailed) || qtyFailed < 0 || !Number.isFinite(qtyRework) || qtyRework < 0) {
+      toast('الكمية المرفوضة وكمية إعادة العمل لا يمكن أن تكون سالبة', 'error'); return
+    }
+    if (!qcForm.inspection_date) { toast('حدد تاريخ الفحص', 'error'); return }
     if (qtyPassed + qtyFailed + qtyRework > qtyInspected + 0.001) {
       toast('مجموع الكميات (قبول + رفض + إعادة عمل) لا يجب أن يتجاوز الكمية المفحوصة', 'error')
       return
@@ -462,11 +490,22 @@ export default function ProductionControl() {
     const r = await api.qc.create({
       ...qcForm,
       work_order_id: qcForm.work_order_id ? Number(qcForm.work_order_id) : null,
+      // حقل فاضي ('') كان بيتبعت كما هو → Decimal('') يفشل بخطأ 422 خام
+      qty_inspected: qtyInspected,
+      qty_passed:    qtyPassed,
+      qty_failed:    qtyFailed,
+      qty_rework:    qtyRework,
+      failure_reason:    qcForm.failure_reason || null,
+      corrective_action: qcForm.corrective_action || null,
     })
     const msg = `نتيجة: ${r.result_ar}${r.rework_work_order ? ` — أُنشئ أمر إعادة عمل ${r.rework_work_order.code}` : ''}`
     toast(msg)
     setShowQC(false)
+    setQcForm(f => ({ ...f, qty_inspected: '', qty_passed: '', qty_failed: '0', qty_rework: '0', failure_reason: '', corrective_action: '' }))
     reloadQC()
+    reloadQCDash()
+    // فحص فاشل/مشروط يُنشئ أمر إعادة عمل جديد → حدّث قائمة الأوامر
+    if (r.rework_work_order) reloadWOs()
   })
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -478,10 +517,10 @@ export default function ProductionControl() {
       </div>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', gap: 4, borderBottom: '2px solid var(--border)', paddingBottom: 0 }}>
+      <div style={{ display: 'flex', gap: 4, borderBottom: '2px solid var(--border)', paddingBottom: 0, overflowX: 'auto' }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
-            style={{ padding: '8px 20px', border: 'none', borderRadius: '6px 6px 0 0',
+            style={{ padding: '8px 20px', border: 'none', borderRadius: '6px 6px 0 0', whiteSpace: 'nowrap',
                      cursor: 'pointer', fontWeight: tab === t.id ? 700 : 400,
                      background: tab === t.id ? 'var(--teal)' : 'var(--surface)',
                      color: tab === t.id ? '#fff' : 'var(--text-secondary)' }}>
@@ -499,7 +538,7 @@ export default function ProductionControl() {
             </button>
           </div>
           {schLoading ? <PageSpinner /> : (
-            <div className="card p-0 overflow-hidden">
+            <div className="card p-0 overflow-x-auto">
               <table className="erp-table">
                 <thead>
                   <tr>
@@ -580,7 +619,7 @@ export default function ProductionControl() {
         <div className="flex flex-col gap-3">
           {/* KPI cards */}
           {qcDash && (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 12 }}>
               {[
                 ['إجمالي الفحوصات', qcDash.total_inspections, 'var(--teal)'],
                 ['ناجح',            qcDash.passed,            '#15803d'],
@@ -597,7 +636,7 @@ export default function ProductionControl() {
           )}
 
           {/* Toolbar */}
-          <div className="flex gap-3 items-center justify-between">
+          <div className="flex gap-3 items-center justify-between flex-wrap">
             <div className="flex gap-2 items-center">
               <span className="text-sm font-medium">فلتر:</span>
               <select className="field-select text-sm" style={{ width: 180 }}
@@ -613,7 +652,7 @@ export default function ProductionControl() {
 
           {/* Inspections table */}
           {qcLoading ? <PageSpinner /> : (
-            <div className="card p-0 overflow-hidden">
+            <div className="card p-0 overflow-x-auto">
               <table className="erp-table text-sm">
                 <thead>
                   <tr>
@@ -703,15 +742,15 @@ export default function ProductionControl() {
             <option value="outgoing">فحص تسليم</option>
           </Select>
           <FormGrid cols={2}>
-            <Input label="الكمية المفحوصة *" type="number" value={qcForm.qty_inspected}
+            <Input label="الكمية المفحوصة *" type="number" min="0" value={qcForm.qty_inspected}
               onChange={e => setQcForm(f => ({ ...f, qty_inspected: e.target.value }))} />
-            <Input label="الكمية المقبولة *" type="number" value={qcForm.qty_passed}
+            <Input label="الكمية المقبولة *" type="number" min="0" value={qcForm.qty_passed}
               onChange={e => setQcForm(f => ({ ...f, qty_passed: e.target.value }))} />
           </FormGrid>
           <FormGrid cols={2}>
-            <Input label="الكمية المرفوضة" type="number" value={qcForm.qty_failed}
+            <Input label="الكمية المرفوضة" type="number" min="0" value={qcForm.qty_failed}
               onChange={e => setQcForm(f => ({ ...f, qty_failed: e.target.value }))} />
-            <Input label="كمية إعادة العمل" type="number" value={qcForm.qty_rework}
+            <Input label="كمية إعادة العمل" type="number" min="0" value={qcForm.qty_rework}
               onChange={e => setQcForm(f => ({ ...f, qty_rework: e.target.value }))} />
           </FormGrid>
           <Textarea label="سبب الرفض (اختياري)" rows={2} value={qcForm.failure_reason}

@@ -42,19 +42,26 @@ const DOC_TITLE_EN = {
 const FONT_LINK = ''
 const FONT_STACK = `'Cairo','Segoe UI','Tahoma',Arial,sans-serif`
 
+// تهريب HTML لأي بيانات مستخدم بتتحقن في مستند الطباعة المولَّد في المتصفح
+// (وصف البنود/الشروط/اسم العميل...) — من غيره أي <script> أو <img onerror>
+// مكتوب في بند كان بيتنفّذ في نافذة الطباعة (أو داخل الصفحة نفسها في printInPage).
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+))
+
 // شريط الهيدر الموحّد لكل المطبوعات: اسم الورشة وشعارها على اليمين، بيانات التواصل على الشمال
 function pageHeaderHTML(ws) {
-  const logo = ws.logo_data ? `<img src="${ws.logo_data}" class="header-logo">` : ''
+  const logo = ws.logo_data ? `<img src="${esc(ws.logo_data)}" class="header-logo">` : ''
   return `
 <div class="header">
   <div class="logo-section">
     ${logo}
     <div>
-      <h1>${ws.name || ''}</h1>
-      ${ws.address ? `<p>${ws.address}</p>` : ''}
+      <h1>${esc(ws.name || '')}</h1>
+      ${ws.address ? `<p>${esc(ws.address)}</p>` : ''}
     </div>
   </div>
-  ${ws.phone ? `<div class="contact">${ws.phone}</div>` : ''}
+  ${ws.phone ? `<div class="contact">${esc(ws.phone)}</div>` : ''}
 </div>`
 }
 
@@ -71,10 +78,10 @@ function pageTitleHTML(titleAr) {
 // شريط تذييل موحّد ببيانات التواصل
 function pageFooterHTML(ws) {
   const items = []
-  if (ws.phone) items.push(`📞 ${ws.phone}`)
-  if (ws.email) items.push(`✉️ ${ws.email}`)
-  if (ws.website) items.push(`🌐 ${ws.website}`)
-  if (!items.length && ws.report_footer) items.push(ws.report_footer)
+  if (ws.phone) items.push(`📞 ${esc(ws.phone)}`)
+  if (ws.email) items.push(`✉️ ${esc(ws.email)}`)
+  if (ws.website) items.push(`🌐 ${esc(ws.website)}`)
+  if (!items.length && ws.report_footer) items.push(esc(ws.report_footer))
   if (!items.length) return ''
   return `<div class="footer">${items.map(i => `<span>${i}</span>`).join('')}</div>`
 }
@@ -148,20 +155,20 @@ function buildQuoteHTML(qt, lines, ws) {
 ${pageHeaderHTML(ws)}
 ${pageTitleHTML('عرض سعر')}
 <div class="info">
-  <div class="card"><div class="card-title">بيانات العميل</div>${qt.customer_name || '—'}</div>
-  <div class="card"><div class="card-title">بيانات العرض</div>رقم العرض: ${qt.number || qt.code}<br>التاريخ: ${fmtDate(qt.date)}</div>
+  <div class="card"><div class="card-title">بيانات العميل</div>${esc(qt.customer_name || '—')}</div>
+  <div class="card"><div class="card-title">بيانات العرض</div>رقم العرض: ${esc(qt.number || qt.code)}<br>التاريخ: ${fmtDate(qt.date)}</div>
   <div class="card"><div class="card-title">صلاحية العرض</div>${qt.valid_until ? `حتى ${fmtDate(qt.valid_until)}` : '—'}</div>
 </div>
 <div class="items-grid">
   ${lines.map((l, i) => `
     <div class="item-card">
       <div class="item-card-head">
-        <div class="item-card-title">${i + 1}. ${l.item_type || 'بند'}</div>
-        <div class="item-card-meta">${l.model_no ? `موديل: ${l.model_no}<br>` : ''}الكمية: ${Number(l.qty || 1).toFixed(2)} ${l.unit || 'قطعة'}</div>
+        <div class="item-card-title">${i + 1}. ${esc(l.item_type || 'بند')}</div>
+        <div class="item-card-meta">${l.model_no ? `موديل: ${esc(l.model_no)}<br>` : ''}الكمية: ${Number(l.qty || 1).toFixed(2)} ${esc(l.unit || 'قطعة')}</div>
       </div>
       <div class="item-card-body">
-        ${l.image_data ? `<img src="${l.image_data}" class="item-card-img">` : ''}
-        <div class="item-card-specs">${(l.description || '').split('\n').filter(Boolean).map(t => `<div>${t}</div>`).join('') || '—'}</div>
+        ${l.image_data ? `<img src="${esc(l.image_data)}" class="item-card-img">` : ''}
+        <div class="item-card-specs">${(l.description || '').split('\n').filter(Boolean).map(t => `<div>${esc(t)}</div>`).join('') || '—'}</div>
       </div>
       <div class="item-card-foot">
         <span>سعر الوحدة: ${egp(l.unit_price)}</span>
@@ -173,8 +180,8 @@ ${pageTitleHTML('عرض سعر')}
   <div class="conditions">
     <h3>الشروط والملاحظات</h3>
     <ul>
-      ${qt.terms ? qt.terms.split('\n').filter(Boolean).map(t => `<li>${t}</li>`).join('') : ''}
-      ${qt.notes ? qt.notes.split('\n').filter(Boolean).map(t => `<li>${t}</li>`).join('') : ''}
+      ${qt.terms ? qt.terms.split('\n').filter(Boolean).map(t => `<li>${esc(t)}</li>`).join('') : ''}
+      ${qt.notes ? qt.notes.split('\n').filter(Boolean).map(t => `<li>${esc(t)}</li>`).join('') : ''}
       ${!qt.terms && !qt.notes ? '<li>هذا العرض غير ملزم إلا بعد التوقيع عليه من الطرفين.</li>' : ''}
     </ul>
   </div>
@@ -206,33 +213,33 @@ ${pageFooterHTML(ws)}
 }
 
 function lineSpecCell(l) {
-  const spec = (l.description || '').split('\n').filter(Boolean).map(t => `<div>${t}</div>`).join('')
-  return `<strong>${l.item_type || ''}${l.model_no ? ` (${l.model_no})` : ''}</strong>${spec ? spec : ''}`
+  const spec = (l.description || '').split('\n').filter(Boolean).map(t => `<div>${esc(t)}</div>`).join('')
+  return `<strong>${esc(l.item_type || '')}${l.model_no ? ` (${esc(l.model_no)})` : ''}</strong>${spec ? spec : ''}`
 }
 
 function linesTable(lines) {
   return `<table>
     <thead><tr><th>#</th><th>البند / المواصفات الفنية</th><th>الكمية</th><th>الوحدة</th><th>سعر الوحدة</th><th>الإجمالي</th></tr></thead>
-    <tbody>${lines.map((l,i)=>`<tr><td>${i+1}</td><td class="spec">${lineSpecCell(l)}</td><td>${Number(l.qty||1).toFixed(2)}</td><td>${l.unit||'قطعة'}</td><td>${egp(l.unit_price)}</td><td class="price">${egp(Number(l.qty||1)*Number(l.unit_price||0))}</td></tr>`).join('')}</tbody>
+    <tbody>${lines.map((l,i)=>`<tr><td>${i+1}</td><td class="spec">${lineSpecCell(l)}</td><td>${Number(l.qty||1).toFixed(2)}</td><td>${esc(l.unit||'قطعة')}</td><td>${egp(l.unit_price)}</td><td class="price">${egp(Number(l.qty||1)*Number(l.unit_price||0))}</td></tr>`).join('')}</tbody>
   </table>`
 }
 
 function linesTableNoPrice(lines) {
   return `<table>
     <thead><tr><th>#</th><th>البند / المواصفات الفنية</th><th>الكمية</th><th>الوحدة</th></tr></thead>
-    <tbody>${lines.map((l,i)=>`<tr><td>${i+1}</td><td class="spec">${lineSpecCell(l)}</td><td>${Number(l.qty||1).toFixed(2)}</td><td>${l.unit||'قطعة'}</td></tr>`).join('')}</tbody>
+    <tbody>${lines.map((l,i)=>`<tr><td>${i+1}</td><td class="spec">${lineSpecCell(l)}</td><td>${Number(l.qty||1).toFixed(2)}</td><td>${esc(l.unit||'قطعة')}</td></tr>`).join('')}</tbody>
   </table>`
 }
 
 function buildSupplyOrderHTML(qt, lines, ws) {
   const info = `
-    <div class="card"><div class="card-title">المورّد له / الجهة</div>${qt.customer_name || '—'}</div>
-    <div class="card"><div class="card-title">بيانات الأمر</div>رقم الأمر: ${qt.number || qt.code}<br>التاريخ: ${fmtDate(qt.date)}</div>
-    <div class="card"><div class="card-title">مرجع عرض السعر</div>${qt.number || qt.code}</div>`
+    <div class="card"><div class="card-title">المورّد له / الجهة</div>${esc(qt.customer_name || '—')}</div>
+    <div class="card"><div class="card-title">بيانات الأمر</div>رقم الأمر: ${esc(qt.number || qt.code)}<br>التاريخ: ${fmtDate(qt.date)}</div>
+    <div class="card"><div class="card-title">مرجع عرض السعر</div>${esc(qt.number || qt.code)}</div>`
   const body = `
     <div class="section"><div class="section-title">الأصناف المطلوب توريدها</div>${linesTableNoPrice(lines)}</div>
     <div class="clause" style="margin-top:20px">يُرجى توريد الأصناف المذكورة أعلاه حسب المواصفات والكميات المتفق عليها${qt.valid_until?` في موعد أقصاه ${fmtDate(qt.valid_until)}`:''}.</div>
-    ${qt.terms?`<div class="clause">الشروط: ${qt.terms}</div>`:''}
+    ${qt.terms?`<div class="clause">الشروط: ${esc(qt.terms)}</div>`:''}
     <div class="sign-row">
       <div class="sign-box"><div class="sign-line">توقيع الجهة الطالبة</div></div>
       <div class="sign-box"><div class="sign-line">توقيع المورّد</div></div>
@@ -246,9 +253,9 @@ function buildContractHTML(qt, lines, ws) {
   const disc = subtotal * Number(qt.discount_pct||0)/100
   const total = subtotal + tax - disc
   const info = `
-    <div class="card"><div class="card-title">بيانات العقد</div>رقم العقد: ${qt.number || qt.code}<br>التاريخ: ${fmtDate(qt.date)}</div>
-    <div class="card"><div class="card-title">الطرف الأول</div>${ws.name || ''}${ws.tax_id ? `<br>بطاقة ضريبية: ${ws.tax_id}` : ''}</div>
-    <div class="card"><div class="card-title">الطرف الثاني</div>${qt.customer_name || '—'}</div>`
+    <div class="card"><div class="card-title">بيانات العقد</div>رقم العقد: ${esc(qt.number || qt.code)}<br>التاريخ: ${fmtDate(qt.date)}</div>
+    <div class="card"><div class="card-title">الطرف الأول</div>${esc(ws.name || '')}${ws.tax_id ? `<br>بطاقة ضريبية: ${esc(ws.tax_id)}` : ''}</div>
+    <div class="card"><div class="card-title">الطرف الثاني</div>${esc(qt.customer_name || '—')}</div>`
   const body = `
     <div class="clause">إنه في يوم ${fmtDate(qt.date)} تم الاتفاق بين كل من الطرف الأول والطرف الثاني على ما يلي:</div>
     <div class="section" style="margin-top:16px"><div class="section-title">البند الأول: محل العقد</div>
@@ -259,7 +266,7 @@ function buildContractHTML(qt, lines, ws) {
       <div class="clause">القيمة الإجمالية للعقد <strong>${egp(total)}</strong> (شاملة الضريبة والخصم إن وُجد).</div>
     </div>
     <div class="section"><div class="section-title">البند الثالث: الشروط</div>
-      <div class="clause">${qt.terms || 'تسري الشروط والأحكام العامة المتفق عليها بين الطرفين.'}</div>
+      <div class="clause">${esc(qt.terms || 'تسري الشروط والأحكام العامة المتفق عليها بين الطرفين.')}</div>
       ${qt.valid_until?`<div class="clause">مدة التنفيذ حتى تاريخ ${fmtDate(qt.valid_until)}.</div>`:''}
     </div>
     <div class="sign-row">
@@ -1040,9 +1047,16 @@ export default function Quotations() {
   )
   const saveTemplate = async () => {
     if (templateRows.length === 0) { toast('أضف قسط واحد على الأقل', 'error'); return }
+    if (templateRows.some(r => !(Number(r.pct) > 0) || Number(r.pct) > 100)) {
+      toast('نسبة كل قسط لازم تكون أكبر من صفر ولا تتجاوز 100%', 'error'); return
+    }
+    if (templateRows.some(r => r.days_offset !== '' && r.days_offset != null && (isNaN(Number(r.days_offset)) || Number(r.days_offset) < 0))) {
+      toast('عدد الأيام لا يمكن أن يكون سالباً', 'error'); return
+    }
     if (Math.abs(templatePctTotal - 100) > 0.5) {
       toast(`مجموع النسب (${templatePctTotal}%) لازم يساوي 100%`, 'error'); return
     }
+    if (savingTemplate) return
     setSavingTemplate(true)
     try {
       const hasExisting = templateExisting && templateExisting.length > 0
@@ -1125,6 +1139,12 @@ export default function Quotations() {
     }
     if (lines.some(l => !l.item_type?.trim())) { toast('أدخل اسم لكل البنود', 'error'); return }
     if (lines.some(l => !Number(l.unit_price))) { toast('أدخل سعر لكل البنود', 'error'); return }
+    if (lines.some(l => Number(l.unit_price) < 0)) { toast('سعر الوحدة لا يمكن أن يكون سالباً', 'error'); return }
+    if (lines.some(l => l.qty !== '' && l.qty != null && !(Number(l.qty) > 0))) { toast('كمية كل بند يجب أن تكون أكبر من صفر', 'error'); return }
+    for (const [name, v] of [['الضريبة', form.tax_pct], ['الخصم', form.discount_pct]]) {
+      const n = Number(v) || 0
+      if (n < 0 || n > 100) { toast(`نسبة ${name} يجب أن تكون بين 0 و100`, 'error'); return }
+    }
 
     const { total } = calcSummary(lines, form.tax_pct, form.discount_pct)
 
@@ -1164,7 +1184,7 @@ export default function Quotations() {
 
   // ── Convert to invoice ────────────────────────────────────────────────────
   const handleConvert = async () => {
-    if (!convertTarget) return
+    if (!convertTarget || converting) return
     setConverting(true)
     try {
       const { code } = await api.sales.nextInvoiceCode()
@@ -1181,7 +1201,7 @@ export default function Quotations() {
 
   // ── Convert quotation to customer order ──────────────────────────────────
   const handleToOrder = async () => {
-    if (!toOrderTarget) return
+    if (!toOrderTarget || toOrdering) return
     setToOrdering(true)
     try {
       const ord = await api.sales.toOrder(toOrderTarget.id, {
@@ -1204,12 +1224,16 @@ export default function Quotations() {
     setCopyingId(qt.id)
     try {
       const srcLines = qt.lines || []
+      const newNumber = genQuoteNumber()
       await api.sales.createQuote({
-        number:       genQuoteNumber(),
+        // QuotationIn في الباك إند بيطلب `code` (مش number) — من غيره النسخ كان بيفشل 422
+        code:         newNumber,
+        number:       newNumber,
         customer_id:  qt.customer_id,
+        location_id:  qt.location_id || null,
         status:       'draft',
         date:         today(),
-        valid_until:  '',
+        valid_until:  null,
         tax_pct:      qt.tax_pct || 0,
         discount_pct: qt.discount_pct || 0,
         notes:        `نسخة من: ${qt.number || qt.code}`,
@@ -1223,6 +1247,7 @@ export default function Quotations() {
           model_no:    l.model_no   || '',
           notes:       l.notes      || '',
           sort_order:  i,
+          ...(l.image_data ? { image_data: l.image_data } : {}),
         })),
       })
       toast('✅ تم نسخ العرض — تحقق من القائمة')
@@ -1260,7 +1285,7 @@ export default function Quotations() {
       printHTML(html, win)
     } catch (e) {
       win?.close()
-      toast('تعذّرت الطباعة', 'error')
+      toast(e?.message ? `تعذّرت الطباعة: ${e.message}` : 'تعذّرت الطباعة', 'error')
     } finally {
       setPrinting(null)
     }

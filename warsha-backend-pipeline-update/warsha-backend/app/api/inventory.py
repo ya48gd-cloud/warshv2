@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, delete as sa_delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, validator
@@ -20,7 +20,33 @@ from app.models.models import (
     SheetStockItem, BarStockItem, CostLine, WorkOrder, StockQuant, BinLocation,
 )
 
-router = APIRouter(prefix="/inventory", tags=["inventory"], dependencies=[Depends(require_any)])
+# ── RBAC للكتابة ──────────────────────────────────────────────────────────
+# كل راوترات المخزون كانت محمية بـ require_any بس (أي مستخدم مسجّل، حتى
+# viewer) — يعني مستخدم "مشاهد" يقدر يسجّل حركات، يعكسها، يمسح مواد، إلخ
+# بطلب API مباشر رغم إن الواجهة مخبية الأزرار. الأدوار اللي ليها صلاحية
+# كتابة المخزون هي نفسها ROLE_WRITE['inventory'] في الفرونت (admin/production).
+INVENTORY_WRITE_ROLES = ("admin", "production")
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+# حسابات بحتة (مفيش أي كتابة في الداتابيز) — مسموحة لأي مستخدم مسجّل
+_READONLY_POST_PATHS = ("/inventory/cutting-plan", "/inventory/bar-cutting-plan")
+
+
+async def require_inventory_write(request: Request, user: dict = Depends(require_any)) -> dict:
+    if request.method.upper() in _READ_METHODS:
+        return user
+    path = request.url.path.rstrip("/")
+    if any(path.endswith(p) for p in _READONLY_POST_PATHS):
+        return user
+    if user.get("role") not in INVENTORY_WRITE_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"صلاحية '{user.get('role')}' غير كافية لتعديل المخزون. مطلوب: {list(INVENTORY_WRITE_ROLES)}",
+        )
+    return user
+
+
+router = APIRouter(prefix="/inventory", tags=["inventory"],
+                   dependencies=[Depends(require_any), Depends(require_inventory_write)])
 
 
 async def _next_material_code(db: AsyncSession) -> str:
@@ -32,6 +58,25 @@ async def _next_material_code(db: AsyncSession) -> str:
         if not exists:
             return code
         n += 1
+
+
+_MATERIAL_KINDS = ("general", "plate", "bar", "consumable")
+_MATERIAL_POLICIES = {
+    "stock_item_type": ("raw_material", "finished_good", "spare_part", "imported_equipment", "consumable"),
+    "tracking": ("none", "lot", "serial"),
+    "valuation_method": ("standard", "moving_average", "last_price", "fifo"),
+    "removal_strategy": ("fifo", "lifo", "fefo", "manual"),
+}
+
+
+def _check_policy(name: str, v):
+    # قيمة فاضية = سيب الافتراضي (نفس السلوك القديم لـ None)
+    if v in (None, ""):
+        return None
+    allowed = _MATERIAL_POLICIES[name]
+    if v not in allowed:
+        raise ValueError(f"قيمة غير صحيحة لـ {name} — القيم المسموحة: {', '.join(allowed)}")
+    return v
 
 
 class MaterialCreate(BaseModel):
@@ -74,6 +119,61 @@ class MaterialCreate(BaseModel):
             raise ValueError("حد إعادة الطلب لا يمكن أن يكون سالباً")
         return v
 
+    @validator("name_ar")
+    def _name_ar_required(cls, v):
+        if v is None or not str(v).strip():
+            raise ValueError("اسم المادة مطلوب")
+        if len(v) > 200:
+            raise ValueError("اسم المادة طويل جداً (الحد الأقصى 200 حرف)")
+        return v.strip()
+
+    @validator("unit")
+    def _unit_required(cls, v):
+        if v is None or not str(v).strip():
+            raise ValueError("وحدة القياس مطلوبة")
+        if len(v.strip()) > 30:
+            raise ValueError("وحدة القياس طويلة جداً (الحد الأقصى 30 حرف)")
+        return v.strip()
+
+    @validator("code")
+    def _code_max_len(cls, v):
+        if v is not None and len(v.strip()) > 50:
+            raise ValueError("كود المادة طويل جداً (الحد الأقصى 50 حرف)")
+        return v
+
+    @validator("thickness_mm", "density_kg_m2", "plate_length_cm", "plate_width_cm",
+               "plate_weight_kg", "bar_length_cm", "bar_weight_kg", "weight_per_meter_kg")
+    def _dims_not_negative(cls, v):
+        # أبعاد/أوزان سالبة كانت بتنتج كثافة أو وزن متر سالب (enrich_material_shape)
+        # وبالتالي كميات صرف سالبة/مقلوبة في record_movement.
+        if v is not None and v < 0:
+            raise ValueError("الأبعاد والأوزان لا يمكن أن تكون سالبة")
+        return v
+
+    @validator("material_kind")
+    def _valid_material_kind(cls, v):
+        if v in (None, ""):
+            return "general"
+        if v not in _MATERIAL_KINDS:
+            raise ValueError(f"نوع الخامة غير صحيح — القيم المسموحة: {', '.join(_MATERIAL_KINDS)}")
+        return v
+
+    @validator("stock_item_type", pre=True)
+    def _valid_stock_item_type(cls, v):
+        return _check_policy("stock_item_type", v)
+
+    @validator("tracking", pre=True)
+    def _valid_tracking(cls, v):
+        return _check_policy("tracking", v)
+
+    @validator("valuation_method", pre=True)
+    def _valid_valuation_method(cls, v):
+        return _check_policy("valuation_method", v)
+
+    @validator("removal_strategy", pre=True)
+    def _valid_removal_strategy(cls, v):
+        return _check_policy("removal_strategy", v)
+
 
 class MovementCreate(BaseModel):
     material_id: int
@@ -102,6 +202,9 @@ class MovementCreate(BaseModel):
     waste_g: Optional[Decimal] = None
     customer_id: Optional[int] = None
     source: Optional[str] = None
+    # المخزن اللي الحركة عليه: "in" = إلى مخزن، "out" = من مخزن.
+    # لو مش متبعوت → مخزن الخامات (RAW) زي السلوك القديم بالظبط.
+    warehouse_id: Optional[int] = None
 
     @validator("movement_type")
     def _valid_movement_type(cls, v):
@@ -111,6 +214,60 @@ class MovementCreate(BaseModel):
         if v not in ("in", "out"):
             raise ValueError("movement_type يجب أن يكون 'in' أو 'out'")
         return v
+
+    @validator("pieces_count", "plate_pieces")
+    def _counts_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("العدد لا يمكن أن يكون سالباً")
+        return v
+
+    @validator("weight_per_piece", "plate_length_cm", "plate_width_cm", "plate_weight_kg",
+               "plate_area_m2", "bar_length_cm", "waste_g")
+    def _measures_not_negative(cls, v):
+        # waste_g سالب كان بيُطرح من كمية الصادر (plate_area / bar_length) فيصرف
+        # أقل من المطلوب فعليًا؛ وأبعاد سالبة كانت بتقلب إشارة الكمية المحسوبة.
+        if v is not None and v < 0:
+            raise ValueError("الأبعاد والأوزان لا يمكن أن تكون سالبة")
+        return v
+
+
+async def _warehouse_bin_for(db: AsyncSession, warehouse_id: int, *, label: str = "المخزن"):
+    """
+    يحوّل warehouse_id (اختيار المستخدم) للـ BinLocation الافتراضي بتاعه
+    (<CODE>-DEFAULT) — مع فحص صريح إن المخزن تابع للـ tenant الحالي وفعّال.
+    يرجّع (warehouse, bin_location).
+    """
+    from app.core.database import current_tenant_id as _ctid_wh
+    from app.models.models import Warehouse
+    from app.services.inventory_ledger import get_or_create_warehouse_bin
+    tenant_id = _ctid_wh.get()
+    wh = await db.scalar(
+        select(Warehouse).where(Warehouse.id == warehouse_id, Warehouse.tenant_id == tenant_id)
+    )
+    if not wh:
+        raise HTTPException(404, f"{label} المحدد غير موجود")
+    if not wh.is_active:
+        raise HTTPException(400, f"{label} '{wh.name_ar}' معطّل — فعّله أولاً أو اختر مخزناً آخر")
+    loc = await get_or_create_warehouse_bin(db, tenant_id, wh.code)
+    return wh, loc
+
+
+async def _warehouse_qty(db: AsyncSession, material_id: int, warehouse_id: int) -> Decimal:
+    """رصيد مادة في مخزن معيّن = مجموع StockQuant على كل مواقع (bins) المخزن."""
+    q = await db.scalar(
+        select(func.coalesce(func.sum(StockQuant.qty), 0))
+        .join(BinLocation, BinLocation.id == StockQuant.location_id)
+        .where(StockQuant.material_id == material_id, BinLocation.warehouse_id == warehouse_id)
+    )
+    return Decimal(str(q or 0))
+
+
+async def _location_qty(db: AsyncSession, material_id: int, location_id: int) -> Decimal:
+    q = await db.scalar(
+        select(func.coalesce(func.sum(StockQuant.qty), 0))
+        .where(StockQuant.material_id == material_id, StockQuant.location_id == location_id)
+    )
+    return Decimal(str(q or 0))
 
 
 def enrich_material_shape(payload: dict) -> dict:
@@ -215,21 +372,57 @@ async def get_material(material_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/materials/{material_id}/quants")
 async def material_quants(material_id: int, db: AsyncSession = Depends(get_db)):
     """محطة 12: توزيع رصيد المادة على المواقع المختلفة (StockQuant لكل موقع)."""
-    mat = await db.get(Material, material_id)
+    from app.core.database import current_tenant_id as _ctid_q
+    from app.models.models import Warehouse
+    tenant_id = _ctid_q.get()
+    mat = await db.scalar(
+        select(Material).where(Material.id == material_id, Material.tenant_id == tenant_id)
+    )
     if not mat:
         raise HTTPException(404, "المادة غير موجودة")
     rows = (await db.execute(
-        select(StockQuant, BinLocation.code, BinLocation.name_ar)
+        select(StockQuant, BinLocation.code, BinLocation.name_ar, Warehouse.id, Warehouse.name_ar, Warehouse.code)
         .join(BinLocation, BinLocation.id == StockQuant.location_id)
-        .where(StockQuant.material_id == material_id, StockQuant.qty != 0)
+        .outerjoin(Warehouse, Warehouse.id == BinLocation.warehouse_id)
+        .where(StockQuant.material_id == material_id, StockQuant.qty != 0,
+               StockQuant.tenant_id == tenant_id)
     )).all()
     return [
         {
             "location_id": q.location_id, "location_code": code, "location_name": name_ar,
+            "warehouse_id": wh_id, "warehouse_name": wh_name, "warehouse_code": wh_code,
             "lot_id": q.lot_id, "qty": float(q.qty),
         }
-        for q, code, name_ar in rows
+        for q, code, name_ar, wh_id, wh_name, wh_code in rows
     ]
+
+
+@router.get("/warehouse-distribution")
+async def warehouse_distribution(db: AsyncSession = Depends(get_db)):
+    """
+    توزيع رصيد كل المواد على المخازن في طلب واحد (لشاشة المواد):
+    {material_id: [{warehouse_id, warehouse_name, warehouse_code, qty}, ...]}
+    """
+    from app.core.database import current_tenant_id as _ctid_d
+    from app.models.models import Warehouse
+    tenant_id = _ctid_d.get()
+    rows = (await db.execute(
+        select(StockQuant.material_id, Warehouse.id, Warehouse.name_ar, Warehouse.code,
+               func.sum(StockQuant.qty))
+        .join(BinLocation, BinLocation.id == StockQuant.location_id)
+        .outerjoin(Warehouse, Warehouse.id == BinLocation.warehouse_id)
+        .where(StockQuant.tenant_id == tenant_id)
+        .group_by(StockQuant.material_id, Warehouse.id, Warehouse.name_ar, Warehouse.code)
+    )).all()
+    out: dict = {}
+    for mid, wid, wname, wcode, qty in rows:
+        if not qty:
+            continue
+        out.setdefault(str(mid), []).append({
+            "warehouse_id": wid, "warehouse_name": wname or "بدون مخزن",
+            "warehouse_code": wcode, "qty": float(qty),
+        })
+    return out
 
 
 @router.get("/materials/{material_id}/stock-check")
@@ -271,6 +464,10 @@ async def update_material(material_id: int, data: MaterialCreate, db: AsyncSessi
     new_code = (payload.get('code') or '').strip()
     if not new_code:
         payload['code'] = mat.code  # حافظ على الكود الموجود لو لم يُرسَل
+    else:
+        payload['code'] = new_code  # نفس الكود اللي اتفحص تكراره (بدون مسافات زيادة)
+    if not payload.get('name_en'):
+        payload['name_en'] = payload.get('name_ar', '')  # نفس سلوك الإنشاء
     if not payload.get('category_id'):
         if mat.category_id:
             payload['category_id'] = mat.category_id  # حافظ على الفئة الحالية لو لم تُرسَل
@@ -313,6 +510,14 @@ async def update_material(material_id: int, data: MaterialCreate, db: AsyncSessi
         if not payload.get("weight_per_meter_kg") and mat.weight_per_meter_kg:
             payload["weight_per_meter_kg"] = mat.weight_per_meter_kg
 
+    # تغيير السعر من شاشة التعديل لازم يسيب أثر في سجل الأسعار زي /price
+    new_cost = payload.get("unit_cost")
+    if new_cost is not None and Decimal(str(new_cost)) != Decimal(str(mat.unit_cost or 0)):
+        db.add(MaterialPriceHistory(
+            tenant_id=mat.tenant_id, material_id=mat.id,
+            old_price=mat.unit_cost, new_price=new_cost,
+        ))
+
     for k, v in payload.items():
         setattr(mat, k, v)
     await db.commit()
@@ -349,6 +554,16 @@ async def record_movement(data: MovementCreate, db: AsyncSession = Depends(get_d
     mat = await db.get(Material, data.material_id)
     if not mat:
         raise HTTPException(404, "Material not found")
+
+    # المراجع الخارجية (أمر إنتاج / عميل) بتوصل كـ IDs خام من العميل — لازم
+    # تكون موجودة وتابعة لنفس الـ tenant (db.get مفلتر تلقائيًا بالـ tenant)،
+    # وإلا الحركة بتتربط بأمر/عميل تنانت تاني أو ID وهمي.
+    if data.work_order_id is not None and not await db.get(WorkOrder, data.work_order_id):
+        raise HTTPException(404, "أمر الإنتاج المحدد غير موجود")
+    if data.customer_id is not None:
+        from app.models.models import Customer as _Customer_mv
+        if not await db.get(_Customer_mv, data.customer_id):
+            raise HTTPException(404, "العميل المحدد غير موجود")
 
     # ── helpers ────────────────────────────────────────────────────
     def D(v):
@@ -454,10 +669,26 @@ async def record_movement(data: MovementCreate, db: AsyncSession = Depends(get_d
         source=data.source,
     )
 
+    # المخزن المختار (اختياري): بيتحول للموقع الافتراضي بتاعه. من غيره →
+    # post_receipt/post_issue بيستخدموا RAW زي ما كانوا دايمًا.
+    location_id = None
+    if data.warehouse_id is not None:
+        wh, loc = await _warehouse_bin_for(db, data.warehouse_id)
+        location_id = loc.id
+        if data.movement_type == "out":
+            wh_qty = await _warehouse_qty(db, mat.id, wh.id)
+            if actual_qty > wh_qty:
+                raise HTTPException(
+                    400,
+                    f"الرصيد في '{wh.name_ar}' غير كافٍ — المتاح: {float(wh_qty):g} {mat.unit}، "
+                    f"المطلوب صرفه: {float(actual_qty):g} {mat.unit}",
+                )
+
     if data.movement_type == "in":
         movement = await post_receipt(
             db, material=mat, qty=actual_qty, unit_cost=data.unit_cost,
             movement_date=data.movement_date or _mv_date.today(),
+            destination_location_id=location_id,
             # source_doc_type=None → حركة يدوية من شاشة المخزون (زي ما كانت دايمًا)
             **extra_fields,
         )
@@ -465,6 +696,7 @@ async def record_movement(data: MovementCreate, db: AsyncSession = Depends(get_d
         movement = await post_issue(
             db, material=mat, qty=actual_qty, unit_cost=data.unit_cost,
             movement_date=data.movement_date or _mv_date.today(),
+            source_location_id=location_id,
             **extra_fields,
         )
 
@@ -483,8 +715,11 @@ async def record_movement(data: MovementCreate, db: AsyncSession = Depends(get_d
 
 class TransferIn(BaseModel):
     material_id: int
-    source_location_id: int
-    destination_location_id: int
+    # إما مواقع (bins) صريحة، أو مخازن (بتتحول للموقع الافتراضي لكل مخزن)
+    source_location_id: Optional[int] = None
+    destination_location_id: Optional[int] = None
+    source_warehouse_id: Optional[int] = None
+    destination_warehouse_id: Optional[int] = None
     qty: Decimal
     reference: Optional[str] = None
     notes: Optional[str] = None
@@ -507,15 +742,43 @@ async def transfer_stock(data: TransferIn, db: AsyncSession = Depends(get_db)):
     # موجود بس لتنانت تاني) كان بيعدي، و_sync_quant كان بينشئ StockQuant
     # يتيم عليه — رصيد "منقول" فعليًا بس مالوش موقع حقيقي يظهر بيه في
     # /quants ولا ينفع يترحّل منه تاني.
-    if not await db.get(BinLocation, data.source_location_id):
+    if data.qty is None or data.qty <= 0:
+        raise HTTPException(400, "كمية التحويل يجب أن تكون أكبر من صفر")
+
+    src_loc_id = data.source_location_id
+    dst_loc_id = data.destination_location_id
+    src_wh = dst_wh = None
+    if src_loc_id is None:
+        if data.source_warehouse_id is None:
+            raise HTTPException(400, "حدد المخزن (أو الموقع) المحوَّل منه")
+        src_wh, src_loc = await _warehouse_bin_for(db, data.source_warehouse_id, label="المخزن المحوَّل منه")
+        src_loc_id = src_loc.id
+    if dst_loc_id is None:
+        if data.destination_warehouse_id is None:
+            raise HTTPException(400, "حدد المخزن (أو الموقع) المحوَّل إليه")
+        dst_wh, dst_loc = await _warehouse_bin_for(db, data.destination_warehouse_id, label="المخزن المحوَّل إليه")
+        dst_loc_id = dst_loc.id
+    if src_wh is not None and dst_wh is not None and src_wh.id == dst_wh.id:
+        raise HTTPException(400, "المخزن المحوَّل منه والمحوَّل إليه لازم يكونوا مختلفين")
+
+    if not await db.get(BinLocation, src_loc_id):
         raise HTTPException(404, "موقع المصدر غير موجود")
-    if not await db.get(BinLocation, data.destination_location_id):
+    if not await db.get(BinLocation, dst_loc_id):
         raise HTTPException(404, "موقع الوجهة غير موجود")
+
+    if src_wh is not None:
+        avail = await _location_qty(db, mat.id, src_loc_id)
+        if data.qty > avail:
+            raise HTTPException(
+                400,
+                f"الرصيد في '{src_wh.name_ar}' غير كافٍ — المتاح: {float(avail):g} {mat.unit}، "
+                f"المطلوب تحويله: {float(data.qty):g} {mat.unit}",
+            )
 
     movement = await post_transfer(
         db, material=mat, qty=data.qty,
-        source_location_id=data.source_location_id,
-        destination_location_id=data.destination_location_id,
+        source_location_id=src_loc_id,
+        destination_location_id=dst_loc_id,
         reference=data.reference, notes=data.notes,
     )
     await db.commit()
@@ -529,25 +792,58 @@ async def transfer_stock(data: TransferIn, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/movements/{material_id}")
-async def get_movements(material_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(StockMovement)
-        .where(StockMovement.material_id == material_id)
-        .order_by(StockMovement.movement_date.asc(), StockMovement.id.asc())
-    )
-    movs = result.scalars().all()
+async def _location_warehouse_map(db: AsyncSession):
+    """{location_id: (warehouse_id, warehouse_name)} + id موقع RAW الافتراضي.
 
-    # حساب الرصيد التراكمي لكل حركة (تصاعدي ثم نعكسه للعرض)
-    running = Decimal("0")
-    rows = []
-    for m in movs:
-        running += m.qty if m.movement_type == "in" else -m.qty
-        rows.append((m, float(running)))
-    rows.reverse()  # الأحدث أولاً
+    الحركات القديمة (قبل تفعيل المواقع) مسجّلة من غير source/destination —
+    الخدمة المركزية للمخزون بتعتبر أي حركة من غير موقع على مخزن الخامات
+    (RAW)، وتسوية المخزون القديم حطت رصيدها هناك، فبنعرضها بنفس المنطق.
+    """
+    from app.models.models import Warehouse
+    from app.core.database import current_tenant_id as _ctid_lw
+    tid = _ctid_lw.get()
+    rows = (await db.execute(
+        select(BinLocation.id, BinLocation.code, Warehouse.id, Warehouse.name_ar)
+        .outerjoin(Warehouse, Warehouse.id == BinLocation.warehouse_id)
+        .where(BinLocation.tenant_id == tid)
+    )).all()
+    loc_map = {lid: (wid, wname) for lid, _code, wid, wname in rows}
+    raw_loc = next((lid for lid, code, _w, _n in rows if code == "RAW-DEFAULT"), None)
+    return loc_map, raw_loc
 
-    dest_ar = {"workshop": "الورشة", "customer": "عميل خارجي"}
-    return [{
+
+def _movement_sides(m, raw_loc):
+    """(موقع المصدر، موقع الوجهة) بعد تطبيق افتراضي RAW للحركات القديمة."""
+    src, dst = m.source_location_id, m.destination_location_id
+    if m.movement_type == "in" and dst is None:
+        dst = raw_loc
+    elif m.movement_type == "out" and src is None:
+        src = raw_loc
+    return src, dst
+
+
+def _wh_of(loc_id, loc_map):
+    return loc_map.get(loc_id, (None, None)) if loc_id is not None else (None, None)
+
+
+def _wh_delta(m, src, dst, loc_map, warehouse_id) -> Decimal:
+    """أثر الحركة على رصيد مخزن معيّن (+ داخل له، − خارج منه)."""
+    d = Decimal("0")
+    if _wh_of(dst, loc_map)[0] == warehouse_id:
+        d += m.qty
+    if _wh_of(src, loc_map)[0] == warehouse_id:
+        d -= m.qty
+    return d
+
+
+_DEST_AR = {"workshop": "الورشة", "customer": "عميل خارجي"}
+
+
+def _movement_row(m, balance, loc_map, raw_loc, material=None, direction=None):
+    src, dst = _movement_sides(m, raw_loc)
+    s_wid, s_wname = _wh_of(src, loc_map)
+    d_wid, d_wname = _wh_of(dst, loc_map)
+    row = {
         "id": m.id, "movement_type": m.movement_type,
         "qty": float(m.qty), "unit_cost": float(m.unit_cost),
         "total_cost": float(m.total_cost),
@@ -555,7 +851,7 @@ async def get_movements(material_id: int, db: AsyncSession = Depends(get_db)):
         "reference": m.reference, "notes": m.notes,
         "withdrawal_unit": getattr(m, "withdrawal_unit", None),
         "destination": m.destination,
-        "destination_ar": dest_ar.get(m.destination or "", m.destination or ""),
+        "destination_ar": _DEST_AR.get(m.destination or "", m.destination or ""),
         "destination_ref": m.destination_ref,
         "pieces_count": m.pieces_count,
         "weight_per_piece": float(m.weight_per_piece) if m.weight_per_piece else None,
@@ -573,7 +869,103 @@ async def get_movements(material_id: int, db: AsyncSession = Depends(get_db)):
         "source_doc_id": getattr(m, "source_doc_id", None),
         "source_location_id": getattr(m, "source_location_id", None),
         "destination_location_id": getattr(m, "destination_location_id", None),
-    } for m, balance in rows]
+        "source_warehouse_id": s_wid, "source_warehouse_name": s_wname,
+        "destination_warehouse_id": d_wid, "destination_warehouse_name": d_wname,
+    }
+    if material is not None:
+        row.update({"material_id": material.id, "material_code": material.code,
+                    "material_name": material.name_ar, "unit": material.unit})
+    if direction is not None:
+        row["warehouse_direction"] = direction  # "in" / "out" بالنسبة للمخزن المفلتر
+    return row
+
+
+@router.get("/movements/{material_id}")
+async def get_movements(material_id: int, warehouse_id: Optional[int] = None,
+                        db: AsyncSession = Depends(get_db)):
+    """حركات مادة — كلها، أو (مع warehouse_id) اللي بتمس مخزن معيّن بس
+    والرصيد التراكمي بيبقى رصيد المادة في المخزن ده."""
+    from app.core.database import current_tenant_id as _ctid_gm
+    mat = await db.get(Material, material_id)
+    if not mat or mat.tenant_id != _ctid_gm.get():
+        raise HTTPException(404, "المادة غير موجودة")
+    movs = (await db.execute(
+        select(StockMovement)
+        .where(StockMovement.material_id == material_id, StockMovement.tenant_id == mat.tenant_id)
+        .order_by(StockMovement.movement_date.asc(), StockMovement.id.asc())
+    )).scalars().all()
+    loc_map, raw_loc = await _location_warehouse_map(db)
+
+    # حساب الرصيد التراكمي لكل حركة (تصاعدي ثم نعكسه للعرض)
+    running = Decimal("0")
+    rows = []
+    for m in movs:
+        if warehouse_id is not None:
+            src, dst = _movement_sides(m, raw_loc)
+            if warehouse_id not in (_wh_of(src, loc_map)[0], _wh_of(dst, loc_map)[0]):
+                continue
+            delta = _wh_delta(m, src, dst, loc_map, warehouse_id)
+            running += delta
+            rows.append((m, float(running), "in" if delta > 0 else "out"))
+            continue
+        # التحويل بين المواقع (transfer) ميغيرش الرصيد الإجمالي للمادة — قبل كده
+        # كان بيتحسب كصادر فيطلّع رصيد تراكمي أقل من الحقيقي بعد أي تحويل.
+        if m.movement_type == "in":
+            running += m.qty
+        elif m.movement_type == "out":
+            running -= m.qty
+        rows.append((m, float(running), None))
+    rows.reverse()  # الأحدث أولاً
+    return [_movement_row(m, bal, loc_map, raw_loc, direction=dirn) for m, bal, dirn in rows]
+
+
+@router.get("/warehouse-movements/{warehouse_id}")
+async def get_warehouse_movements(
+    warehouse_id: int,
+    date_from: Optional[date] = None, date_to: Optional[date] = None,
+    limit: int = 300,
+    db: AsyncSession = Depends(get_db),
+):
+    """كل الحركات اللي دخلت أو خرجت من مخزن معيّن (كل المواد)، الأحدث أولاً."""
+    from sqlalchemy import or_ as _or, and_ as _and
+    from app.models.models import Warehouse
+    from app.core.database import current_tenant_id as _ctid_wm
+    tid = _ctid_wm.get()
+    wh = await db.scalar(select(Warehouse).where(Warehouse.id == warehouse_id, Warehouse.tenant_id == tid))
+    if not wh:
+        raise HTTPException(404, "المخزن غير موجود")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "تاريخ البداية بعد تاريخ النهاية")
+    limit = max(1, min(int(limit or 300), 1000))
+
+    loc_map, raw_loc = await _location_warehouse_map(db)
+    wh_locs = [lid for lid, (wid, _n) in loc_map.items() if wid == warehouse_id]
+    if not wh_locs:
+        return []
+    cond = [StockMovement.source_location_id.in_(wh_locs), StockMovement.destination_location_id.in_(wh_locs)]
+    if raw_loc in wh_locs:
+        # الحركات القديمة من غير موقع محسوبة على RAW
+        cond += [
+            _and(StockMovement.movement_type == "in", StockMovement.destination_location_id.is_(None)),
+            _and(StockMovement.movement_type == "out", StockMovement.source_location_id.is_(None)),
+        ]
+    q = select(StockMovement).where(StockMovement.tenant_id == tid, _or(*cond))
+    if date_from:
+        q = q.where(StockMovement.movement_date >= date_from)
+    if date_to:
+        q = q.where(StockMovement.movement_date <= date_to)
+    movs = (await db.execute(
+        q.order_by(StockMovement.movement_date.desc(), StockMovement.id.desc()).limit(limit)
+    )).scalars().all()
+    ids = {m.material_id for m in movs}
+    mats = {x.id: x for x in (await db.execute(select(Material).where(Material.id.in_(ids)))).scalars()} if ids else {}
+    out = []
+    for m in movs:
+        src, dst = _movement_sides(m, raw_loc)
+        delta = _wh_delta(m, src, dst, loc_map, warehouse_id)
+        out.append(_movement_row(m, None, loc_map, raw_loc, material=mats.get(m.material_id),
+                                 direction="in" if delta > 0 else "out"))
+    return out
 
 
 @router.get("/alerts/low-stock")
@@ -626,6 +1018,8 @@ async def update_material_price(material_id: int, new_price: float,
     if not mat: raise HTTPException(404, "Material not found")
     if new_price < 0:
         raise HTTPException(400, "السعر لا يمكن أن يكون سالباً")
+    # float → Decimal عبر str عشان منخزّنش أخطاء تقريب الـ float في عمود Numeric
+    new_price = Decimal(str(new_price))
     old_price = mat.unit_cost
     mat.unit_cost = new_price
     # سجّل التغيير في MaterialPriceHistory — الموديل موجود ومربوط بعلاقة
@@ -673,6 +1067,8 @@ async def create_category(data: CategoryCreate, db: AsyncSession = Depends(get_d
     name_ar = (data.name_ar or "").strip()
     if not name_ar:
         raise HTTPException(400, "اسم الصنف مطلوب")
+    if len(name_ar) > 120 or len((data.name_en or "").strip()) > 120:
+        raise HTTPException(400, "اسم الصنف طويل جداً (الحد الأقصى 120 حرف)")
     # نتأكد إنه مش مكرر
     existing = await db.execute(
         select(MaterialCategory).where(MaterialCategory.name_ar == name_ar)
@@ -732,6 +1128,30 @@ async def delete_material(material_id: int, db: AsyncSession = Depends(get_db)):
         blockers.append("أوامر شراء")
     if float(mat.stock_qty or 0) != 0:
         blockers.append("رصيد حالي غير صفري")
+    if await _count(SheetStockItem) > 0 or await _count(BarStockItem) > 0:
+        blockers.append("مقاسات ألواح/أسياخ مسجلة")
+    if await _count(CostLine) > 0:
+        blockers.append("تكاليف أوامر إنتاج")
+
+    # أي جدول تاني بيشاور على المادة (سطور فواتير بيع، عروض أسعار، هالك،
+    # جرد...) — الحذف كان بيعدّي ويسيب سجلات يتيمة (أو يفشل بـ 500 على
+    # Postgres بسبب الـ FK). نفحصهم كلهم بشكل عام بدل قائمة ثابتة ناقصة.
+    from app.core.database import Base as _Base_del
+    _checked = {StockMovement, StockBatch, MaterialBinStock, MaterialReservation,
+                PurchaseInvoiceLine, PurchaseOrderLine, SheetStockItem, BarStockItem,
+                CostLine, BOMLine, MaterialPriceHistory}
+    _other_refs = 0
+    for _mapper in _Base_del.registry.mappers:
+        _cls = _mapper.class_
+        if _cls in _checked or _cls is Material:
+            continue
+        _col = getattr(_cls, "__table__", None)
+        _col = _col.c.get("material_id") if _col is not None else None
+        if _col is None or not any(fk.column.table.name == "materials" for fk in _col.foreign_keys):
+            continue
+        _other_refs += await _count(_cls)
+    if _other_refs > 0:
+        blockers.append("مستندات أخرى (مبيعات/عروض أسعار/هالك/جرد...)")
 
     if blockers:
         raise HTTPException(
@@ -769,8 +1189,76 @@ async def delete_movement(movement_id: int, db: AsyncSession = Depends(get_db)):
     if is_a_reversal is not None:
         raise HTTPException(400, "هذه الحركة نفسها ناتجة عن عكس حركة أخرى ولا يمكن عكسها")
 
+    if mov.source_doc_type == "reversal":
+        raise HTTPException(400, "هذه الحركة نفسها ناتجة عن عكس حركة أخرى ولا يمكن عكسها")
+
     mat = await db.get(Material, mov.material_id)
+
+    # ── عكس تحويل بين المواقع ──────────────────────────────────────────
+    # قبل كده حركة "transfer" كانت بتقع في فرع "else" فتتعامل كصادر:
+    # stock_qty كان بيزيد بكمية التحويل (رصيد وهمي) وQuant الموقع الافتراضي
+    # بيزيد بدل ما الكمية ترجع من الوجهة للمصدر. العكس الصحيح = تحويل معاكس.
+    if mov.movement_type == "transfer":
+        if not mat:
+            raise HTTPException(404, "المادة غير موجودة")
+        if not mov.source_location_id or not mov.destination_location_id:
+            raise HTTPException(400, "حركة التحويل ناقصة بيانات المواقع ولا يمكن عكسها")
+        from app.services.inventory_ledger import post_transfer as _post_transfer_rev
+        reversal = await _post_transfer_rev(
+            db, material=mat, qty=mov.qty,
+            source_location_id=mov.destination_location_id,
+            destination_location_id=mov.source_location_id,
+            source_doc_type="reversal", source_doc_id=mov.id,
+            reference=f"عكس للحركة #{mov.id}",
+            notes=f"تم إنشاؤها تلقائيًا كعكس لحركة #{mov.id}" + (f" — {mov.notes}" if mov.notes else ""),
+        )
+        await db.flush()
+        mov.state = "reversed"
+        mov.reversed_movement_id = reversal.id
+        await db.commit()
+        await db.refresh(reversal)
+        return {
+            "message": "تم عكس الحركة بنجاح",
+            "original_movement_id": mov.id,
+            "reversal_movement_id": reversal.id,
+            "material_id": mov.material_id,
+            "stock_qty": float(mat.stock_qty),
+        }
+
     reverse_type = "out" if mov.movement_type == "in" else "in"
+
+    # عكس حركة وارد = صرف فعلي — لازم يمر بنفس فحص المتاح (الرصيد - المحجوز)
+    # وإلا الرصيد ممكن ينزل تحت الصفر أو ياكل كمية محجوزة لأمر إنتاج.
+    if mat and mov.movement_type == "in":
+        from app.services.inventory import get_available_qty as _avail_rev
+        available = await _avail_rev(db, mat.id, mat.stock_qty)
+        if mov.qty > available:
+            raise HTTPException(
+                400,
+                f"لا يمكن عكس حركة الوارد — المتاح حاليًا ({float(available)} {mat.unit}) "
+                f"أقل من كمية الحركة ({float(mov.qty)} {mat.unit})",
+            )
+
+    # الحركات المربوطة بدُفعة (lot) لازم رصيد الدُفعة يتعكس معاها، وإلا
+    # qty_remaining للدُفعة يفضل يعرض كمية مش موجودة فعليًا (أو العكس).
+    rev_batch = None
+    if mov.source_doc_type in ("stock_batch", "stock_batch_issue") and mov.source_doc_id:
+        rev_batch = await db.get(StockBatch, mov.source_doc_id)
+        if rev_batch and mov.source_doc_type == "stock_batch":
+            if (rev_batch.qty_remaining or Decimal("0")) < mov.qty:
+                raise HTTPException(
+                    400,
+                    f"لا يمكن عكس استلام الدُفعة '{rev_batch.lot_number}' — تم صرف جزء منها "
+                    f"(المتبقي {float(rev_batch.qty_remaining)} من {float(mov.qty)})",
+                )
+            rev_batch.qty_remaining -= mov.qty
+            if rev_batch.qty_remaining <= 0:
+                rev_batch.qty_remaining = Decimal("0")
+                rev_batch.status = "consumed"
+        elif rev_batch and mov.source_doc_type == "stock_batch_issue":
+            rev_batch.qty_remaining = (rev_batch.qty_remaining or Decimal("0")) + mov.qty
+            if rev_batch.status == "consumed" and rev_batch.qty_remaining > 0:
+                rev_batch.status = "active"
 
     if mat:
         # نعكس الأثر: حركة دخول كانت زوّدت الرصيد → ننقص، والعكس
@@ -799,6 +1287,10 @@ async def delete_movement(movement_id: int, db: AsyncSession = Depends(get_db)):
         movement_no=await _next_movement_no(db, rev_tenant_id),
         source_doc_type="reversal",
         source_doc_id=mov.id,
+        # نفس الموقع اللي الحركة الأصلية أثّرت عليه (الوارد دخل على
+        # destination_location_id، والصادر خرج من source_location_id)
+        source_location_id=(mov.destination_location_id if mov.movement_type == "in" else None),
+        destination_location_id=(mov.source_location_id if mov.movement_type != "in" else None),
     )
     db.add(reversal)
     await db.flush()  # نحتاج reversal.id قبل ما نربطه بالحركة الأصلية
@@ -816,9 +1308,12 @@ async def delete_movement(movement_id: int, db: AsyncSession = Depends(get_db)):
             else None
         )
         quant_delta = -mov.qty if mov.movement_type == "in" else mov.qty
+        quant_location_id = (
+            mov.destination_location_id if mov.movement_type == "in" else mov.source_location_id
+        )
         await _sync_quant(
             db, tenant_id=rev_tenant_id, material_id=mov.material_id,
-            delta_qty=quant_delta, lot_id=quant_lot_id,
+            delta_qty=quant_delta, lot_id=quant_lot_id, location_id=quant_location_id,
         )
 
     await db.commit()
@@ -840,6 +1335,19 @@ class CuttingPieceIn(BaseModel):
     height_cm: Decimal
     qty: int = 1
 
+    @validator("width_cm", "height_cm")
+    def _dim_positive(cls, v):
+        if v is None or v <= 0:
+            raise ValueError("أبعاد القطعة يجب أن تكون أكبر من صفر")
+        return v
+
+    @validator("qty")
+    def _qty_range(cls, v):
+        # حد أقصى معقول يمنع طلب بملايين القطع يعلّق خوارزمية التقطيع (DoS)
+        if v is None or v < 1 or v > 10000:
+            raise ValueError("عدد القطع يجب أن يكون بين 1 و 10000")
+        return v
+
 
 class CuttingPlanRequest(BaseModel):
     material_id: Optional[int] = None
@@ -849,6 +1357,12 @@ class CuttingPlanRequest(BaseModel):
     allow_rotation: bool = True
     kerf_mm: Decimal = Decimal("0")
     use_stock: bool = False
+
+    @validator("kerf_mm")
+    def _kerf_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("سُمك القطع (kerf) لا يمكن أن يكون سالباً")
+        return v
 
 
 @router.post("/cutting-plan")
@@ -935,6 +1449,18 @@ class BarPieceIn(BaseModel):
     length_cm: Decimal
     qty: int = 1
 
+    @validator("length_cm")
+    def _len_positive(cls, v):
+        if v is None or v <= 0:
+            raise ValueError("طول القطعة يجب أن يكون أكبر من صفر")
+        return v
+
+    @validator("qty")
+    def _qty_range(cls, v):
+        if v is None or v < 1 or v > 10000:
+            raise ValueError("عدد القطع يجب أن يكون بين 1 و 10000")
+        return v
+
 
 class BarCuttingPlanRequest(BaseModel):
     material_id: Optional[int] = None
@@ -942,6 +1468,12 @@ class BarCuttingPlanRequest(BaseModel):
     pieces: list[BarPieceIn]
     kerf_mm: Decimal = Decimal("0")
     use_stock: bool = False
+
+    @validator("kerf_mm")
+    def _kerf_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("سُمك القطع (kerf) لا يمكن أن يكون سالباً")
+        return v
 
 
 @router.post("/bar-cutting-plan")
@@ -1019,6 +1551,31 @@ class CommitWasteItem(BaseModel):
     qty: int = 1
     action: str  # "remnant" | "scrap"
 
+    @validator("kind")
+    def _valid_kind(cls, v):
+        if v not in ("sheet", "bar"):
+            raise ValueError("kind يجب أن يكون 'sheet' أو 'bar'")
+        return v
+
+    @validator("action")
+    def _valid_action(cls, v):
+        # قيمة غير معروفة كانت بتتجاهل بصمت (لا نسالة ولا هالك)
+        if v not in ("remnant", "scrap"):
+            raise ValueError("action يجب أن يكون 'remnant' أو 'scrap'")
+        return v
+
+    @validator("length_cm", "width_cm")
+    def _dims_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("الأبعاد لا يمكن أن تكون سالبة")
+        return v
+
+    @validator("qty")
+    def _qty_positive(cls, v):
+        if v is None or v < 1:
+            raise ValueError("العدد يجب أن يكون 1 على الأقل")
+        return v
+
 
 class CuttingPlanCommitRequest(BaseModel):
     material_id: int
@@ -1039,6 +1596,9 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
     from app.services.production import record_scrap
     from app.services.inventory_ledger import post_issue, _next_movement_no
     tid = _ctid_cc.get() or 1
+
+    if data.work_order_id is not None and not await db.get(WorkOrder, data.work_order_id):
+        raise HTTPException(404, "أمر الإنتاج المحدد غير موجود")
 
     res = None
     if data.reservation_id:
@@ -1082,11 +1642,23 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
         total_issued_cost += cost
 
     # 2) تصفير عناصر مخزون الألواح/الأسياخ (نسالة أو قياسي) المُستهلكة بالكامل
-    for item_id in data.used_stock_item_ids:
-        item = await db.get(SheetStockItem, item_id)
-        is_sheet = item is not None
-        if item is None:
-            item = await db.get(BarStockItem, item_id)
+    # - dedupe: نفس الـ id مكرر في الطلب كان بيتحسب مرتين في total_issued_qty
+    #   (db.get بيرجّع نفس الكائن المعلَّم للحذف قبل الـ flush).
+    # - لازم العنصر يكون تابع لنفس المادة — قبل كده أي id (حتى لو لوح مادة
+    #   تانية) كان بيتمسح ويتحسب على المادة دي.
+    # - SheetStockItem وBarStockItem جدولين منفصلين وممكن يتكرر نفس الـ id في
+    #   الاتنين؛ نبدأ بالجدول المناسب لنوع المادة (سيخ ← أسياخ، غير كده ← ألواح).
+    _bar_first = (mat.material_kind == "bar")
+    _order = (BarStockItem, SheetStockItem) if _bar_first else (SheetStockItem, BarStockItem)
+    for item_id in dict.fromkeys(data.used_stock_item_ids):
+        item = None
+        is_sheet = False
+        for _model in _order:
+            _cand = await db.get(_model, item_id)
+            if _cand is not None and _cand.material_id == mat.id:
+                item = _cand
+                is_sheet = (_model is SheetStockItem)
+                break
         if item:
             if is_sheet:
                 item_qty = (item.length_cm * item.width_cm / Decimal("10000")) * item.qty
@@ -1108,14 +1680,19 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
         # عمد ميتمّش خصم Material.stock_qty هنا تاني لتفادي الخصم المزدوج
         # (زي ما التعليق الأصلي بيوضّح). لكن لازم برضه ياخد movement_no
         # تسلسلي زي كل حركة تانية في النظام (كان بيتسجّل NULL قبل كده).
-        db.add(StockMovement(
-            tenant_id=tid, material_id=mat.id, movement_type="out",
-            qty=issued_now, unit_cost=mat.unit_cost, total_cost=cost_now,
-            reference=f"{wo.code}-CUT" if wo else "مخطط تقطيع", notes="استهلاك نسالة عبر مخطط التقطيع",
-            movement_date=date.today(), work_order_id=res.work_order_id,
-            movement_no=await _next_movement_no(db, tid),
-            source_doc_type="cutting_plan_reservation", source_doc_id=res.id,
-        ))
+        # لو الخصم الفعلي اتسجل بالفعل كحركة "out" في الخطوة 1 (post_issue)،
+        # حركة تسجيلية تانية بنوع "out" كانت بتظهر في كشف حركة المادة كصرف
+        # مكرر (صرف 90 + صرف 60 بينما الرصيد نزل 90 بس). نسجّلها بس لما
+        # الاستهلاك كان كله من عناصر نسالة (الخطوة 2) من غير حركة أساسية.
+        if not result["main_stock_deducted"]:
+            db.add(StockMovement(
+                tenant_id=tid, material_id=mat.id, movement_type="out",
+                qty=issued_now, unit_cost=mat.unit_cost, total_cost=cost_now,
+                reference=f"{wo.code}-CUT" if wo else "مخطط تقطيع", notes="استهلاك نسالة عبر مخطط التقطيع",
+                movement_date=date.today(), work_order_id=res.work_order_id,
+                movement_no=await _next_movement_no(db, tid),
+                source_doc_type="cutting_plan_reservation", source_doc_id=res.id,
+            ))
         db.add(CostLine(
             tenant_id=tid, work_order_id=res.work_order_id, cost_type="material",
             description=f"{mat.name_ar} — تقطيع", qty=issued_now,
@@ -1125,6 +1702,13 @@ async def commit_cutting_plan(data: CuttingPlanCommitRequest, db: AsyncSession =
         res.status = "fully_issued" if res.issued_qty >= res.required_qty else "partially_issued"
         if wo:
             wo.actual_cost += cost_now
+            # نفس اللي بيعمله issue_material: قيمة "تحت التصنيع" في موقع WIP +
+            # قيد WIP مدين / مخزون خام دائن. من غيرهم حساب WIP بيطلع دائن
+            # بقيمة المواد دي عند إقفال الأمر، ومخزون الخامات بيفضل متضخّم.
+            from app.services.production import _sync_wip_quant
+            from app.services.auto_journal import journal_material_issue
+            await _sync_wip_quant(db, wo, tid)
+            await journal_material_issue(db, tid, wo.id, wo.code, cost_now, date.today())
         result["reservation_status"] = res.status
         result["issued_qty"] = float(issued_now)
 
@@ -1183,6 +1767,24 @@ class SheetStockItemIn(BaseModel):
     source: str = "purchased"  # purchased | remnant
     notes: Optional[str] = None
 
+    @validator("length_cm", "width_cm")
+    def _dims_positive(cls, v):
+        if v is None or v <= 0:
+            raise ValueError("الأبعاد يجب أن تكون أكبر من صفر")
+        return v
+
+    @validator("qty")
+    def _qty_positive(cls, v):
+        if v is None or v < 1:
+            raise ValueError("العدد يجب أن يكون 1 على الأقل")
+        return v
+
+    @validator("source")
+    def _valid_source(cls, v):
+        if v not in ("purchased", "remnant"):
+            raise ValueError("المصدر يجب أن يكون 'purchased' أو 'remnant'")
+        return v
+
 
 @router.get("/sheet-stock")
 async def list_sheet_stock(material_id: Optional[int] = None, db: AsyncSession = Depends(get_db)):
@@ -1235,6 +1837,24 @@ class BarStockItemIn(BaseModel):
     qty: int = 1
     source: str = "purchased"  # purchased | remnant
     notes: Optional[str] = None
+
+    @validator("length_cm")
+    def _len_positive(cls, v):
+        if v is None or v <= 0:
+            raise ValueError("الطول يجب أن يكون أكبر من صفر")
+        return v
+
+    @validator("qty")
+    def _qty_positive(cls, v):
+        if v is None or v < 1:
+            raise ValueError("العدد يجب أن يكون 1 على الأقل")
+        return v
+
+    @validator("source")
+    def _valid_source(cls, v):
+        if v not in ("purchased", "remnant"):
+            raise ValueError("المصدر يجب أن يكون 'purchased' أو 'remnant'")
+        return v
 
 
 @router.get("/bar-stock")

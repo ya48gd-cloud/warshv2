@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, Field
 
 from app.core.database import get_db
 from app.api.auth import require_any, require_admin_production
@@ -28,7 +28,7 @@ class ScheduleIn(BaseModel):
     customer_order_id: Optional[int] = None
     scheduled_start: date
     scheduled_end: date
-    priority: int = 5
+    priority: int = Field(5, ge=1, le=10)
     notes: Optional[str] = None
 
     @validator("scheduled_end")
@@ -43,9 +43,15 @@ class ScheduleUpdateIn(BaseModel):
     scheduled_end: Optional[date] = None
     actual_start: Optional[date] = None
     actual_end: Optional[date] = None
-    priority: Optional[int] = None
+    priority: Optional[int] = Field(None, ge=1, le=10)
     status: Optional[str] = None
     notes: Optional[str] = None
+
+    @validator("status")
+    def _status_valid(cls, v):
+        if v is not None and v not in SCHEDULE_STATUSES:
+            raise ValueError(f"حالة الجدولة غير صالحة — المسموح: {', '.join(SCHEDULE_STATUSES)}")
+        return v
 
 
 class QCIn(BaseModel):
@@ -54,13 +60,31 @@ class QCIn(BaseModel):
     inspection_date: date
     inspector_id: Optional[int] = None
     inspection_type: str = "final"   # incoming | in_process | final | outgoing
-    qty_inspected: Decimal
-    qty_passed: Decimal
-    qty_failed: Decimal = Decimal("0")
-    qty_rework: Decimal = Decimal("0")
+    qty_inspected: Decimal = Field(..., gt=0)
+    qty_passed: Decimal = Field(..., ge=0)
+    qty_failed: Decimal = Field(Decimal("0"), ge=0)
+    qty_rework: Decimal = Field(Decimal("0"), ge=0)
     failure_reason: Optional[str] = None
     corrective_action: Optional[str] = None
     notes: Optional[str] = None
+
+    @validator("inspection_type")
+    def _type_valid(cls, v):
+        if v not in QC_TYPES:
+            raise ValueError(f"نوع الفحص غير صالح — المسموح: {', '.join(QC_TYPES)}")
+        return v
+
+    @validator("qty_rework")
+    def totals_match_all(cls, rework, values):
+        # validator("qty_passed") بيتنفذ قبل ما qty_failed/qty_rework يتقروا
+        # (ترتيب الحقول)، فكان بيقارن passed لوحده بالمفحوص — الفحص الكامل هنا
+        inspected = values.get("qty_inspected")
+        passed = values.get("qty_passed")
+        failed = values.get("qty_failed")
+        if inspected is not None and passed is not None and failed is not None:
+            if passed + failed + rework > inspected + Decimal("0.001"):
+                raise ValueError("مجموع القبول+الرفض+الإعادة لا يجب أن يتجاوز الكمية المفحوصة")
+        return rework
 
     @validator("qty_passed")
     def totals_match(cls, passed, values):
@@ -72,10 +96,14 @@ class QCIn(BaseModel):
         return passed
 
 
+SCHEDULE_STATUSES = ("planned", "in_progress", "completed", "delayed", "cancelled")
+QC_TYPES = ("incoming", "in_process", "final", "outgoing")
+
+
 class LinkOrderIn(BaseModel):
     customer_order_id: int
     work_order_id: int
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(None, max_length=300)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -143,6 +171,12 @@ async def create_schedule(data: ScheduleIn, db: AsyncSession = Depends(get_db)):
     wo = await db.get(WorkOrder, data.work_order_id)
     if not wo:
         raise HTTPException(404, "أمر الإنتاج غير موجود")
+    if wo.status == "cancelled":
+        raise HTTPException(400, "أمر الإنتاج ملغي — لا يمكن جدولته")
+    if data.customer_order_id is not None:
+        # طلب البيع لازم يكون تابع لنفس الورشة (db.get بيمر بفلتر الـtenant)
+        if not await db.get(CustomerOrder, data.customer_order_id):
+            raise HTTPException(404, "طلب البيع غير موجود")
 
     # التحقق من عدم التداخل — نفس أمر الإنتاج لا يُجدوَل مرتين في نفس الفترة
     existing = await db.scalar(
@@ -181,7 +215,16 @@ async def update_schedule(sched_id: int, data: ScheduleUpdateIn, db: AsyncSessio
     sched = await db.get(ProductionSchedule, sched_id)
     if not sched:
         raise HTTPException(404)
-    for k, v in data.model_dump(exclude_none=True).items():
+    _upd = data.model_dump(exclude_none=True)
+    _new_start = _upd.get("scheduled_start", sched.scheduled_start)
+    _new_end = _upd.get("scheduled_end", sched.scheduled_end)
+    if _new_start and _new_end and _new_end < _new_start:
+        raise HTTPException(400, "تاريخ الانتهاء يجب أن يكون بعد تاريخ البدء")
+    _new_as = _upd.get("actual_start", sched.actual_start)
+    _new_ae = _upd.get("actual_end", sched.actual_end)
+    if _new_as and _new_ae and _new_ae < _new_as:
+        raise HTTPException(400, "تاريخ الانتهاء الفعلي يجب أن يكون بعد تاريخ البدء الفعلي")
+    for k, v in _upd.items():
         setattr(sched, k, v)
     await db.commit()
     res = await db.execute(
@@ -197,6 +240,11 @@ async def start_schedule(sched_id: int, db: AsyncSession = Depends(get_db)):
     sched = await db.get(ProductionSchedule, sched_id)
     if not sched:
         raise HTTPException(404)
+    if sched.status not in ("planned", "delayed"):
+        raise HTTPException(400, f"لا يمكن بدء جدولة بحالة '{sched.status}'")
+    _wo_chk = await db.get(WorkOrder, sched.work_order_id)
+    if _wo_chk and _wo_chk.status == "cancelled":
+        raise HTTPException(400, "أمر الإنتاج المرتبط ملغي — لا يمكن بدء الجدولة")
     sched.status = "in_progress"
     sched.actual_start = date.today()
     # تحديث حالة أمر الإنتاج تلقائياً
@@ -212,7 +260,11 @@ async def complete_schedule(sched_id: int, db: AsyncSession = Depends(get_db)):
     sched = await db.get(ProductionSchedule, sched_id)
     if not sched:
         raise HTTPException(404)
+    if sched.status in ("completed", "cancelled"):
+        raise HTTPException(400, f"لا يمكن إنهاء جدولة بحالة '{sched.status}'")
     sched.status = "completed"
+    if not sched.actual_start:
+        sched.actual_start = date.today()
     sched.actual_end = date.today()
     await db.commit()
     return {"id": sched_id, "status": "completed", "actual_end": str(date.today())}
@@ -274,6 +326,16 @@ def qc_dict(q: QualityInspection) -> dict:
     }
 
 
+async def _validate_qc_refs(db: AsyncSession, data: "QCIn") -> None:
+    """كل المراجع (أمر إنتاج/مادة/مفتش) لازم تكون موجودة وتابعة لنفس الورشة."""
+    if data.work_order_id is not None and not await db.get(WorkOrder, data.work_order_id):
+        raise HTTPException(404, "أمر الإنتاج غير موجود")
+    if data.material_id is not None and not await db.get(Material, data.material_id):
+        raise HTTPException(404, "المادة غير موجودة")
+    if data.inspector_id is not None and not await db.get(Worker, data.inspector_id):
+        raise HTTPException(404, "المفتش (العامل) غير موجود")
+
+
 @router.get("/quality")
 async def list_inspections(
     work_order_id: Optional[int] = None,
@@ -296,6 +358,8 @@ async def list_inspections(
 async def create_inspection(data: QCIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
+
+    await _validate_qc_refs(db, data)
 
     # تحديد النتيجة تلقائياً
     if data.qty_failed == 0 and data.qty_rework == 0:
@@ -333,7 +397,14 @@ async def create_inspection(data: QCIn, db: AsyncSession = Depends(get_db)):
         _parent_wo = await db.get(_WO, insp.work_order_id)
         if _parent_wo:
             _count = await db.scalar(select(_func.count()).select_from(_WO))
-            _rw_code = f"WO-RW-{(_count or 0) + 1:04d}"
+            _rw_n = (_count or 0) + 1
+            # كود أمر الإنتاج فريد لكل ورشة (uq_workorder_tenant_code) — العد
+            # وحده كان بيتصادم مع كود موجود بعد أي حذف (IntegrityError 500)
+            while True:
+                _rw_code = f"WO-RW-{_rw_n:04d}"
+                if not await db.scalar(select(_WO.id).where(_WO.tenant_id == tid, _WO.code == _rw_code)):
+                    break
+                _rw_n += 1
             _rw = _WO(
                 tenant_id=tid,
                 code=_rw_code,
@@ -367,6 +438,7 @@ async def update_inspection(insp_id: int, data: QCIn, db: AsyncSession = Depends
     insp = await db.get(QualityInspection, insp_id)
     if not insp:
         raise HTTPException(404)
+    await _validate_qc_refs(db, data)
     for k, v in data.model_dump(exclude_none=True).items():
         setattr(insp, k, v)
     # إعادة حساب النتيجة
@@ -450,6 +522,10 @@ async def link_sales_to_production(data: LinkOrderIn, db: AsyncSession = Depends
 @router.get("/link-order/{customer_order_id}")
 async def get_linked_work_orders(customer_order_id: int, db: AsyncSession = Depends(get_db)):
     """جلب كل أوامر الإنتاج المرتبطة بطلب بيع"""
+    # SalesOrderWorkOrder مالوش عمود tenant_id (فالفلتر التلقائي مش بيغطيه) —
+    # لازم نتأكد إن طلب البيع نفسه تابع للورشة الحالية قبل عرض أي روابط
+    if not await db.get(CustomerOrder, customer_order_id):
+        raise HTTPException(404, "طلب البيع غير موجود")
     res = await db.execute(
         select(SalesOrderWorkOrder)
         .options(selectinload(SalesOrderWorkOrder.work_order))
@@ -469,6 +545,11 @@ async def get_linked_work_orders(customer_order_id: int, db: AsyncSession = Depe
 async def unlink_order(link_id: int, db: AsyncSession = Depends(get_db)):
     link = await db.get(SalesOrderWorkOrder, link_id)
     if not link:
+        raise HTTPException(404)
+    # SalesOrderWorkOrder بلا tenant_id — التحقق من ملكية الورشة عبر أمر الإنتاج
+    # وطلب البيع (الاتنين بيمروا بفلتر الـtenant التلقائي)، وإلا أي مستخدم
+    # كان يقدر يمسح روابط ورشة تانية بمجرد تخمين الـid
+    if not await db.get(WorkOrder, link.work_order_id) or not await db.get(CustomerOrder, link.customer_order_id):
         raise HTTPException(404)
     await db.delete(link)
     await db.commit()

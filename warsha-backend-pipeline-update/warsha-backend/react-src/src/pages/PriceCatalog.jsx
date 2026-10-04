@@ -93,7 +93,11 @@ export default function PriceCatalog() {
           price_mode: updated.price_mode,
         })
       }
-    } catch (e) { toast(e.message || 'تعذّر حفظ التعديل — حاول تاني', 'error') }
+    } catch (e) {
+      // رجّع الصف لقيمته الأصلية بدل ما يفضل معروض بسعر ما اتحفظش
+      setAllRows(prev => prev.map(r => (r.kind === row.kind && r.ref_id === row.ref_id) ? row : r))
+      toast(e.message || 'تعذّر حفظ التعديل — حاول تاني', 'error')
+    }
   }
 
   const [eqChildrenMap, setEqChildrenMap] = useState({}) // { [equipmentId]: rows[] | 'loading' }
@@ -168,8 +172,9 @@ export default function PriceCatalog() {
   useEffect(() => { load() }, [load])
 
   /* ── form helpers ── */
-  const openNew  = ()   => { setEditing(null); setForm(EMPTY); setErr(''); setShowForm(true) }
-  const openEdit = (it) => { setEditing(it); setForm({ ...it, cost_price: String(it.cost_price), margin_pct: String(it.margin_pct) }); setErr(''); setShowForm(true) }
+  const [newCatMode, setNewCatMode] = useState(false)
+  const openNew  = ()   => { setEditing(null); setForm(EMPTY); setErr(''); setNewCatMode(false); setShowForm(true) }
+  const openEdit = (it) => { setEditing(it); setForm({ ...it, cost_price: String(it.cost_price), margin_pct: String(it.margin_pct), selling_price: it.selling_price != null ? String(it.selling_price) : '', code: it.code || '', category: it.category || '', description: it.description || '' }); setErr(''); setNewCatMode(false); setShowForm(true) }
   const closeForm= ()   => { setShowForm(false); setEditing(null) }
 
   const save = async () => {
@@ -177,6 +182,11 @@ export default function PriceCatalog() {
     const isManual = form.price_mode === 'manual'
     if (!isManual && (form.cost_price === '' || isNaN(Number(form.cost_price)))) { setErr('سعر التكلفة مطلوب'); return }
     if (isManual && (form.selling_price === '' || isNaN(Number(form.selling_price)))) { setErr('سعر البيع مطلوب في الوضع اليدوي'); return }
+    if (form.cost_price !== '' && Number(form.cost_price) < 0) { setErr('سعر التكلفة لا يمكن أن يكون سالباً'); return }
+    if (isManual && Number(form.selling_price) < 0) { setErr('سعر البيع لا يمكن أن يكون سالباً'); return }
+    if (!isManual && calcSelling(form.cost_price || 0, form.margin_pct || 0) < 0) { setErr('سعر البيع الناتج لا يمكن أن يكون سالباً — راجع نسبة الهامش'); return }
+    if (form.category === '__new__') { setErr('اكتب اسم الفئة الجديدة أو اختر فئة'); return }
+    if (saving) return
     setSaving(true); setErr('')
     try {
       const body = {
@@ -186,9 +196,15 @@ export default function PriceCatalog() {
         selling_price: isManual ? Number(form.selling_price) : null,
         price_mode: form.price_mode || 'auto',
       }
+      // openEdit بيحوّل null → '' عشان الـ inputs تفضل controlled؛ نرجّعها null هنا لو كانت null أصلاً
+      if (editing) for (const k of ['code', 'category', 'description']) {
+        if (body[k] === '' && editing[k] == null) body[k] = null
+      }
       if (editing) await catalogApi.update(editing.id, body)
       else         await catalogApi.create(body)
+      toast(editing ? 'تم حفظ التعديلات' : 'تمت الإضافة للكتالوج')
       closeForm(); load()
+      if (viewMode === 'all') loadAllItems()
     } catch (e) { setErr(e.message || 'خطأ') }
     finally { setSaving(false) }
   }
@@ -199,6 +215,9 @@ export default function PriceCatalog() {
     const { id, field, value } = inlineEdit
     const item = items.find(i => i.id === id)
     if (!item) return
+    const n = Number(value)
+    if (value === '' || isNaN(n)) { setInlineEdit(null); return }   // فاضي = إلغاء التعديل مش صفر
+    if (field === 'cost_price' && n < 0) { toast('سعر التكلفة لا يمكن أن يكون سالباً', 'error'); setInlineEdit(null); return }
     const patch = field === 'cost_price'
       ? { cost_price: Number(value) }
       : { margin_pct: Number(value) }
@@ -212,7 +231,12 @@ export default function PriceCatalog() {
   }
 
   const toggleActive = async (item) => {
-    await catalogApi.update(item.id, { ...item, is_active: !item.is_active, cost_price: Number(item.cost_price), margin_pct: Number(item.margin_pct) })
+    try {
+      await catalogApi.update(item.id, { ...item, is_active: !item.is_active, cost_price: Number(item.cost_price), margin_pct: Number(item.margin_pct) })
+      toast(item.is_active ? 'تم إيقاف الصنف' : 'تم تفعيل الصنف')
+    } catch (e) {
+      toast(e.message || 'تعذّر تغيير الحالة', 'error')
+    }
     load()
   }
 
@@ -443,15 +467,26 @@ export default function PriceCatalog() {
                 <input value={form.code} onChange={e => setForm(f => ({ ...f, code: e.target.value }))} style={inputStyle} placeholder="اختياري" />
               </Field>
               <Field label="الفئة">
-                <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))} style={inputStyle}>
+                {/* إصلاح: خانة "فئة جديدة" كانت بتختفي بعد أول حرف (لأن category بيتغير من __new__
+                    للنص المكتوب فالشرط بيبقى false). دلوقتي وضع "فئة جديدة" متخزّن في newCatMode. */}
+                <select value={newCatMode ? '__new__' : (form.category || '')}
+                  onChange={e => {
+                    if (e.target.value === '__new__') { setNewCatMode(true); setForm(f => ({ ...f, category: '' })) }
+                    else { setNewCatMode(false); setForm(f => ({ ...f, category: e.target.value })) }
+                  }} style={inputStyle}>
                   <option value="">اختر فئة</option>
                   {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                  {form.category && !newCatMode && !categories.includes(form.category) && (
+                    <option value={form.category}>{form.category}</option>
+                  )}
                   <option value="__new__">+ فئة جديدة</option>
                 </select>
-                {form.category === '__new__' && (
+                {newCatMode && (
                   <input
+                    autoFocus
                     style={{ ...inputStyle, marginTop: 6 }}
                     placeholder="اكتب اسم الفئة الجديدة"
+                    value={form.category || ''}
                     onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
                   />
                 )}
@@ -610,18 +645,33 @@ function UnifiedTable({ rows, onSave, onSaveDescription, eqChildrenMap, onToggle
                 </td>
                 <td style={{ ...tdStyle, color: 'var(--text-secondary)' }}>{r.unit}</td>
                 <td style={tdStyle}>
-                  <input type="number" defaultValue={r.cost_price}
-                    onBlur={e => { const v = Number(e.target.value); if (v !== r.cost_price) onSave(r, { cost_price: v }) }}
+                  <input type="number" min="0" key={`cp-${r.cost_price}`} defaultValue={r.cost_price}
+                    onBlur={e => {
+                      // فاضي/سالب/مش رقم = نرجّع القيمة الأصلية بدل ما نحفظ صفر أو قيمة مرفوضة
+                      const v = Number(e.target.value)
+                      if (e.target.value === '' || isNaN(v) || v < 0) { e.target.value = r.cost_price ?? ''; return }
+                      if (v !== Number(r.cost_price)) onSave(r, { cost_price: v })
+                    }}
                     style={{ ...inputStyle, width: 90, padding: '4px 8px' }} />
                 </td>
                 <td style={tdStyle}>
-                  <input type="number" defaultValue={r.margin_pct} disabled={r.price_mode === 'manual'}
-                    onBlur={e => { const v = Number(e.target.value); if (v !== r.margin_pct) onSave(r, { margin_pct: v }) }}
+                  <input type="number" key={`mp-${r.margin_pct}`} defaultValue={r.margin_pct} disabled={r.price_mode === 'manual'}
+                    onBlur={e => {
+                      const v = Number(e.target.value)
+                      if (e.target.value === '' || isNaN(v) || Number(r.cost_price || 0) * (1 + v / 100) < 0) { e.target.value = r.margin_pct ?? ''; return }
+                      if (v !== Number(r.margin_pct)) onSave(r, { margin_pct: v })
+                    }}
                     style={{ ...inputStyle, width: 70, padding: '4px 8px', opacity: r.price_mode === 'manual' ? 0.5 : 1 }} />
                 </td>
                 <td style={tdStyle}>
-                  <input type="number" defaultValue={r.selling_price}
-                    onBlur={e => { const v = Number(e.target.value); if (v !== r.selling_price) onSave(r, { selling_price: v, price_mode: 'manual' }) }}
+                  {/* key مربوط بالقيمة: لما سعر البيع يتحسب من جديد (تغيير التكلفة/الهامش) الخانة تتحدّث
+                      بدل ما تفضل عارضة القيمة القديمة (defaultValue مش بيتحدّث لوحده) */}
+                  <input type="number" min="0" key={`sp-${r.selling_price}`} defaultValue={r.selling_price}
+                    onBlur={e => {
+                      const v = Number(e.target.value)
+                      if (e.target.value === '' || isNaN(v) || v < 0) { e.target.value = r.selling_price ?? ''; return }
+                      if (v !== Number(r.selling_price)) onSave(r, { selling_price: v, price_mode: 'manual' })
+                    }}
                     style={{ ...inputStyle, width: 100, padding: '4px 8px', border: '1px solid #FF8A00', fontWeight: 700, color: '#FF8A00' }} />
                 </td>
                 <td style={{ ...tdStyle, minWidth: 220 }}>

@@ -13,13 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, block_viewer_writes
 from app.models.models import (
     FieldServiceOrder, ServiceAssignment, ServiceVisit,
     CustomerAsset, Customer, Worker, AssetMovement,
 )
 
-router = APIRouter(prefix="/field-service", tags=["field-service"], dependencies=[Depends(require_any)])
+router = APIRouter(prefix="/field-service", tags=["field-service"], dependencies=[Depends(require_any), Depends(block_viewer_writes)])
 
 
 # ── Schemas ────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ class AssetMovementIn(BaseModel):
     notes: Optional[str] = None
 
 
-_VALID_FS_STATUSES = {"pending", "in_progress", "completed", "cancelled", "on_hold"}
+_VALID_FS_STATUSES = {"pending", "assigned", "in_progress", "completed", "cancelled", "on_hold"}
 
 class StatusUpdate(BaseModel):
     status: str
@@ -89,6 +89,56 @@ class StatusUpdate(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────
+
+def _tid() -> int:
+    from app.core.database import current_tenant_id as _ctid
+    return _ctid.get() or 1
+
+
+async def _tenant_order(db: AsyncSession, oid: int) -> FieldServiceOrder:
+    """أمر خدمة مقيّد بالـ tenant الحالي — 404 لو مش موجود أو تابع لـ tenant تاني."""
+    o = await db.get(FieldServiceOrder, oid)
+    if not o or o.tenant_id != _tid():
+        raise HTTPException(404, "أمر الخدمة غير موجود")
+    return o
+
+
+async def _validate_customer(db: AsyncSession, customer_id: int):
+    c = await db.get(Customer, customer_id)
+    if not c or c.tenant_id != _tid():
+        raise HTTPException(404, "العميل غير موجود")
+
+
+async def _validate_location(db: AsyncSession, location_id: Optional[int], customer_id: Optional[int] = None):
+    if not location_id:
+        return
+    from app.models.models import CustomerLocation
+    loc = await db.get(CustomerLocation, location_id)
+    if not loc or loc.tenant_id != _tid():
+        raise HTTPException(404, "الموقع غير موجود")
+    if customer_id and getattr(loc, "customer_id", None) and loc.customer_id != customer_id:
+        raise HTTPException(400, "الموقع لا يخص هذا العميل")
+
+
+async def _validate_order_payload(db: AsyncSession, data: "ServiceOrderIn"):
+    if not (data.code or "").strip():
+        raise HTTPException(400, "كود أمر الخدمة مطلوب")
+    if not (data.title or "").strip():
+        raise HTTPException(400, "عنوان أمر الخدمة مطلوب")
+    if data.order_type not in ORDER_TYPE_AR:
+        raise HTTPException(400, f"نوع أمر غير صالح. القيم المسموحة: {sorted(ORDER_TYPE_AR)}")
+    if data.priority not in PRIORITY_AR:
+        raise HTTPException(400, f"أولوية غير صالحة. القيم المسموحة: {sorted(PRIORITY_AR)}")
+    if data.estimated_hours is not None and data.estimated_hours < 0:
+        raise HTTPException(400, "الساعات التقديرية لا يمكن أن تكون سالبة")
+    await _validate_customer(db, data.customer_id)
+    await _validate_location(db, data.location_id, data.customer_id)
+    if data.asset_id:
+        a = await db.get(CustomerAsset, data.asset_id)
+        if not a or a.tenant_id != _tid():
+            raise HTTPException(404, "المعدة غير موجودة")
+        if a.customer_id != data.customer_id:
+            raise HTTPException(400, "المعدة لا تخص هذا العميل")
 
 ORDER_TYPE_AR = {
     "installation":  "تركيب",
@@ -222,6 +272,11 @@ async def list_assets(
 @router.post("/assets", status_code=201)
 async def create_asset(data: AssetIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_ca
+    if not (data.name or "").strip():
+        raise HTTPException(400, "اسم المعدة مطلوب")
+    if data.delivery_date and data.warranty_end and data.warranty_end < data.delivery_date:
+        raise HTTPException(400, "نهاية الضمان يجب أن تكون بعد تاريخ التسليم")
+    await _validate_customer(db, data.customer_id)
     _ca_data = data.model_dump()
     _ca_data['tenant_id'] = _ctid_ca.get() or 1
     a = CustomerAsset(**_ca_data)
@@ -302,6 +357,7 @@ async def add_asset_movement(aid: int, data: AssetMovementIn, db: AsyncSession =
     from app.core.database import current_tenant_id as _ctid_aam
     a = await db.get(CustomerAsset, aid)
     if not a or a.tenant_id != (_ctid_aam.get() or 1): raise HTTPException(404)
+    await _validate_location(db, data.to_location_id)
     from_location_id = a.current_location_id
     m = AssetMovement(
         tenant_id=a.tenant_id, asset_id=a.id, event_type=data.event_type,
@@ -323,6 +379,12 @@ async def update_asset(aid: int, data: AssetIn, db: AsyncSession = Depends(get_d
     from app.core.database import current_tenant_id as _ctid_ua
     a = await db.get(CustomerAsset, aid)
     if not a or a.tenant_id != (_ctid_ua.get() or 1): raise HTTPException(404)
+    if not (data.name or "").strip():
+        raise HTTPException(400, "اسم المعدة مطلوب")
+    if data.delivery_date and data.warranty_end and data.warranty_end < data.delivery_date:
+        raise HTTPException(400, "نهاية الضمان يجب أن تكون بعد تاريخ التسليم")
+    if data.customer_id != a.customer_id:
+        await _validate_customer(db, data.customer_id)
     for k, v in data.model_dump().items():
         setattr(a, k, v)
     await db.commit()
@@ -334,6 +396,15 @@ async def delete_asset(aid: int, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_dela
     a = await db.get(CustomerAsset, aid)
     if not a or a.tenant_id != (_ctid_dela.get() or 1): raise HTTPException(404)
+    # المعدة مرتبطة بأوامر خدمة/مشاريع خارجية — حذفها كان بيسيب FK يتيم
+    # (أو يفشل بـ IntegrityError على Postgres ويرجع 500).
+    so_cnt = await db.scalar(select(func.count(FieldServiceOrder.id)).where(FieldServiceOrder.asset_id == aid))
+    if so_cnt:
+        raise HTTPException(409, f"لا يمكن حذف المعدة — مرتبطة بعدد {so_cnt} أمر خدمة")
+    from app.models.models import ExtProject
+    ep_cnt = await db.scalar(select(func.count(ExtProject.id)).where(ExtProject.asset_id == aid))
+    if ep_cnt:
+        raise HTTPException(409, f"لا يمكن حذف المعدة — مرتبطة بعدد {ep_cnt} مشروع خارجي")
     await db.delete(a)
     await db.commit()
     return {"message": "تم الحذف", "id": aid}
@@ -375,6 +446,13 @@ async def list_service_orders(
 @router.post("/orders", status_code=201)
 async def create_service_order(data: ServiceOrderIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_fso
+    await _validate_order_payload(db, data)
+    # الكود فريد لكل tenant (uq_fieldserviceorder_tenant_code) — التكرار كان
+    # بيوصل لـ IntegrityError → 500.
+    if await db.scalar(select(FieldServiceOrder.id).where(
+        FieldServiceOrder.code == data.code, FieldServiceOrder.tenant_id == _tid(),
+    )):
+        raise HTTPException(409, f"كود أمر الخدمة {data.code} مستخدم من قبل")
     _fso_data = data.model_dump(exclude={"estimated_hours"})
     _fso_data['tenant_id'] = _ctid_fso.get() or 1
     o = FieldServiceOrder(**_fso_data)
@@ -408,6 +486,12 @@ async def update_service_order(oid: int, data: ServiceOrderIn, db: AsyncSession 
     from app.core.database import current_tenant_id as _ctid_uso
     o = await db.get(FieldServiceOrder, oid)
     if not o or o.tenant_id != (_ctid_uso.get() or 1): raise HTTPException(404)
+    await _validate_order_payload(db, data)
+    if data.code != o.code and await db.scalar(select(FieldServiceOrder.id).where(
+        FieldServiceOrder.code == data.code, FieldServiceOrder.tenant_id == _tid(),
+        FieldServiceOrder.id != oid,
+    )):
+        raise HTTPException(409, f"كود أمر الخدمة {data.code} مستخدم من قبل")
     for k, v in data.model_dump(exclude={"estimated_hours"}).items():
         if hasattr(o, k):
             setattr(o, k, v)
@@ -453,6 +537,12 @@ async def delete_service_order(oid: int, db: AsyncSession = Depends(get_db)):
     if not o or o.tenant_id != (_ctid_dso.get() or 1): raise HTTPException(404)
     if o.status not in ("pending", "cancelled"):
         raise HTTPException(400, "لا يمكن حذف أمر جاري — قم بإلغائه أولاً")
+    # سجلات العمالة وعهد العدة مش cascade على الأمر — حذفه كان بيسيبها يتيمة
+    # (وعهدة لسه مسحوبة من المخزون مش هترجع أبداً).
+    labor_cnt = await db.scalar(select(func.count(ProjectLaborEntry.id)).where(ProjectLaborEntry.service_order_id == oid))
+    tools_cnt = await db.scalar(select(func.count(ProjectToolWithdrawal.id)).where(ProjectToolWithdrawal.service_order_id == oid))
+    if labor_cnt or tools_cnt:
+        raise HTTPException(409, "لا يمكن حذف أمر له سجلات عمالة أو عهد عدة — احذفها أولاً")
     await db.delete(o)
     await db.commit()
     return {"message": "تم الحذف", "id": oid}
@@ -494,8 +584,9 @@ async def assign_workers(oid: int, data: AssignIn, db: AsyncSession = Depends(ge
 
 @router.delete("/orders/{oid}/assign/{assignment_id}")
 async def remove_assignment(oid: int, assignment_id: int, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     a = await db.get(ServiceAssignment, assignment_id)
-    if not a or a.service_order_id != oid: raise HTTPException(404)
+    if not a or a.service_order_id != oid or a.tenant_id != _tid(): raise HTTPException(404)
     await db.delete(a)
     await db.commit()
     return {"message": "تم إلغاء التعيين"}
@@ -509,6 +600,8 @@ async def record_visit(oid: int, data: VisitIn, db: AsyncSession = Depends(get_d
     tid_sv = _ctid_sv.get() or 1
     o = await db.get(FieldServiceOrder, oid)
     if not o or o.tenant_id != tid_sv: raise HTTPException(404)
+    if data.labor_hours is not None and data.labor_hours < 0:
+        raise HTTPException(400, "ساعات العمل لا يمكن أن تكون سالبة")
 
     visit = ServiceVisit(
         tenant_id=tid_sv,
@@ -543,6 +636,7 @@ async def record_visit(oid: int, data: VisitIn, db: AsyncSession = Depends(get_d
 
 @router.get("/orders/{oid}/visits")
 async def list_visits(oid: int, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     res = await db.execute(
         select(ServiceVisit)
         .where(ServiceVisit.service_order_id == oid)
@@ -707,12 +801,12 @@ class ToolWithdrawalIn(BaseModel):
     material_id:    int
     worker_id:      Optional[int] = None
     qty:            float = 1
-    withdrawn_date: date
+    withdrawn_date: Optional[date] = None   # null → اليوم
     notes:          Optional[str] = None
 
 
 class ToolReturnIn(BaseModel):
-    returned_date: date
+    returned_date: Optional[date] = None    # null → اليوم
     returned_qty:  float
     damaged_qty:   float = 0
     notes:         Optional[str] = None
@@ -721,6 +815,7 @@ class ToolReturnIn(BaseModel):
 # ── GET labor entries for an order ────────────────────────────
 @router.get("/orders/{oid}/labor")
 async def list_labor(oid: int, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     res = await db.execute(
         select(ProjectLaborEntry)
         .options(selectinload(ProjectLaborEntry.worker))
@@ -756,6 +851,8 @@ async def add_labor(oid: int, data: LaborEntryIn, db: AsyncSession = Depends(get
         raise HTTPException(400, "عدد الأيام يجب أن يكون أكبر من صفر")
     if data.daily_wage is not None and data.daily_wage < 0:
         raise HTTPException(400, "الأجر اليومي لا يمكن أن يكون سالباً")
+    if (data.allowance or 0) < 0 or (data.advance or 0) < 0:
+        raise HTTPException(400, "البدل والسلفة لا يمكن أن يكونا بالسالب")
 
     total = Decimal(str(data.days)) * Decimal(str(data.daily_wage)) + Decimal(str(data.allowance))
     entry = ProjectLaborEntry(
@@ -789,8 +886,9 @@ async def add_labor(oid: int, data: LaborEntryIn, db: AsyncSession = Depends(get
 # ── DELETE labor entry ─────────────────────────────────────────
 @router.delete("/orders/{oid}/labor/{entry_id}")
 async def delete_labor(oid: int, entry_id: int, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     e = await db.get(ProjectLaborEntry, entry_id)
-    if not e or e.service_order_id != oid: raise HTTPException(404)
+    if not e or e.service_order_id != oid or e.tenant_id != _tid(): raise HTTPException(404)
     o = await db.get(FieldServiceOrder, oid)
     if o:
         o.labor_cost = max(Decimal("0"), (o.labor_cost or Decimal("0")) - e.total_pay)
@@ -807,6 +905,7 @@ async def delete_labor(oid: int, entry_id: int, db: AsyncSession = Depends(get_d
 # ── GET withdrawals for an order ──────────────────────────────
 @router.get("/orders/{oid}/tools")
 async def list_tools(oid: int, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     res = await db.execute(
         select(ProjectToolWithdrawal)
         .options(
@@ -820,7 +919,8 @@ async def list_tools(oid: int, db: AsyncSession = Depends(get_db)):
     return [{
         "id":             r.id,
         "material_id":    r.material_id,
-        "material_name":  r.material.name if r.material else "",
+        # موديل Material مفيهوش حقل name (name_ar/name_en بس) — .name كان بيرمي AttributeError → 500
+        "material_name":  (r.material.name_ar or r.material.name_en or r.material.code) if r.material else "",
         "material_unit":  r.material.unit if r.material else "",
         "worker_id":      r.worker_id,
         "worker_name":    r.worker.name if r.worker else "",
@@ -845,6 +945,10 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
     if not mat or mat.tenant_id != tid_ptw: raise HTTPException(404, "المادة غير موجودة")
     if data.qty is None or data.qty <= 0:
         raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
+    if data.worker_id:
+        _w = await db.get(Worker, data.worker_id)
+        if not _w or _w.tenant_id != tid_ptw:
+            raise HTTPException(404, "العامل غير موجود")
 
     row = ProjectToolWithdrawal(
         tenant_id=tid_ptw,
@@ -852,7 +956,7 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
         material_id=data.material_id,
         worker_id=data.worker_id,
         qty=Decimal(str(data.qty)),
-        withdrawn_date=data.withdrawn_date,
+        withdrawn_date=data.withdrawn_date or date.today(),
         status="withdrawn",
         notes=data.notes,
     )
@@ -866,7 +970,7 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
     from app.services.inventory_ledger import post_issue
     await post_issue(
         db, material=mat, qty=row.qty, unit_cost=mat.unit_cost or Decimal("0"),
-        movement_date=data.withdrawn_date,
+        movement_date=data.withdrawn_date or date.today(),
         source_doc_type="field_service_tool", source_doc_id=row.id,
         reference=f"FS-TOOL-{row.id}", notes=f"سحب عهدة عدة — أمر خدمة #{oid}",
     )
@@ -879,8 +983,9 @@ async def withdraw_tool(oid: int, data: ToolWithdrawalIn, db: AsyncSession = Dep
 # ── PATCH return tool ──────────────────────────────────────────
 @router.patch("/orders/{oid}/tools/{wid}/return")
 async def return_tool(oid: int, wid: int, data: ToolReturnIn, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     row = await db.get(ProjectToolWithdrawal, wid)
-    if not row or row.service_order_id != oid: raise HTTPException(404)
+    if not row or row.service_order_id != oid or row.tenant_id != _tid(): raise HTTPException(404)
     if row.status != "withdrawn":
         # كانت الدالة بتسمح بإعادة النداء عليها أكتر من مرة فتكتب فوق
         # returned_qty/damaged_qty القديمة، وده كان هيسبب قيد مخزون مزدوج
@@ -895,7 +1000,7 @@ async def return_tool(oid: int, wid: int, data: ToolReturnIn, db: AsyncSession =
     if returned_qty + damaged_qty > row.qty:
         raise HTTPException(400, f"إجمالي المرتجع والتالف ({returned_qty + damaged_qty}) أكبر من الكمية المسحوبة ({row.qty})")
 
-    row.returned_date = data.returned_date
+    row.returned_date = data.returned_date or date.today()
     row.returned_qty  = returned_qty
     row.damaged_qty   = damaged_qty
     row.status = "damaged" if damaged_qty > 0 else "returned"
@@ -924,8 +1029,9 @@ async def return_tool(oid: int, wid: int, data: ToolReturnIn, db: AsyncSession =
 # ── DELETE withdrawal ──────────────────────────────────────────
 @router.delete("/orders/{oid}/tools/{wid}")
 async def delete_withdrawal(oid: int, wid: int, db: AsyncSession = Depends(get_db)):
+    await _tenant_order(db, oid)
     row = await db.get(ProjectToolWithdrawal, wid)
-    if not row or row.service_order_id != oid: raise HTTPException(404)
+    if not row or row.service_order_id != oid or row.tenant_id != _tid(): raise HTTPException(404)
     if row.status != "withdrawn":
         raise HTTPException(400, "لا يمكن حذف عهدة مرتجعة أو تالفة")
 

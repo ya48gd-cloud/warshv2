@@ -17,11 +17,11 @@ export default function ProductionHub() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex gap-1 border-b border-erp-border pb-0">
+      <div className="flex gap-1 border-b border-erp-border pb-0 overflow-x-auto">
         {TABS.map(tab => (
           <button
             key={tab.key}
-            className="px-4 py-2 text-sm font-medium transition-colors"
+            className="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap"
             style={activeTab === tab.key
               ? { color: 'var(--teal)', borderBottom: '2px solid var(--teal)' }
               : { color: 'var(--erp-muted)', borderBottom: '2px solid transparent' }}

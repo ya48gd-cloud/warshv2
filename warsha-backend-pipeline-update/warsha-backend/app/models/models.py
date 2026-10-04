@@ -954,6 +954,8 @@ class StockCount(Base):
     id:         Mapped[int]           = mapped_column(primary_key=True)
     tenant_id:     Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
     count_date: Mapped[date]          = mapped_column(Date)
+    # المخزن اللي بيتجرد — NULL = جرد قديم على كل المخازن (قبل الجرد لكل مخزن)
+    warehouse_id: Mapped[Optional[int]] = mapped_column(ForeignKey("warehouses.id"), nullable=True, index=True)
     status:     Mapped[str]           = mapped_column(String(20), default="in_progress")
     notes:      Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime]      = mapped_column(DateTime, server_default=func.now())
@@ -1554,9 +1556,10 @@ class ExtProjectPayment(Base):
 class PurchaseOrder(Base):
     """أمر شراء — يسبق فاتورة الشراء ويتتبع الاستلام"""
     __tablename__ = "purchase_orders"
+    __table_args__ = (UniqueConstraint("tenant_id", "code", name="uq_purchaseorder_tenant_code"),)
     id:            Mapped[int]            = mapped_column(primary_key=True)
     tenant_id:     Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
-    code:          Mapped[str]            = mapped_column(String(50), unique=True, index=True)
+    code:          Mapped[str]            = mapped_column(String(50), index=True)
     supplier_id:   Mapped[Optional[int]]  = mapped_column(ForeignKey("suppliers.id"), nullable=True)
     supplier_name: Mapped[Optional[str]]  = mapped_column(String(200))
     order_date:    Mapped[date]           = mapped_column(Date)
@@ -1927,9 +1930,10 @@ class TreasuryTransaction(Base):
 class SupplyContract(Base):
     """أمر التوريد — يُنشأ من عرض سعر أو مستقلاً"""
     __tablename__ = "supply_contracts"
+    __table_args__ = (UniqueConstraint("tenant_id", "code", name="uq_supplycontract_tenant_code"),)
     id:             Mapped[int]            = mapped_column(primary_key=True)
     tenant_id:      Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
-    code:           Mapped[str]            = mapped_column(String(50), unique=True)
+    code:           Mapped[str]            = mapped_column(String(50))
     quotation_id:   Mapped[Optional[int]]  = mapped_column(ForeignKey("quotations.id"), nullable=True)
     customer_id:    Mapped[int]            = mapped_column(ForeignKey("customers.id"))
     date:           Mapped[date]           = mapped_column(Date)
@@ -1992,9 +1996,10 @@ class SupplyContractLine(Base):
 class CreditNote(Base):
     """إشعار دائن — مرتجع مبيعات كلي أو جزئي"""
     __tablename__ = "credit_notes"
+    __table_args__ = (UniqueConstraint("tenant_id", "code", name="uq_creditnote_tenant_code"),)
     id:           Mapped[int]            = mapped_column(primary_key=True)
     tenant_id:    Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
-    code:         Mapped[str]            = mapped_column(String(50), unique=True)
+    code:         Mapped[str]            = mapped_column(String(50))
     invoice_id:   Mapped[Optional[int]]  = mapped_column(ForeignKey("invoices.id"), nullable=True)
     customer_id:  Mapped[int]            = mapped_column(ForeignKey("customers.id"))
     date:         Mapped[date]           = mapped_column(Date)
@@ -2041,9 +2046,10 @@ class CreditNoteLine(Base):
 class WorkCompletionCert(Base):
     """شهادة إتمام أعمال — Work Completion Certificate"""
     __tablename__ = "work_completion_certs"
+    __table_args__ = (UniqueConstraint("tenant_id", "code", name="uq_workcompletioncert_tenant_code"),)
     id:            Mapped[int]            = mapped_column(primary_key=True)
     tenant_id:     Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
-    code:          Mapped[str]            = mapped_column(String(50), unique=True)
+    code:          Mapped[str]            = mapped_column(String(50))
     customer_id:   Mapped[int]            = mapped_column(ForeignKey("customers.id"))
     invoice_id:    Mapped[Optional[int]]  = mapped_column(ForeignKey("invoices.id"), nullable=True)
     contract_id:   Mapped[Optional[int]]  = mapped_column(ForeignKey("supply_contracts.id"), nullable=True)
@@ -2086,9 +2092,10 @@ class WorkCompletionItem(Base):
 class WarrantyCertificate(Base):
     """شهادة ضمان — Warranty Certificate"""
     __tablename__ = "warranty_certificates"
+    __table_args__ = (UniqueConstraint("tenant_id", "code", name="uq_warrantycert_tenant_code"),)
     id:             Mapped[int]            = mapped_column(primary_key=True)
     tenant_id:      Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
-    code:           Mapped[str]            = mapped_column(String(50), unique=True)
+    code:           Mapped[str]            = mapped_column(String(50))
     customer_id:    Mapped[int]            = mapped_column(ForeignKey("customers.id"))
     invoice_id:     Mapped[Optional[int]]  = mapped_column(ForeignKey("invoices.id"), nullable=True)
     wcc_id:         Mapped[Optional[int]]  = mapped_column(ForeignKey("work_completion_certs.id"), nullable=True)

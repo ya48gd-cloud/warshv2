@@ -11,10 +11,11 @@ export default function Login() {
 
   const submit = async (e) => {
     e.preventDefault()
-    if (!form.username || !form.password) return toast('أدخل اسم المستخدم وكلمة المرور', 'error')
+    if (loading) return
+    if (!form.username?.trim() || !form.password) return toast('أدخل اسم المستخدم وكلمة المرور', 'error')
     setLoading(true)
     try {
-      await login(form.username, form.password, form.tenant_slug)
+      await login(form.username.trim(), form.password, form.tenant_slug?.trim() || null)
     } catch (err) {
       toast(err.message || 'فشل تسجيل الدخول', 'error')
     } finally {

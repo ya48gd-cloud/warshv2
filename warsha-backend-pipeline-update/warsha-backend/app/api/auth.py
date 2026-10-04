@@ -13,9 +13,10 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from app.services.analytics import log_event, Events
@@ -150,6 +151,39 @@ def verify_password(plain: str, stored: str) -> bool:
     return hmac.compare_digest(hashlib.sha256(plain.encode()).hexdigest(), stored)
 
 
+# ── Live account checks ───────────────────────────────────────
+# SECURITY (fixed): الـ JWT كان بيفضل صالح 12 ساعة حتى لو:
+#   - الأدمن عطّل المستخدم (is_active=False)
+#   - Super Admin عطّل الورشة كلها (toggle)
+#   - الأدمن نزّل دور المستخدم (مثلاً admin → viewer) — التوكن القديم كان
+#     بيحتفظ بصلاحيات admin ويقدر يرجّع نفسه admin تاني.
+# دلوقتي كل طلب موثّق بيتأكد من حالة الورشة والمستخدم الفعلية في الداتابيز،
+# وبيعتمد الدور الحالي المخزّن بدل الدور المختوم في التوكن.
+async def _enforce_live_account(db: AsyncSession, token_data: dict) -> dict:
+    try:
+        tid = int(token_data.get("tenant_id"))
+        uid = int(token_data.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="الجلسة غير صالحة — يرجى إعادة تسجيل الدخول")
+
+    tenant = await db.get(Tenant, tid)
+    if tenant is not None and tenant.is_active is False:
+        raise HTTPException(status_code=403, detail="هذه الورشة معطّلة")
+
+    res = await db.execute(
+        select(User).where(User.id == uid, User.tenant_id == tid)
+    )
+    user = res.scalar_one_or_none()
+    # نطابق اسم المستخدم كمان: الـ id لوحده ممكن يتعاد استخدامه بعد الحذف
+    # (SQLite بدون AUTOINCREMENT) فيتطبّق على صف مش بتاع صاحب التوكن.
+    if user is not None and user.username == token_data.get("username"):
+        if not user.is_active:
+            raise HTTPException(status_code=401, detail="الحساب معطل — تواصل مع مدير النظام")
+        if user.role and user.role != token_data.get("role"):
+            token_data = {**token_data, "role": user.role}
+    return token_data
+
+
 # ── Dependency: get current user (token → dict) ───────────────
 
 async def get_current_user(
@@ -161,7 +195,7 @@ async def get_current_user(
     token_data = verify_token(credentials.credentials)
     if not token_data:
         raise HTTPException(status_code=401, detail="الجلسة منتهية — يرجى إعادة تسجيل الدخول")
-    return token_data
+    return await _enforce_live_account(db, token_data)
 
 
 async def get_current_user_optional(
@@ -191,6 +225,7 @@ def require_role(*roles: str):
         token_data = verify_token(credentials.credentials)
         if not token_data:
             raise HTTPException(status_code=401, detail="الجلسة منتهية — يرجى إعادة تسجيل الدخول")
+        token_data = await _enforce_live_account(db, token_data)
         if token_data.get("role") not in roles:
             raise HTTPException(
                 status_code=403,
@@ -205,6 +240,17 @@ require_admin             = require_role("admin")
 require_admin_accountant  = require_role("admin", "accountant")
 require_admin_production  = require_role("admin", "production")
 require_any               = require_role("admin", "accountant", "production", "viewer")
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """Dependency مشتركة على مستوى الراوتر: "مشاهد" (viewer) قراءة فقط.
+    ROLE_WRITE['viewer'] = [] في الواجهة، لكن راوترات كتير كانت require_any بس
+    فالمشاهد يقدر ينشئ/يعدّل/يحذف بطلب API مباشر. (الدور هنا هو الدور الحي من الداتابيز)."""
+    if request.method.upper() not in _SAFE_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
 
 
 # ── Schemas ───────────────────────────────────────────────────
@@ -228,6 +274,34 @@ class ChangePasswordIn(BaseModel):
     new_password: str
 
 
+def validate_new_workshop(workshop_name: str, slug: str, admin_username: str,
+                          admin_password: str, admin_full_name: Optional[str] = None) -> None:
+    """تحقّق مشترك لإنشاء ورشة جديدة (signup-internal + Super Admin).
+    الحدود مطابقة لأطوال الأعمدة (Tenant.name=200, Tenant.slug=50,
+    User.username=50, User.full_name=200) — بدونها Postgres بيرمي 500."""
+    if not (workshop_name or "").strip():
+        raise HTTPException(400, "اسم الورشة مطلوب")
+    if len(workshop_name.strip()) > 200:
+        raise HTTPException(400, "اسم الورشة طويل جداً (200 حرف كحد أقصى)")
+    if not slug or not slug.replace("-", "").replace("_", "").isalnum():
+        raise HTTPException(400, "معرّف الورشة (slug) يحتوي على أحرف غير مسموحة")
+    if not slug.isascii():
+        raise HTTPException(400, "معرّف الورشة (slug) يجب أن يكون بأحرف إنجليزية وأرقام فقط")
+    if len(slug) > 50:
+        raise HTTPException(400, "معرّف الورشة طويل جداً (50 حرف كحد أقصى)")
+    uname = (admin_username or "").strip()
+    if not uname:
+        raise HTTPException(400, "اسم المستخدم مطلوب")
+    if len(uname) > 50:
+        raise HTTPException(400, "اسم المستخدم طويل جداً (50 حرف كحد أقصى)")
+    if len(admin_password or "") < 6:
+        raise HTTPException(400, "كلمة المرور قصيرة جداً (6 أحرف على الأقل)")
+    if len(admin_password) > 128:
+        raise HTTPException(400, "كلمة المرور طويلة جداً (128 حرف كحد أقصى)")
+    if admin_full_name and len(admin_full_name) > 200:
+        raise HTTPException(400, "الاسم الكامل طويل جداً (200 حرف كحد أقصى)")
+
+
 # ── Endpoints ─────────────────────────────────────────────────
 
 @router.post("/signup", status_code=201)
@@ -241,10 +315,8 @@ async def signup(data: SignupIn, db: AsyncSession = Depends(get_db)):
     عملية public — لا تحتاج توثيق. صالحة فقط لتسجيل ورشة جديدة.
     """
     slug = data.workshop_slug.strip().lower()
-    if not slug or not slug.replace("-", "").replace("_", "").isalnum():
-        raise HTTPException(400, "معرّف الورشة (slug) يحتوي على أحرف غير مسموحة")
-    if len(data.admin_password) < 6:
-        raise HTTPException(400, "كلمة المرور قصيرة جداً (6 أحرف على الأقل)")
+    validate_new_workshop(data.workshop_name, slug, data.admin_username,
+                          data.admin_password, data.admin_full_name)
 
     # تحقّق من تفرّد الـ slug
     existing = await db.execute(select(Tenant).where(Tenant.slug == slug))
@@ -267,7 +339,7 @@ async def signup(data: SignupIn, db: AsyncSession = Depends(get_db)):
         tenant_id=tenant.id,
         username=data.admin_username.strip(),
         password_hash=hash_password(data.admin_password),
-        full_name=data.admin_full_name or data.admin_username,
+        full_name=(data.admin_full_name or "").strip() or data.admin_username.strip(),
         role="admin",
         is_active=True,
     )
@@ -282,7 +354,12 @@ async def signup(data: SignupIn, db: AsyncSession = Depends(get_db)):
     from app.api.warehouses import seed_default_warehouses
     await seed_default_warehouses(db, tenant.id)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # سباق: طلبين بنفس الـ slug في نفس اللحظة → القيد الفريد يرفض الثاني
+        await db.rollback()
+        raise HTTPException(409, "هذا المُعرّف مستخدم بالفعل — اختر معرّفاً آخر")
     await db.refresh(user)
 
     token = create_token(user.id, user.username, user.role, user.tenant_id)
@@ -305,8 +382,48 @@ async def signup(data: SignupIn, db: AsyncSession = Depends(get_db)):
     }
 
 
+# SECURITY (fixed): مفيش أي حد لمحاولات الدخول الفاشلة → brute-force مفتوح على
+# كلمات المرور. دلوقتي: 10 محاولات فاشلة خلال 15 دقيقة لنفس (IP + ورشة + مستخدم)
+# بتقفل المحاولات مؤقتاً (429). الذاكرة محلية للعملية (كافية للنسخة الـ desktop/الفردية).
+_LOGIN_MAX_FAILS = 10
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_login_failures: dict = {}  # key -> [timestamps]
+
+
+def _login_key(request: Optional[Request], username: str, slug: Optional[str]) -> str:
+    ip = ""
+    try:
+        ip = request.client.host if request is not None and request.client else ""
+    except Exception:
+        ip = ""
+    return f"{ip}|{(slug or '').strip().lower()}|{(username or '').strip().lower()}"
+
+
+def _login_recent_failures(key: str) -> list:
+    import time as _time
+    now = _time.time()
+    fails = [t for t in _login_failures.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    if fails:
+        _login_failures[key] = fails
+    else:
+        _login_failures.pop(key, None)
+    return fails
+
+
+def _login_register_failure(key: str) -> None:
+    import time as _time
+    _login_failures.setdefault(key, []).append(_time.time())
+    # حماية الذاكرة من التضخم
+    if len(_login_failures) > 10000:
+        for k in list(_login_failures.keys())[:5000]:
+            _login_failures.pop(k, None)
+
+
 @router.post("/login")
-async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
+async def login(data: LoginIn, request: Request, db: AsyncSession = Depends(get_db)):
+    _key = _login_key(request, data.username, data.tenant_slug)
+    if len(_login_recent_failures(_key)) >= _LOGIN_MAX_FAILS:
+        raise HTTPException(status_code=429, detail="محاولات دخول فاشلة كثيرة — حاول مرة أخرى بعد 15 دقيقة")
     # signup مفتوح، فاللوجن لازم يكون بدون قيد RLS — نستخدم استعلام صريح بـ tenant
     # لو slug موجود، نقيّد البحث به؛ لو لا، نسمح بـ login لأول ورشة فيها هذا الاسم (للأنظمة أحادية الورشة)
     if data.tenant_slug:
@@ -336,13 +453,20 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
             None,
         )
     if not user or not verify_password(data.password, user.password_hash):
+        _login_register_failure(_key)
         raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="الحساب معطل")
+    # SECURITY (fixed): الدخول بدون tenant_slug كان بيتخطى فحص "الورشة معطّلة"
+    _user_tenant = await db.get(Tenant, user.tenant_id)
+    if _user_tenant is not None and _user_tenant.is_active is False:
+        raise HTTPException(status_code=403, detail="هذه الورشة معطّلة")
+    _login_failures.pop(_key, None)
+    user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
     # ترقية تلقائية للهاش القديم (SHA-256 بدون salt) إلى PBKDF2
     if not user.password_hash.startswith("pbkdf2$"):
         user.password_hash = hash_password(data.password)
-        await db.commit()
+    await db.commit()
     token = create_token(user.id, user.username, user.role, user.tenant_id)
     await log_event(Events.USER_LOGIN, tenant_id=user.tenant_id, user_id=user.id,
                      entity_type="user", entity_id=user.id, source_path="/api/v1/auth/login")
@@ -400,6 +524,8 @@ async def change_password(
         raise HTTPException(400, "كلمة المرور القديمة غير صحيحة")
     if len(data.new_password) < 6:
         raise HTTPException(400, "كلمة المرور الجديدة قصيرة جداً (6 أحرف على الأقل)")
+    if len(data.new_password) > 128:
+        raise HTTPException(400, "كلمة المرور الجديدة طويلة جداً (128 حرف كحد أقصى)")
     user.password_hash = hash_password(data.new_password)
     await db.commit()
     return {"message": "تم تغيير كلمة المرور بنجاح"}

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, block_viewer_writes
 from app.models.models import (
     WorkCompletionCert, WorkCompletionItem, Customer, Invoice, SupplyContract,
 )
@@ -21,7 +21,7 @@ from app.models.models import (
 router = APIRouter(
     prefix="/work-completion-certs",
     tags=["work_completion_certs"],
-    dependencies=[Depends(require_any)],
+    dependencies=[Depends(require_any), Depends(block_viewer_writes)],
 )
 print_router = APIRouter(prefix="/work-completion-certs", tags=["wcc_print"], dependencies=[Depends(require_any)])
 
@@ -59,10 +59,25 @@ async def _next_code(db: AsyncSession) -> str:
     n = (count or 0) + 1
     while True:
         code = f"WCC-{n:04d}"
-        exists = await db.scalar(select(WorkCompletionCert.id).where(WorkCompletionCert.code == code))
+        # code عليه UNIQUE على مستوى الجدول كله (مش لكل ورشة) والفلتر التلقائي
+        # كان بيحصر الفحص في الورشة الحالية → ورشة تانية تولّد كود مستخدم وتقع في 500.
+        exists = await db.scalar(
+            select(WorkCompletionCert.id).where(WorkCompletionCert.code == code)
+            .execution_options(skip_tenant_filter=True)
+        )
         if not exists:
             return code
         n += 1
+
+
+def _tid():
+    from app.core.database import current_tenant_id as _ctid
+    return _ctid.get()
+
+
+def _same_tenant(obj) -> bool:
+    tid = _tid()
+    return obj is not None and (tid is None or getattr(obj, "tenant_id", None) == tid)
 
 
 def _wcc_dict(w: WorkCompletionCert) -> dict:
@@ -118,6 +133,8 @@ async def list_certs(
         selectinload(WorkCompletionCert.contract),
         selectinload(WorkCompletionCert.items),
     ).order_by(WorkCompletionCert.date.desc())
+    if _tid() is not None:
+        q = q.where(WorkCompletionCert.tenant_id == _tid())
     if status:
         q = q.where(WorkCompletionCert.status == status)
     if customer_id:
@@ -139,7 +156,7 @@ async def get_cert(wcc_id: int, db: AsyncSession = Depends(get_db)):
         .where(WorkCompletionCert.id == wcc_id)
     )
     w = res.scalar_one_or_none()
-    if not w:
+    if not _same_tenant(w):
         raise HTTPException(404)
     return _wcc_dict(w)
 
@@ -150,19 +167,33 @@ async def create_cert(data: WCCIn, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, "تاريخ انتهاء العمل يجب أن يكون بعد تاريخ بدايته")
     if data.warranty_months is not None and data.warranty_months < 0:
         raise HTTPException(400, "مدة الضمان لا يمكن أن تكون سالبة")
+    if data.contract_value is not None and data.contract_value < 0:
+        raise HTTPException(400, "قيمة العقد لا يمكن أن تكون سالبة")
+    if not (data.project_name or "").strip():
+        raise HTTPException(400, "اسم المشروع مطلوب")
     for it in data.items:
+        if not (it.description or "").strip():
+            raise HTTPException(400, "وصف البند مطلوب")
         if it.qty is None or it.qty <= 0:
             raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
         if it.unit_price is not None and it.unit_price < 0:
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
     # إصلاح ثغرة تحقق: مرجع عميل/فاتورة/عقد غير موجودة (أو تابعة لـ tenant
     # تاني) كان يُقبل بصمت.
-    if not await db.get(Customer, data.customer_id):
+    if not _same_tenant(await db.get(Customer, data.customer_id)):
         raise HTTPException(404, "العميل غير موجود")
-    if data.invoice_id is not None and not await db.get(Invoice, data.invoice_id):
-        raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
-    if data.contract_id is not None and not await db.get(SupplyContract, data.contract_id):
-        raise HTTPException(404, "العقد المرجعي غير موجود")
+    if data.invoice_id is not None:
+        _inv = await db.get(Invoice, data.invoice_id)
+        if not _same_tenant(_inv):
+            raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
+        if _inv.customer_id != data.customer_id:
+            raise HTTPException(400, "الفاتورة المرجعية تخص عميلاً آخر")
+    if data.contract_id is not None:
+        _sc = await db.get(SupplyContract, data.contract_id)
+        if not _same_tenant(_sc):
+            raise HTTPException(404, "العقد المرجعي غير موجود")
+        if _sc.customer_id != data.customer_id:
+            raise HTTPException(400, "العقد المرجعي يخص عميلاً آخر")
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
     code = await _next_code(db)
@@ -223,8 +254,10 @@ async def cert_from_contract(contract_id: int, db: AsyncSession = Depends(get_db
         .where(SupplyContract.id == contract_id)
     )
     sc = res.scalar_one_or_none()
-    if not sc:
+    if not _same_tenant(sc):
         raise HTTPException(404, "العقد غير موجود")
+    if sc.status == "cancelled":
+        raise HTTPException(400, "لا يمكن إصدار شهادة إتمام لعقد ملغي")
 
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
@@ -275,7 +308,7 @@ async def cert_from_contract(contract_id: int, db: AsyncSession = Depends(get_db
 @router.patch("/{wcc_id}/issue")
 async def issue_cert(wcc_id: int, db: AsyncSession = Depends(get_db)):
     w = await db.get(WorkCompletionCert, wcc_id)
-    if not w:
+    if not _same_tenant(w):
         raise HTTPException(404)
     if w.status != "draft":
         raise HTTPException(400, "يمكن إصدار المسودات فقط")
@@ -288,10 +321,15 @@ async def issue_cert(wcc_id: int, db: AsyncSession = Depends(get_db)):
 @router.delete("/{wcc_id}", status_code=204)
 async def delete_cert(wcc_id: int, db: AsyncSession = Depends(get_db)):
     w = await db.get(WorkCompletionCert, wcc_id)
-    if not w:
+    if not _same_tenant(w):
         raise HTTPException(404)
     if w.status == "issued":
         raise HTTPException(400, "لا يمكن حذف شهادة صادرة")
+    # شهادات ضمان مرتبطة بالشهادة دي (wcc_id FK) كانت هتفضل يتيمة
+    from app.models.models import WarrantyCertificate
+    wr_cnt = await db.scalar(select(func.count(WarrantyCertificate.id)).where(WarrantyCertificate.wcc_id == wcc_id))
+    if wr_cnt:
+        raise HTTPException(409, f"لا يمكن حذف الشهادة — مرتبطة بعدد {wr_cnt} شهادة ضمان")
     items = (await db.execute(
         select(WorkCompletionItem).where(WorkCompletionItem.cert_id == wcc_id)
     )).scalars().all()
@@ -323,7 +361,7 @@ async def _company(db: AsyncSession) -> dict:
         return {"name": "ورشة معدات الاعلاف", "sub": "", "phone": "",
                 "address": "", "footer": "شكرا لتعاملكم معنا", "logo_html": "", "legal_html": ""}
     logo_html = (
-        f'<img src="{prof.logo_data}" alt="logo" '
+        f'<img src="{_esc(prof.logo_data)}" alt="logo" '
         'style="max-height:75px;max-width:160px;object-fit:contain;display:block;"/>'
         if prof.logo_data else ""
     )
@@ -354,7 +392,7 @@ def _wcc_html(w: WorkCompletionCert, company: dict) -> str:
     cphone   = _esc(company.get("phone", ""))
     caddr    = _esc(company.get("address", ""))
     cfooter  = _esc(company.get("footer", ""))
-    legal_h  = company.get("legal_html", "")
+    legal_h  = _esc(company.get("legal_html", ""))
     logo_html = company.get("logo_html", "")
 
     cust_name  = _esc(w.customer.name  if w.customer else "—")
@@ -592,7 +630,7 @@ async def print_cert(wcc_id: int, db: AsyncSession = Depends(get_db)):
         .where(WorkCompletionCert.id == wcc_id)
     )
     w = res.scalar_one_or_none()
-    if not w:
+    if not _same_tenant(w):
         raise HTTPException(404)
     company = await _company(db)
     return _wcc_html(w, company)

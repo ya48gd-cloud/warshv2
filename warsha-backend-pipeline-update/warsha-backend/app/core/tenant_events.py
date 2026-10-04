@@ -40,11 +40,15 @@ _TENANT_ENTITIES = None
 
 @event.listens_for(Session, "do_orm_execute")
 def _apply_tenant_filter(execute_state):
-    # SELECT فقط — لا نلمس التحديث/الحذف الجماعي
-    if not execute_state.is_select:
+    # SELECT + UPDATE/DELETE الجماعي (update(Model)/delete(Model)).
+    # إصلاح ثغرة عزل: الفلتر كان على SELECT بس، فأي UPDATE/DELETE جماعي شرطه
+    # مش فيه tenant_id (مثلاً delete(X).where(X.invoice_id == iid) أو scheduler
+    # الأقساط من طلب ورشة) كان بيعدّل/يمسح صفوف ورش تانية. with_loader_criteria
+    # بيشتغل على UPDATE/DELETE في SQLAlchemy 2.0 فنطبّق نفس الشرط.
+    if not (execute_state.is_select or execute_state.is_update or execute_state.is_delete):
         return
     # تجاهل إعادة تحميل عمود لكائن محمّل بالفعل
-    if execute_state.is_column_load:
+    if execute_state.is_select and execute_state.is_column_load:
         return
     # السماح بتخطّي الفلتر صراحةً (تقارير عابرة للمستأجرين / مهام إدارية)
     if execute_state.execution_options.get("skip_tenant_filter", False):

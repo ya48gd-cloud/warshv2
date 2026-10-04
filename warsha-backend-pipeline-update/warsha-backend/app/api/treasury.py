@@ -7,15 +7,15 @@
 - ربط تلقائي بمدفوعات العملاء والموردين
 """
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, Field, validator
 
 from app.core.database import get_db
 from app.api.auth import require_any
@@ -23,7 +23,42 @@ from app.models.models import (
     Treasury, TreasuryCategory, TreasuryTransaction,
 )
 
-router = APIRouter(prefix="/treasury", tags=["treasury"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+_WRITE_ROLES = {"admin", "accountant"}
+
+
+async def _block_non_finance_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: كل مسارات الخزنة كانت محمية بـ require_any بس —
+    يعني مستخدم "مشاهد" أو "إنتاج" يقدر يسجّل/يعدّل/يحذف حركات نقدية وتحويلات
+    (بقيود محاسبية حقيقية) بطلب API مباشر رغم إن الواجهة مخبية الأزرار
+    (canWrite('accounting') = admin/accountant فقط). القراءة متاحة للكل زي ما هي."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") not in _WRITE_ROLES:
+        raise HTTPException(403, f"صلاحية '{user.get('role')}' لا تسمح بتعديل الخزنة")
+    return user
+
+
+# أقصى مبلغ يتسع له عمود Numeric(14, 2)
+_MAX_AMOUNT = Decimal("999999999999.99")
+
+
+def _money(v, field: str = "المبلغ", allow_zero: bool = False) -> Decimal:
+    """تحويل مبلغ لـ Decimal مقرَّب لقرشين — وإلا (مثلاً 10.005) الرصيد يتحدّث
+    بالقيمة غير المقرّبة بينما العمود Numeric(14,2) يخزّن المقرّبة فيختلفا."""
+    try:
+        d = Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
+        raise HTTPException(400, f"{field} غير صالح")
+    if not d.is_finite():
+        raise HTTPException(400, f"{field} غير صالح")
+    if d < 0 or (d == 0 and not allow_zero):
+        raise HTTPException(400, "المبلغ لازم يكون أكبر من صفر" if not allow_zero else f"{field} لا يمكن أن يكون سالباً")
+    if d > _MAX_AMOUNT:
+        raise HTTPException(400, f"{field} أكبر من الحد المسموح")
+    return d
+
+
+router = APIRouter(prefix="/treasury", tags=["treasury"],
+                   dependencies=[Depends(require_any), Depends(_block_non_finance_writes)])
 print_router = APIRouter(prefix="/treasury", tags=["treasury_print"], dependencies=[Depends(require_any)])
 
 
@@ -31,11 +66,14 @@ print_router = APIRouter(prefix="/treasury", tags=["treasury_print"], dependenci
 # Schemas
 # ════════════════════════════════════════════════════
 class TreasuryIn(BaseModel):
-    name: str
+    name: str = Field(..., max_length=100)
     kind: str = "cash"            # cash | bank
     opening_balance: Decimal = Decimal("0")
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(None, max_length=2000)
     coa_account_id: Optional[int] = None
+    # اختياري (للتعديل فقط): تعطيل/تفعيل الخزنة — رسالة الحذف بتقول "عطّلها بدل
+    # الحذف" لكن ماكانش فيه أي طريقة للتعطيل. None = بدون تغيير.
+    is_active: Optional[bool] = None
 
     @validator("kind")
     def _valid_kind(cls, v):
@@ -47,7 +85,7 @@ class TreasuryIn(BaseModel):
 
 
 class CategoryIn(BaseModel):
-    name: str
+    name: str = Field(..., max_length=100)
     flow: str = "both"           # in | out | both
     coa_account_id: Optional[int] = None
 
@@ -64,12 +102,12 @@ class TxnIn(BaseModel):
     amount: Decimal
     category_id: Optional[int] = None
     txn_date: Optional[date] = None
-    description: Optional[str] = None
-    reference: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=2000)
+    reference: Optional[str] = Field(None, max_length=100)
     payment_method: Optional[str] = "cash"   # cash | cheque | wallet | other
-    cheque_number: Optional[str] = None
+    cheque_number: Optional[str] = Field(None, max_length=50)
     cheque_date: Optional[date] = None       # تاريخ استحقاق الشيك
-    cheque_bank: Optional[str] = None
+    cheque_bank: Optional[str] = Field(None, max_length=100)
 
 
 class ChequeStatusIn(BaseModel):
@@ -81,7 +119,7 @@ class TransferIn(BaseModel):
     to_treasury_id: int
     amount: Decimal
     txn_date: Optional[date] = None
-    description: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=2000)
 
 
 # ════════════════════════════════════════════════════
@@ -125,11 +163,72 @@ def _txn(x: TreasuryTransaction, cat_name=None, treasury_name=None) -> dict:
 
 
 async def _next_receipt_no(db: AsyncSession, direction: str) -> str:
+    """رقم السند التالي لكل (نوع/سنة) داخل الـ tenant.
+    إصلاح: كان count(*) لكل الحركات — بعد حذف أي حركة الرقم يتكرر (سندين بنفس
+    الرقم)، وكمان كان بيعدّ حركات التحويل والدفعات التلقائية وحركات الـ tenants
+    التانية لو الفلتر التلقائي مش شغال. دلوقتي: أكبر رقم مستخدم + 1."""
+    from app.core.database import current_tenant_id as _ctid_rn
+    tid = _ctid_rn.get() or 1
     year = date.today().year
-    count = await db.scalar(select(func.count()).select_from(TreasuryTransaction))
-    n = (count or 0) + 1
     prefix = "RC" if direction == "in" else "PY"
-    return f"{prefix}-{year}-{n:04d}"
+    stem = f"{prefix}-{year}-"
+    existing = (await db.execute(
+        select(TreasuryTransaction.receipt_no).where(
+            TreasuryTransaction.tenant_id == tid,
+            TreasuryTransaction.receipt_no.like(f"{stem}%"),
+        )
+    )).scalars().all()
+    mx = 0
+    for rn in existing:
+        try:
+            mx = max(mx, int(str(rn)[len(stem):]))
+        except (TypeError, ValueError):
+            continue
+    return f"{stem}{mx + 1:04d}"
+
+
+async def _validate_coa_account(db: AsyncSession, tenant_id: int, coa_id: Optional[int]) -> None:
+    """حماية: coa_account_id لازم يكون حساب موجود في دليل حسابات نفس الـ tenant —
+    وإلا القيود التلقائية للخزنة تترحّل على حساب tenant تاني أو حساب غير موجود."""
+    if coa_id is None:
+        return
+    from app.models.models import ChartOfAccount
+    ok = await db.scalar(
+        select(ChartOfAccount.id).where(
+            ChartOfAccount.id == coa_id, ChartOfAccount.tenant_id == tenant_id,
+        )
+    )
+    if not ok:
+        raise HTTPException(400, "الحساب المحدد في دليل الحسابات غير موجود")
+
+
+async def _get_treasury_checked(db: AsyncSession, tenant_id: int, treasury_id: int) -> Treasury:
+    t = await db.scalar(
+        select(Treasury).where(Treasury.id == treasury_id, Treasury.tenant_id == tenant_id)
+    )
+    if not t:
+        raise HTTPException(404, "الخزنة غير موجودة")
+    if t.is_active is False:
+        raise HTTPException(400, "الخزنة معطّلة — لا يمكن تسجيل حركات عليها")
+    return t
+
+
+async def _get_category_checked(db: AsyncSession, tenant_id: int,
+                                category_id: Optional[int], direction: str) -> Optional[TreasuryCategory]:
+    """الفئة لازم تكون من نفس الـ tenant ومتوافقة مع اتجاه الحركة
+    (فئة "إيراد" ماينفعش تتسجّل على صرف والعكس — وإلا الترحيل يروح لحساب غلط)."""
+    if not category_id:
+        return None
+    c = await db.scalar(
+        select(TreasuryCategory).where(
+            TreasuryCategory.id == category_id, TreasuryCategory.tenant_id == tenant_id,
+        )
+    )
+    if not c:
+        raise HTTPException(404, "الفئة غير موجودة")
+    if c.flow in ("in", "out") and c.flow != direction:
+        raise HTTPException(400, "الفئة المختارة لا تتوافق مع نوع الحركة (إيراد/مصروف)")
+    return c
 
 
 async def _apply_to_balance(db, treasury_id, direction, amount, revert=False):
@@ -145,12 +244,45 @@ async def _apply_to_balance(db, treasury_id, direction, amount, revert=False):
     return t
 
 
+def _current_tid() -> int:
+    from app.core.database import current_tenant_id as _ctid
+    return _ctid.get() or 1
+
+
+async def _balances_snapshot(db: AsyncSession, treasury_ids) -> dict:
+    """رصيد كل خزنة قبل العملية — لمقارنته بعد العكس/التعديل"""
+    snap = {}
+    for tr_id in set(i for i in treasury_ids if i):
+        t = await db.get(Treasury, tr_id)
+        if t:
+            snap[tr_id] = Decimal(str(t.balance or 0))
+    return snap
+
+
+async def _guard_not_negative(db: AsyncSession, before: dict, action: str) -> None:
+    """منع الرصيد السالب الناتج عن حذف/تعديل حركة (نفس سياسة منع السحب على المكشوف):
+    حذف حركة "قبض" أو تحويل اتصرف منه بالفعل كان بيخلي رصيد الخزنة بالسالب بصمت.
+    نرفض فقط لو العملية نفسها نزّلت الرصيد تحت الصفر (بيانات قديمة سالبة لا تعطّل)."""
+    for tr_id, prev in before.items():
+        t = await db.get(Treasury, tr_id)
+        if not t:
+            continue
+        after = Decimal(str(t.balance or 0))
+        if after < 0 and after < prev:
+            raise HTTPException(
+                409,
+                f"لا يمكن {action}: رصيد الخزنة '{t.name}' سيصبح بالسالب "
+                f"({float(after):,.2f}) — المبلغ اتصرف منها بالفعل",
+            )
+
+
 # ════════════════════════════════════════════════════
 # Treasuries (الخزن)
 # ════════════════════════════════════════════════════
 @router.get("/accounts")
 async def list_treasuries(db: AsyncSession = Depends(get_db)):
-    r = await db.execute(select(Treasury).order_by(Treasury.name))
+    r = await db.execute(select(Treasury).where(Treasury.tenant_id == _current_tid())
+                         .order_by(Treasury.name))
     return [_t(t) for t in r.scalars().all()]
 
 
@@ -159,11 +291,14 @@ async def create_treasury(data: TreasuryIn, db: AsyncSession = Depends(get_db)):
     name = (data.name or "").strip()
     if not name:
         raise HTTPException(400, "اسم الخزنة مطلوب")
-    ex = await db.execute(select(Treasury).where(Treasury.name == name))
-    if ex.scalar_one_or_none():
-        raise HTTPException(409, "خزنة بنفس الاسم موجودة")
     from app.core.database import current_tenant_id as _ctid_tr
     tid = _ctid_tr.get() or 1
+    ex = await db.execute(select(Treasury).where(Treasury.name == name, Treasury.tenant_id == tid))
+    if ex.scalars().first():
+        raise HTTPException(409, "خزنة بنفس الاسم موجودة")
+    # الرصيد الافتتاحي: مقرّب لقرشين وغير سالب (نفس سياسة منع السحب على المكشوف)
+    opening = _money(data.opening_balance, "الرصيد الافتتاحي", allow_zero=True)
+    await _validate_coa_account(db, tid, data.coa_account_id)
     coa_id = data.coa_account_id
     if coa_id is None:
         from app.models.models import ChartOfAccount
@@ -176,8 +311,8 @@ async def create_treasury(data: TreasuryIn, db: AsyncSession = Depends(get_db)):
     t = Treasury(
         tenant_id=tid,
         name=name, kind=data.kind,
-        opening_balance=data.opening_balance,
-        balance=data.opening_balance,   # الرصيد الافتتاحي يبدأ به
+        opening_balance=opening,
+        balance=opening,   # الرصيد الافتتاحي يبدأ به
         notes=data.notes,
         coa_account_id=coa_id,
     )
@@ -189,14 +324,32 @@ async def create_treasury(data: TreasuryIn, db: AsyncSession = Depends(get_db)):
 
 @router.put("/accounts/{treasury_id}")
 async def update_treasury(treasury_id: int, data: TreasuryIn, db: AsyncSession = Depends(get_db)):
-    t = await db.get(Treasury, treasury_id)
+    from app.core.database import current_tenant_id as _ctid_utr
+    tid = _ctid_utr.get() or 1
+    t = await db.scalar(select(Treasury).where(Treasury.id == treasury_id, Treasury.tenant_id == tid))
     if not t:
         raise HTTPException(404, "الخزنة غير موجودة")
-    t.name = (data.name or t.name).strip()
-    t.kind = data.kind
-    t.notes = data.notes
+    new_name = (data.name or "").strip() or t.name
+    if new_name != t.name:
+        # بدون الفحص ده الاسم المكرر كان يوقع IntegrityError (500) من القيد الفريد
+        dup = await db.scalar(select(Treasury.id).where(
+            Treasury.tenant_id == tid, Treasury.name == new_name, Treasury.id != t.id,
+        ))
+        if dup:
+            raise HTTPException(409, "خزنة بنفس الاسم موجودة")
+    await _validate_coa_account(db, tid, data.coa_account_id)
+    t.name = new_name
+    # تعديل جزئي: kind له قيمة افتراضية "cash" — لو الطلب ماحددهوش كانت خزنة البنك
+    # بتتحوّل لنقدية بصمت. نغيّره فقط لو اتبعت صراحةً.
+    _set = getattr(data, "model_fields_set", None) or getattr(data, "__fields_set__", set())
+    if "kind" in _set:
+        t.kind = data.kind
+    if "notes" in _set:
+        t.notes = data.notes
     if data.coa_account_id is not None:
         t.coa_account_id = data.coa_account_id
+    if data.is_active is not None:
+        t.is_active = data.is_active
     await db.commit()
     await db.refresh(t)
     return _t(t)
@@ -204,7 +357,10 @@ async def update_treasury(treasury_id: int, data: TreasuryIn, db: AsyncSession =
 
 @router.delete("/accounts/{treasury_id}", status_code=204)
 async def delete_treasury(treasury_id: int, db: AsyncSession = Depends(get_db)):
-    t = await db.get(Treasury, treasury_id)
+    from app.core.database import current_tenant_id as _ctid_dtr
+    t = await db.scalar(select(Treasury).where(
+        Treasury.id == treasury_id, Treasury.tenant_id == (_ctid_dtr.get() or 1),
+    ))
     if not t:
         raise HTTPException(404, "الخزنة غير موجودة")
     cnt = await db.execute(
@@ -214,6 +370,13 @@ async def delete_treasury(treasury_id: int, db: AsyncSession = Depends(get_db)):
     )
     if (cnt.scalar() or 0) > 0:
         raise HTTPException(409, "لا يمكن حذف خزنة عليها حركات. عطّلها بدل الحذف.")
+    # مبيعات الخردة بتشير للخزنة (FK) — حذفها كان يسيب سجلات يتيمة/خطأ FK
+    from app.models.models import ScrapSale
+    scrap_cnt = await db.scalar(
+        select(func.count()).select_from(ScrapSale).where(ScrapSale.treasury_id == treasury_id)
+    )
+    if (scrap_cnt or 0) > 0:
+        raise HTTPException(409, "لا يمكن حذف خزنة مرتبطة بمبيعات خردة. عطّلها بدل الحذف.")
     await db.delete(t)
     await db.commit()
 
@@ -223,7 +386,8 @@ async def delete_treasury(treasury_id: int, db: AsyncSession = Depends(get_db)):
 # ════════════════════════════════════════════════════
 @router.get("/categories")
 async def list_categories(db: AsyncSession = Depends(get_db)):
-    r = await db.execute(select(TreasuryCategory).order_by(TreasuryCategory.name))
+    r = await db.execute(select(TreasuryCategory).where(TreasuryCategory.tenant_id == _current_tid())
+                         .order_by(TreasuryCategory.name))
     return [{"id": c.id, "name": c.name, "flow": c.flow, "coa_account_id": c.coa_account_id}
             for c in r.scalars().all()]
 
@@ -233,11 +397,15 @@ async def create_category(data: CategoryIn, db: AsyncSession = Depends(get_db)):
     name = (data.name or "").strip()
     if not name:
         raise HTTPException(400, "اسم الفئة مطلوب")
-    ex = await db.execute(select(TreasuryCategory).where(TreasuryCategory.name == name))
-    if ex.scalar_one_or_none():
-        raise HTTPException(409, "الفئة موجودة بالفعل")
     from app.core.database import current_tenant_id as _ctid_tc
-    c = TreasuryCategory(tenant_id=_ctid_tc.get() or 1, name=name, flow=data.flow,
+    _tid_tc = _ctid_tc.get() or 1
+    ex = await db.execute(select(TreasuryCategory).where(
+        TreasuryCategory.name == name, TreasuryCategory.tenant_id == _tid_tc,
+    ))
+    if ex.scalars().first():
+        raise HTTPException(409, "الفئة موجودة بالفعل")
+    await _validate_coa_account(db, _tid_tc, data.coa_account_id)
+    c = TreasuryCategory(tenant_id=_tid_tc, name=name, flow=data.flow,
                           coa_account_id=data.coa_account_id)
     db.add(c)
     await db.commit()
@@ -248,10 +416,35 @@ async def create_category(data: CategoryIn, db: AsyncSession = Depends(get_db)):
 @router.put("/categories/{category_id}")
 async def update_category(category_id: int, data: CategoryIn, db: AsyncSession = Depends(get_db)):
     """تحديث فئة — يُستخدم أساساً لربطها بحساب في دليل الحسابات لترحيل حركاتها تلقائياً"""
-    c = await db.get(TreasuryCategory, category_id)
+    from app.core.database import current_tenant_id as _ctid_uc
+    _tid_uc = _ctid_uc.get() or 1
+    c = await db.scalar(select(TreasuryCategory).where(
+        TreasuryCategory.id == category_id, TreasuryCategory.tenant_id == _tid_uc,
+    ))
     if not c:
         raise HTTPException(404, "الفئة غير موجودة")
-    c.name = (data.name or c.name).strip()
+    new_name = (data.name or "").strip() or c.name
+    if new_name != c.name:
+        dup = await db.scalar(select(TreasuryCategory.id).where(
+            TreasuryCategory.tenant_id == _tid_uc, TreasuryCategory.name == new_name,
+            TreasuryCategory.id != c.id,
+        ))
+        if dup:
+            raise HTTPException(409, "الفئة موجودة بالفعل")
+    await _validate_coa_account(db, _tid_uc, data.coa_account_id)
+    # تغيير flow لـ in/out بينما الفئة عليها حركات بالاتجاه العكسي كان يخلّي
+    # حركات قديمة بفئة "إيراد" على صرف (أو العكس) — نفس القاعدة المطبّقة عند الإنشاء
+    if data.flow in ("in", "out") and data.flow != c.flow:
+        conflicting = await db.scalar(
+            select(func.count()).select_from(TreasuryTransaction).where(
+                TreasuryTransaction.category_id == c.id,
+                TreasuryTransaction.tenant_id == _tid_uc,
+                TreasuryTransaction.direction != data.flow,
+            )
+        )
+        if (conflicting or 0) > 0:
+            raise HTTPException(409, "لا يمكن تغيير نوع الفئة: عليها حركات بالاتجاه العكسي")
+    c.name = new_name
     c.flow = data.flow
     if data.coa_account_id is not None:
         c.coa_account_id = data.coa_account_id
@@ -262,9 +455,22 @@ async def update_category(category_id: int, data: CategoryIn, db: AsyncSession =
 
 @router.delete("/categories/{category_id}", status_code=204)
 async def delete_category(category_id: int, db: AsyncSession = Depends(get_db)):
-    c = await db.get(TreasuryCategory, category_id)
+    from app.core.database import current_tenant_id as _ctid_dc
+    _tid_dc = _ctid_dc.get() or 1
+    c = await db.scalar(select(TreasuryCategory).where(
+        TreasuryCategory.id == category_id, TreasuryCategory.tenant_id == _tid_dc,
+    ))
     if not c:
         raise HTTPException(404, "الفئة غير موجودة")
+    # فئة عليها حركات: حذفها كان يسيب حركات بـ category_id يتيم (أو خطأ FK 500 على Postgres)
+    used = await db.scalar(
+        select(func.count()).select_from(TreasuryTransaction).where(
+            TreasuryTransaction.category_id == category_id,
+            TreasuryTransaction.tenant_id == _tid_dc,
+        )
+    )
+    if (used or 0) > 0:
+        raise HTTPException(409, "لا يمكن حذف فئة مستخدمة في حركات خزنة")
     await db.delete(c)
     await db.commit()
 
@@ -279,7 +485,9 @@ async def list_transactions(
     category_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(TreasuryTransaction).order_by(TreasuryTransaction.txn_date.desc(), TreasuryTransaction.id.desc())
+    tid = _current_tid()
+    q = select(TreasuryTransaction).where(TreasuryTransaction.tenant_id == tid) \
+        .order_by(TreasuryTransaction.txn_date.desc(), TreasuryTransaction.id.desc())
     if treasury_id:
         q = q.where(TreasuryTransaction.treasury_id == treasury_id)
     if direction in ("in", "out"):
@@ -289,8 +497,10 @@ async def list_transactions(
     rows = (await db.execute(q)).scalars().all()
 
     # نجيب أسماء الفئات والخزن
-    cats = {c.id: c.name for c in (await db.execute(select(TreasuryCategory))).scalars().all()}
-    treas = {t.id: t.name for t in (await db.execute(select(Treasury))).scalars().all()}
+    cats = {c.id: c.name for c in (await db.execute(
+        select(TreasuryCategory).where(TreasuryCategory.tenant_id == tid))).scalars().all()}
+    treas = {t.id: t.name for t in (await db.execute(
+        select(Treasury).where(Treasury.tenant_id == tid))).scalars().all()}
     return [_txn(x, cats.get(x.category_id), treas.get(x.treasury_id)) for x in rows]
 
 
@@ -298,33 +508,32 @@ async def list_transactions(
 async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db)):
     if data.direction not in ("in", "out"):
         raise HTTPException(400, "الاتجاه لازم يكون in أو out")
-    amt = Decimal(str(data.amount))
-    if amt <= 0:
-        raise HTTPException(400, "المبلغ لازم يكون أكبر من صفر")
+    amt = _money(data.amount)
     payment_method = data.payment_method or "cash"
     if payment_method not in ("cash", "cheque", "wallet", "other"):
         raise HTTPException(400, "طريقة الدفع غير صحيحة")
     cheque_status = None
     if payment_method == "cheque":
-        if not data.cheque_number or not data.cheque_date:
+        if not (data.cheque_number or "").strip() or not data.cheque_date:
             raise HTTPException(400, "رقم الشيك وتاريخ الاستحقاق مطلوبان")
         cheque_status = "under_collection"
-    # تحذير: رصيد غير كافٍ
-    if data.direction == "out":
-        t = await db.get(Treasury, data.treasury_id)
-        if t:
-            current = Decimal(str(t.balance or 0))
-            if amt > current:
-                raise HTTPException(400,
-                    f"الرصيد الحالي للخزنة ({float(current):,.2f}) أقل من المبلغ المطلوب صرفه ({float(amt):,.2f})")
-    receipt_no = await _next_receipt_no(db, data.direction)
     from app.core.database import current_tenant_id as _ctid_ttx
     tid = _ctid_ttx.get() or 1
+    # الخزنة والفئة لازم يكونوا من نفس الـ tenant، والخزنة نشطة، والفئة متوافقة مع الاتجاه
+    t = await _get_treasury_checked(db, tid, data.treasury_id)
+    await _get_category_checked(db, tid, data.category_id, data.direction)
+    # تحذير: رصيد غير كافٍ
+    if data.direction == "out":
+        current = Decimal(str(t.balance or 0))
+        if amt > current:
+            raise HTTPException(400,
+                f"الرصيد الحالي للخزنة ({float(current):,.2f}) أقل من المبلغ المطلوب صرفه ({float(amt):,.2f})")
+    receipt_no = await _next_receipt_no(db, data.direction)
     x = TreasuryTransaction(
         tenant_id=tid,
         treasury_id=data.treasury_id,
         direction=data.direction,
-        amount=data.amount,
+        amount=amt,
         category_id=data.category_id,
         txn_date=data.txn_date or date.today(),
         description=data.description,
@@ -337,7 +546,7 @@ async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db)):
         cheque_bank=data.cheque_bank if payment_method == "cheque" else None,
         cheque_status=cheque_status,
     )
-    await _apply_to_balance(db, data.treasury_id, data.direction, data.amount)
+    await _apply_to_balance(db, data.treasury_id, data.direction, amt)
     db.add(x)
     await db.flush()
 
@@ -362,7 +571,11 @@ async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db)):
 @router.put("/transactions/{txn_id}")
 async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depends(get_db)):
     """تعديل حركة خزينة — مسموح فقط للحركات اليدوية غير المقاصة"""
-    x = await db.get(TreasuryTransaction, txn_id)
+    from app.core.database import current_tenant_id as _ctid_utx
+    tid = _ctid_utx.get() or 1
+    x = await db.scalar(select(TreasuryTransaction).where(
+        TreasuryTransaction.id == txn_id, TreasuryTransaction.tenant_id == tid,
+    ))
     if not x:
         raise HTTPException(404, "الحركة غير موجودة")
     if x.source != "manual":
@@ -370,12 +583,25 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
     if getattr(x, "cheque_status", None) in ("cleared", "bounced"):
         raise HTTPException(400, "لا يمكن تعديل شيك مُقاص أو مرتجع")
 
-    from app.core.database import current_tenant_id as _ctid_utx
-    tid = _ctid_utx.get() or 1
-
     # الأثر القديم (على الرصيد والقيد المحاسبي) لسه فعّال إلا لو كان شيكاً مرتجعاً/ملغياً
     # (في الحالة دي يكون الأثر اتعكس بالفعل من update_cheque_status)
     old_balance_active = x.cheque_status not in ("bounced", "cancelled")
+
+    # التحقق من المدخلات قبل أي عكس للأثر القديم
+    if data.direction not in ("in", "out"):
+        raise HTTPException(400, "الاتجاه لازم يكون in أو out")
+    amt = _money(data.amount)
+    if data.treasury_id != x.treasury_id:
+        # نقل الحركة لخزنة تانية: لازم تكون من نفس الـ tenant ونشطة
+        await _get_treasury_checked(db, tid, data.treasury_id)
+    else:
+        same_t = await db.scalar(select(Treasury.id).where(
+            Treasury.id == data.treasury_id, Treasury.tenant_id == tid,
+        ))
+        if not same_t:
+            raise HTTPException(404, "الخزنة غير موجودة")
+    await _get_category_checked(db, tid, data.category_id, data.direction)
+    _before_bal = await _balances_snapshot(db, [x.treasury_id, data.treasury_id])
 
     # عكس القيد المحاسبي القديم المرتبط بالحركة — وإلا يفضل قيد بالبيانات القديمة
     # في دليل الحسابات (COA) بعد ما نعدّل بيانات الحركة، وميزان المراجعة يبقى غير متوافق
@@ -388,14 +614,8 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
     if old_balance_active:
         await _apply_to_balance(db, x.treasury_id, x.direction, x.amount, revert=True)
 
-    amt = Decimal(str(data.amount))
-    if amt <= 0:
-        raise HTTPException(400, "المبلغ لازم يكون أكبر من صفر")
-    if data.direction not in ("in", "out"):
-        raise HTTPException(400, "الاتجاه لازم يكون in أو out")
-
-    # تحقق من كفاية الرصيد إن كان صرف
-    if data.direction == "out":
+    # تحقق من كفاية الرصيد إن كان صرف (فقط لو الحركة لها أثر فعّال على الرصيد)
+    if data.direction == "out" and old_balance_active:
         t = await db.get(Treasury, data.treasury_id)
         if t:
             current = Decimal(str(t.balance or 0))
@@ -405,13 +625,18 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
 
     x.treasury_id = data.treasury_id
     x.direction = data.direction
-    x.amount = data.amount
+    x.amount = amt
     x.category_id = data.category_id
     x.txn_date = data.txn_date or x.txn_date
     x.description = data.description
     x.reference = data.reference
 
-    await _apply_to_balance(db, data.treasury_id, data.direction, data.amount)
+    # إصلاح: الشيك الملغي أثره معكوس بالفعل — كان التعديل يضيف المبلغ الجديد للرصيد
+    # من غير ما يعكس القديم، فيتضخم الرصيد بمبلغ شيك ملغي
+    if old_balance_active:
+        await _apply_to_balance(db, data.treasury_id, data.direction, amt)
+        # تقليل مبلغ "قبض" (أو نقله لخزنة تانية) بعد ما اتصرف منه كان يخلّي الرصيد سالباً
+        await _guard_not_negative(db, _before_bal, "تعديل الحركة")
 
     # إعادة ترحيل قيد محاسبي جديد يعكس البيانات المحدَّثة (نفس شرط الترحيل في create_transaction)
     if old_balance_active:
@@ -431,22 +656,59 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
     await db.commit()
     await db.refresh(x)
 
-    cats = {c.id: c.name for c in (await db.execute(select(TreasuryCategory))).scalars().all()}
-    treas = {t.id: t.name for t in (await db.execute(select(Treasury))).scalars().all()}
+    cats = {c.id: c.name for c in (await db.execute(
+        select(TreasuryCategory).where(TreasuryCategory.tenant_id == tid))).scalars().all()}
+    treas = {t.id: t.name for t in (await db.execute(
+        select(Treasury).where(Treasury.tenant_id == tid))).scalars().all()}
     return _txn(x, cats.get(x.category_id), treas.get(x.treasury_id))
 
 
 @router.delete("/transactions/{txn_id}", status_code=204)
 async def delete_transaction(txn_id: int, db: AsyncSession = Depends(get_db)):
-    x = await db.get(TreasuryTransaction, txn_id)
-    if not x:
-        raise HTTPException(404, "الحركة غير موجودة")
     from app.core.database import current_tenant_id as _ctid_dtx
     tid = _ctid_dtx.get() or 1
+    x = await db.scalar(select(TreasuryTransaction).where(
+        TreasuryTransaction.id == txn_id, TreasuryTransaction.tenant_id == tid,
+    ))
+    if not x:
+        raise HTTPException(404, "الحركة غير موجودة")
+    # الحركات التلقائية (دفعة عميل/مورد، رواتب، سلف، أصول...) مرتبطة بمستند أصلي —
+    # حذفها من هنا كان يعكس الرصيد ويسيب المستند الأصلي (والقيد) على حاله.
+    # الواجهة أصلاً بتعرض الحذف للحركات اليدوية بس.
+    if x.source not in ("manual", "transfer"):
+        raise HTTPException(409, "لا يمكن حذف حركة تلقائية مرتبطة بمستند — احذف/اعكس المستند الأصلي")
+
+    # التحويل: حذف رِجل واحدة كان يعكس قيد التحويل كله ويسيب الرِجل التانية في
+    # الخزنة الأخرى فيختل الرصيدان — نحذف رِجلي التحويل معاً
+    if x.source == "transfer" and x.transfer_group:
+        legs = (await db.execute(
+            select(TreasuryTransaction).where(
+                TreasuryTransaction.transfer_group == x.transfer_group,
+                TreasuryTransaction.tenant_id == tid,
+            )
+        )).scalars().all()
+        out_leg_id = None
+        _before_bal = await _balances_snapshot(db, [leg.treasury_id for leg in legs])
+        for leg in legs:
+            if leg.direction == "out":
+                out_leg_id = leg.id
+            await _apply_to_balance(db, leg.treasury_id, leg.direction, leg.amount, revert=True)
+        # الخزنة المستلمة ممكن تكون صرفت مبلغ التحويل بالفعل
+        await _guard_not_negative(db, _before_bal, "حذف التحويل")
+        if out_leg_id:
+            from app.services.auto_journal import journal_reverse_entry
+            await journal_reverse_entry(db, tid, "treasury_transfer", out_leg_id, "حذف حركة التحويل")
+        for leg in legs:
+            await db.delete(leg)
+        await db.commit()
+        return
+
     balance_active = x.cheque_status not in ("bounced", "cancelled")
     # نعكس أثرها على الرصيد — إلا لو كان شيكاً مرتجعاً/ملغياً (أثره معكوس أصلاً)
     if balance_active:
+        _before_bal = await _balances_snapshot(db, [x.treasury_id])
         await _apply_to_balance(db, x.treasury_id, x.direction, x.amount, revert=True)
+        await _guard_not_negative(db, _before_bal, "حذف الحركة")
 
     # عكس القيد المحاسبي المرتبط بالحركة (لو كان مرحّلاً فعلياً) — وإلا يفضل قيد يتيم
     # في دليل الحسابات بعد حذف الحركة، فيختل تطابق ميزان المراجعة مع رصيد الخزينة الفعلي
@@ -460,6 +722,7 @@ async def delete_transaction(txn_id: int, db: AsyncSession = Depends(get_db)):
                 select(TreasuryTransaction.id).where(
                     TreasuryTransaction.transfer_group == x.transfer_group,
                     TreasuryTransaction.direction == "out",
+                    TreasuryTransaction.tenant_id == tid,
                 )
             )
             if out_leg_id:
@@ -478,8 +741,10 @@ async def list_cheques(
     direction: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
+    tid = _current_tid()
     q = select(TreasuryTransaction).where(
-        TreasuryTransaction.payment_method == "cheque"
+        TreasuryTransaction.payment_method == "cheque",
+        TreasuryTransaction.tenant_id == tid,
     ).order_by(TreasuryTransaction.cheque_date.asc())
     if cheque_status:
         q = q.where(TreasuryTransaction.cheque_status == cheque_status)
@@ -487,14 +752,18 @@ async def list_cheques(
         q = q.where(TreasuryTransaction.direction == direction)
     rows = (await db.execute(q)).scalars().all()
 
-    cats = {c.id: c.name for c in (await db.execute(select(TreasuryCategory))).scalars().all()}
-    treas = {t.id: t.name for t in (await db.execute(select(Treasury))).scalars().all()}
+    cats = {c.id: c.name for c in (await db.execute(
+        select(TreasuryCategory).where(TreasuryCategory.tenant_id == tid))).scalars().all()}
+    treas = {t.id: t.name for t in (await db.execute(
+        select(Treasury).where(Treasury.tenant_id == tid))).scalars().all()}
     return [_txn(x, cats.get(x.category_id), treas.get(x.treasury_id)) for x in rows]
 
 
 @router.patch("/cheques/{txn_id}/status")
 async def update_cheque_status(txn_id: int, data: ChequeStatusIn, db: AsyncSession = Depends(get_db)):
-    x = await db.get(TreasuryTransaction, txn_id)
+    x = await db.scalar(select(TreasuryTransaction).where(
+        TreasuryTransaction.id == txn_id, TreasuryTransaction.tenant_id == _current_tid(),
+    ))
     if not x:
         raise HTTPException(404, "الحركة غير موجودة")
     if x.payment_method != "cheque":
@@ -504,6 +773,8 @@ async def update_cheque_status(txn_id: int, data: ChequeStatusIn, db: AsyncSessi
 
     old_status = x.cheque_status
     new_status = data.cheque_status
+    if old_status == new_status:
+        return _txn(x)
 
     # الشيك "تحت التحصيل" يُحتسب أصلاً في رصيد الخزنة عند إنشائه.
     # لو تحوّل لـ "مرتجع" أو "ملغي"، نعكس أثره على الرصيد.
@@ -518,6 +789,13 @@ async def update_cheque_status(txn_id: int, data: ChequeStatusIn, db: AsyncSessi
             await journal_reverse_entry(db, tid, "treasury_manual", x.id,
                                          "بنك" if new_status == "bounced" else "إلغاء")
     elif old_status in reverted_statuses and new_status not in reverted_statuses:
+        # إعادة تفعيل شيك صادر = صرف جديد من الخزنة — نفس سياسة منع السحب على المكشوف
+        if x.direction == "out":
+            t_chq = await db.get(Treasury, x.treasury_id)
+            cur = Decimal(str((t_chq.balance if t_chq else 0) or 0))
+            if Decimal(str(x.amount or 0)) > cur:
+                raise HTTPException(400,
+                    f"الرصيد الحالي للخزنة ({float(cur):,.2f}) أقل من مبلغ الشيك ({float(x.amount or 0):,.2f})")
         await _apply_to_balance(db, x.treasury_id, x.direction, x.amount)
         if x.source == "manual":
             from app.services.auto_journal import journal_reverse_entry
@@ -536,36 +814,36 @@ async def update_cheque_status(txn_id: int, data: ChequeStatusIn, db: AsyncSessi
 async def transfer(data: TransferIn, db: AsyncSession = Depends(get_db)):
     if data.from_treasury_id == data.to_treasury_id:
         raise HTTPException(400, "لا يمكن التحويل لنفس الخزنة")
-    tamt = Decimal(str(data.amount))
-    if tamt <= 0:
-        raise HTTPException(400, "المبلغ لازم يكون أكبر من صفر")
+    tamt = _money(data.amount)
+    from app.core.database import current_tenant_id as _ctid_xfr
+    _tid_xfr = _ctid_xfr.get() or 1
+    # الخزنتين لازم يكونوا من نفس الـ tenant ونشطين (قبل كده خزنة وجهة غير موجودة/
+    # من tenant تاني كانت بتتقبل لو الـ get رجع None للمصدر)
+    src = await _get_treasury_checked(db, _tid_xfr, data.from_treasury_id)
+    await _get_treasury_checked(db, _tid_xfr, data.to_treasury_id)
     # تحقق من رصيد المصدر
-    src = await db.get(Treasury, data.from_treasury_id)
-    if src:
-        src_bal = Decimal(str(src.balance or 0))
-        if tamt > src_bal:
-            raise HTTPException(400,
-                f"رصيد خزنة المصدر ({float(src_bal):,.2f}) أقل من مبلغ التحويل ({float(tamt):,.2f})")
+    src_bal = Decimal(str(src.balance or 0))
+    if tamt > src_bal:
+        raise HTTPException(400,
+            f"رصيد خزنة المصدر ({float(src_bal):,.2f}) أقل من مبلغ التحويل ({float(tamt):,.2f})")
     grp = uuid4().hex
     d = data.txn_date or date.today()
     desc = data.description or "تحويل بين الخزن"
 
-    from app.core.database import current_tenant_id as _ctid_xfr
-    _tid_xfr = _ctid_xfr.get() or 1
     # خروج من المصدر
     out_txn = TreasuryTransaction(
         tenant_id=_tid_xfr,
-        treasury_id=data.from_treasury_id, direction="out", amount=data.amount,
+        treasury_id=data.from_treasury_id, direction="out", amount=tamt,
         txn_date=d, description=desc, source="transfer", transfer_group=grp,
     )
-    await _apply_to_balance(db, data.from_treasury_id, "out", data.amount)
+    await _apply_to_balance(db, data.from_treasury_id, "out", tamt)
     # دخول للهدف
     in_txn = TreasuryTransaction(
         tenant_id=_tid_xfr,
-        treasury_id=data.to_treasury_id, direction="in", amount=data.amount,
+        treasury_id=data.to_treasury_id, direction="in", amount=tamt,
         txn_date=d, description=desc, source="transfer", transfer_group=grp,
     )
-    await _apply_to_balance(db, data.to_treasury_id, "in", data.amount)
+    await _apply_to_balance(db, data.to_treasury_id, "in", tamt)
     db.add_all([out_txn, in_txn])
     await db.flush()
 
@@ -587,19 +865,28 @@ async def transfer(data: TransferIn, db: AsyncSession = Depends(get_db)):
 # ════════════════════════════════════════════════════
 @router.get("/summary")
 async def summary(db: AsyncSession = Depends(get_db)):
-    treas = (await db.execute(select(Treasury))).scalars().all()
+    tid = _current_tid()
+    treas = (await db.execute(select(Treasury).where(Treasury.tenant_id == tid))).scalars().all()
     total_balance = sum(float(t.balance or 0) for t in treas)
 
     total_in = (await db.execute(
         select(func.coalesce(func.sum(TreasuryTransaction.amount), 0)).where(
             TreasuryTransaction.direction == "in",
             TreasuryTransaction.source != "transfer",
+            TreasuryTransaction.tenant_id == tid,
+            # الشيكات المرتجعة/الملغاة أثرها معكوس من الرصيد — ماتتحسبش في الإجمالي
+            or_(TreasuryTransaction.cheque_status.is_(None),
+                TreasuryTransaction.cheque_status.notin_(("bounced", "cancelled"))),
         )
     )).scalar() or 0
     total_out = (await db.execute(
         select(func.coalesce(func.sum(TreasuryTransaction.amount), 0)).where(
             TreasuryTransaction.direction == "out",
             TreasuryTransaction.source != "transfer",
+            TreasuryTransaction.tenant_id == tid,
+            # الشيكات المرتجعة/الملغاة أثرها معكوس من الرصيد — ماتتحسبش في الإجمالي
+            or_(TreasuryTransaction.cheque_status.is_(None),
+                TreasuryTransaction.cheque_status.notin_(("bounced", "cancelled"))),
         )
     )).scalar() or 0
 
@@ -844,9 +1131,11 @@ body{{font-family:'Cairo',Tahoma,Arial,sans-serif;font-size:13px;color:#1a1a18;b
 @print_router.get("/transactions/{txn_id}/print", response_class=HTMLResponse)
 async def print_voucher(txn_id: int, db: AsyncSession = Depends(get_db)):
     """طباعة سند قبض أو سند صرف"""
-    txn = await db.get(TreasuryTransaction, txn_id)
+    txn = await db.scalar(select(TreasuryTransaction).where(
+        TreasuryTransaction.id == txn_id, TreasuryTransaction.tenant_id == _current_tid(),
+    ))
     if not txn:
-        raise HTTPException(404)
+        raise HTTPException(404, "الحركة غير موجودة")
     company = await _voucher_company(db)
     treasury = await db.get(Treasury, txn.treasury_id)
     treasury_name = treasury.name if treasury else "—"

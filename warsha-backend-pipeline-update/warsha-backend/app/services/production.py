@@ -54,6 +54,10 @@ async def auto_reserve_materials(db: AsyncSession, work_order_id: int) -> dict:
     wo = await db.get(WorkOrder, work_order_id)
     if not wo:
         return {"error": "أمر الإنتاج غير موجود"}
+    if wo.status in ("done", "cancelled"):
+        # حجز مواد لأمر مكتمل/ملغي كان بيعمل soft-lock على المخزون للأبد
+        # (الحجوزات دي مبتتقفلش تاني) ويضخّم احتياجات MRP بلا داعي
+        return {"error": f"أمر الإنتاج {wo.code} {'مكتمل' if wo.status == 'done' else 'ملغي'} — لا يمكن حجز مواد له"}
 
     if not wo.equipment_id:
         return {
@@ -242,6 +246,8 @@ async def reserve_single_material(db: AsyncSession, work_order_id: int, material
     wo = await db.get(WorkOrder, work_order_id)
     if not wo:
         return {"error": "أمر الإنتاج غير موجود"}
+    if wo.status in ("done", "cancelled"):
+        return {"error": f"أمر الإنتاج {wo.code} {'مكتمل' if wo.status == 'done' else 'ملغي'} — لا يمكن حجز مواد له"}
     mat = await db.get(Material, material_id)
     if not mat:
         return {"error": "المادة غير موجودة"}
@@ -596,6 +602,11 @@ async def issue_material(
     mat = await db.get(Material, material_id)
     if not wo or not mat:
         return {"error": "بيانات غير صحيحة"}
+    if wo.status in ("done", "cancelled"):
+        # صرف مواد لأمر مكتمل كان بيزوّد actual_cost بعد ما FG اتسجّل بتكلفة
+        # وحدة ثابتة (تناقض صامت)، وبيعيد فتح WIP لأمر مقفول. لأمر ملغي: خصم
+        # مخزون فعلي على أمر مش هيتنتج أصلًا.
+        return {"error": f"أمر الإنتاج {wo.code} {'مكتمل' if wo.status == 'done' else 'ملغي'} — لا يمكن صرف مواد له"}
     if qty_to_issue is None or qty_to_issue <= 0:
         # محطة 29: صرف بكمية صفر/سالبة كان بيمر من غير فحص — لكمية سالبة
         # كان بيزوّد stock_qty فعليًا (بدل ما يخصم) وبينقص wo.actual_cost
@@ -633,6 +644,35 @@ async def issue_material(
 
     remnants_used = []
     new_remnant = None
+
+    # فحص مسبق للتوفر (نسالة + بالك) قبل أي استهلاك فعلي: _consume_plate_qty/
+    # _consume_bar_qty بيحذفوا النسالة ويخصموا البالك أثناء التنفيذ، فلو طلع
+    # نقص في الآخر كانت الدالة بترجع error والتعديلات الجزئية (نسالة محذوفة +
+    # stock_qty مخصوم) فاضلة في الـsession بلا حركة ولا تكلفة — وفي
+    # auto_execute_bom كان أول commit لبند تالي ناجح بيثبّتها فعليًا.
+    if mat.is_plate and mat.plate_length_cm and mat.plate_width_cm:
+        from app.models.models import SheetStockItem as _SSI_chk
+        _rem_rows = (await db.execute(
+            select(_SSI_chk).where(_SSI_chk.material_id == mat.id, _SSI_chk.qty > 0)
+        )).scalars().all()
+        _avail_m2 = sum(
+            (Decimal(str(float(r.length_cm) * float(r.width_cm) / 10000 * r.qty)) for r in _rem_rows),
+            Decimal("0"),
+        ) + max(mat.stock_qty or Decimal("0"), Decimal("0"))
+        if _avail_m2 < qty_to_issue:
+            return {"error": f"المخزون غير كافٍ (نسالة+بالك) — نقص {float(qty_to_issue - _avail_m2):.2f} م²"}
+    elif mat.bar_length_cm and mat.weight_per_meter_kg:
+        from app.models.models import BarStockItem as _BSI_chk
+        _bar_rows = (await db.execute(
+            select(_BSI_chk).where(_BSI_chk.material_id == mat.id, _BSI_chk.qty > 0)
+        )).scalars().all()
+        _wpm_chk = Decimal(str(mat.weight_per_meter_kg))
+        _avail_kg = sum(
+            (Decimal(str(float(r.length_cm) / 100)) * r.qty * _wpm_chk for r in _bar_rows),
+            Decimal("0"),
+        ) + max(mat.stock_qty or Decimal("0"), Decimal("0"))
+        if _avail_kg + Decimal("0.0001") < qty_to_issue:
+            return {"error": f"المخزون غير كافٍ (نسالة+بالك) — نقص {float(qty_to_issue - _avail_kg):.2f} كجم"}
 
     if mat.is_plate and mat.plate_length_cm and mat.plate_width_cm:
         consumed = await _consume_plate_qty(db, mat, qty_to_issue, _tid_iss)
@@ -704,16 +744,14 @@ async def issue_material(
     # محطة 14: تسجيل المعدة "تحت التصنيع" كرصيد فعلي في موقع WIP
     await _sync_wip_quant(db, wo, _tid_iss)
 
-    await db.commit()
+    # قيد محاسبي: WIP debit / Inventory credit — لازم يتسجل قبل الـ commit وفي
+    # نفس الترانزاكشن. كان بعد الـ commit وجوه try/except صامت، فالقيد مكانش
+    # بيتحفظ أبدًا: حساب WIP بيطلع دائن بقيمة المعدة عند الإقفال، ومخزون
+    # الخامات في الميزانية بيفضل شايل مواد اتصرفت فعلًا.
+    from app.services.auto_journal import journal_material_issue
+    await journal_material_issue(db, _tid_iss, work_order_id, wo.code, total_cost, date.today())
 
-    # قيد محاسبي: WIP debit / Inventory credit
-    try:
-        from app.services.auto_journal import journal_material_issue
-        from app.core.database import current_tenant_id as _ctid_issue
-        _tid_issue = _ctid_issue.get() or 1
-        await journal_material_issue(db, _tid_issue, work_order_id, wo.code, total_cost, date.today())
-    except Exception:
-        pass  # القيد اختياري — لا يوقف العملية
+    await db.commit()
 
     return {
         "issued":               float(actual_qty),
@@ -1265,6 +1303,9 @@ async def complete_work_order(db: AsyncSession, work_order_id: int) -> dict:
     # sales.py بيعتمد عليه بالكامل لفوترة أمر الإنتاج وحساب COGS.
     if wo.status == "done":
         return {"error": f"أمر الإنتاج {wo.code} مكتمل بالفعل — لا يمكن إنهاؤه مرة أخرى"}
+    if wo.status == "cancelled":
+        # إنهاء أمر ملغي كان بيستقبل FG-{code} (مخزون تام صنع وهمي) ويرحّل قيد WIP→FG
+        return {"error": f"أمر الإنتاج {wo.code} ملغي — لا يمكن إنهاؤه"}
 
     eq = await db.get(Equipment, wo.equipment_id) if wo.equipment_id else None
 
@@ -1375,7 +1416,10 @@ async def run_mrp(db: AsyncSession, tenant_id: Optional[int] = None) -> List[dic
     # اتنفذت الدالة دي جوه executor/thread أو task منفصل مش وارث للسياق).
     if tenant_id is None:
         from app.core.database import current_tenant_id as _ctid_mrp0
-        tenant_id = _ctid_mrp0.get() or 1
+        tenant_id = _ctid_mrp0.get()
+    if tenant_id is None:
+        # fail-closed: ممنوع الرجوع لـ tenant 1 (كان بيعرض بيانات ورشة تانية)
+        return []
 
     # احتياجات أوامر الإنتاج المفتوحة
     open_res = (await db.execute(
@@ -1470,7 +1514,10 @@ async def get_smart_alerts(db: AsyncSession, tenant_id: Optional[int] = None) ->
     # ContextVar فاضية في سياق التنفيذ.
     if tenant_id is None:
         from app.core.database import current_tenant_id as _ctid_alerts0
-        tenant_id = _ctid_alerts0.get() or 1
+        tenant_id = _ctid_alerts0.get()
+    if tenant_id is None:
+        # fail-closed: ممنوع الرجوع لـ tenant 1 (كان بيعرض بيانات ورشة تانية)
+        return []
     alerts = []
 
     # 1. مواد نقص حرج (أقل من 50% من حد إعادة الطلب)

@@ -72,11 +72,13 @@ export default function Users() {
   const { user: me } = useAuth()
   const toast = useToast()
 
-  const { data: users, loading, reload } = useApi(() => api.users.list())
+  const { data: users, loading, error: loadError, reload } = useApi(() => api.users.list())
 
   const [modal, setModal] = useState(null)   // null | { mode: 'add'|'edit', item? }
   const [pwModal, setPwModal] = useState(null)
   const [deleteTarget, setDeleteTarget] = useState(null)
+  const [deactivateTarget, setDeactivateTarget] = useState(null)
+  const [togglingId, setTogglingId] = useState(null)
   const [form, setForm] = useState({})
   const [pwForm, setPwForm] = useState('')
 
@@ -84,22 +86,35 @@ export default function Users() {
   const openEdit = (u) => { setForm({ ...u }); setModal({ mode: 'edit', item: u }) }
 
   const [save, saving] = useAction(async () => {
-    if (!form.username?.trim()) { toast('اسم المستخدم مطلوب', 'error'); return }
+    if (saving) return
+    // الباك (login) بيعمل strip لاسم المستخدم قبل المطابقة — لو اتسجل بمسافة
+    // في الأول/الآخر المستخدم مش هيقدر يدخل أبداً، فنقصّه هنا قبل الإرسال.
+    const username = (form.username || '').trim()
+    if (!username) { toast('اسم المستخدم مطلوب', 'error'); return }
     if (modal?.mode === 'add' && (!form.password || form.password.length < 6)) {
       toast('كلمة المرور 6 أحرف على الأقل', 'error'); return
     }
     if (modal?.mode === 'add' && form.password !== form.confirm_password) {
       toast('كلمة المرور غير متطابقة — تأكد من إدخالها مرتين بشكل صحيح', 'error'); return
     }
-    if (modal?.mode === 'edit') await api.users.update(form.id, { full_name: form.full_name, role: form.role })
-    else await api.users.create({ username: form.username, password: form.password, full_name: form.full_name, role: form.role })
+    if (!form.role || !ROLE_META[form.role]) { toast('اختر دوراً صالحاً', 'error'); return }
+    const fullName = (form.full_name || '').trim()
+    if (modal?.mode === 'edit') {
+      // تنبيه: المدير بيغيّر دوره هو شخصياً لدور أقل — هيفقد صلاحية إدارة المستخدمين فوراً
+      if (form.id === me?.id && modal?.item?.role === 'admin' && form.role !== 'admin') {
+        if (!window.confirm('أنت على وشك إزالة صلاحية المدير من حسابك الحالي — لن تستطيع إدارة المستخدمين بعد ذلك. هل تريد المتابعة؟')) return
+      }
+      await api.users.update(form.id, { full_name: fullName, role: form.role })
+    }
+    else await api.users.create({ username, password: form.password, full_name: fullName || null, role: form.role })
     toast(modal?.mode === 'edit' ? 'تم التحديث' : 'تم إنشاء المستخدم')
     setModal(null)
     reload()
   })
 
   const [resetPw, resetLoading] = useAction(async () => {
-    if (!pwForm || pwForm.length < 6) { toast('كلمة المرور قصيرة', 'error'); return }
+    if (resetLoading) return
+    if (!pwForm || pwForm.length < 6) { toast('كلمة المرور قصيرة (6 أحرف على الأقل)', 'error'); return }
     await api.users.resetPassword(pwModal.id, pwForm)
     toast('تم إعادة تعيين كلمة المرور')
     setPwModal(null)
@@ -107,9 +122,15 @@ export default function Users() {
   })
 
   const [toggleActive] = useAction(async (u) => {
-    await api.users.update(u.id, { is_active: !u.is_active })
-    toast(u.is_active ? 'تم تعطيل الحساب' : 'تم تفعيل الحساب')
-    reload()
+    if (togglingId) return
+    setTogglingId(u.id)
+    try {
+      await api.users.update(u.id, { is_active: !u.is_active })
+      toast(u.is_active ? 'تم تعطيل الحساب' : 'تم تفعيل الحساب')
+      reload()
+    } finally {
+      setTogglingId(null)
+    }
   })
 
   const [doDelete] = useAction(async () => {
@@ -138,9 +159,17 @@ export default function Users() {
         <button className="btn btn-primary btn-sm" onClick={openAdd}>+ مستخدم جديد</button>
       </div>
 
+      {loadError && (
+        <div className="card flex items-center justify-between gap-3 text-sm"
+             style={{ background: 'var(--red-lt)', color: 'var(--red)' }}>
+          <span>تعذّر تحميل المستخدمين: {loadError}</span>
+          <button className="btn btn-sm" onClick={reload}>إعادة المحاولة</button>
+        </div>
+      )}
+
       {/* User cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {!users?.length && (
+        {!users?.length && !loadError && (
           <div className="col-span-3 card text-center text-erp-muted py-12">
             <div className="text-4xl mb-3">👥</div>
             <div className="font-medium mb-1">لا يوجد مستخدمون</div>
@@ -179,7 +208,8 @@ export default function Users() {
                   {!isSelf && (
                     <button
                       className="btn btn-sm text-xs"
-                      onClick={() => toggleActive(u)}
+                      onClick={() => (u.is_active ? setDeactivateTarget(u) : toggleActive(u))}
+                      disabled={togglingId === u.id}
                       title={u.is_active ? 'تعطيل' : 'تفعيل'}
                     >{u.is_active ? '⏸' : '▶️'}</button>
                   )}
@@ -299,6 +329,16 @@ export default function Users() {
         onConfirm={doDelete}
         title="حذف مستخدم"
         message={`هل تريد حذف المستخدم "${deleteTarget?.username}"؟ لا يمكن التراجع.`}
+        danger
+      />
+
+      <ConfirmDialog
+        open={!!deactivateTarget}
+        onClose={() => setDeactivateTarget(null)}
+        onConfirm={() => { const t = deactivateTarget; if (t) toggleActive(t) }}
+        title="تعطيل مستخدم"
+        message={`هل تريد تعطيل حساب "${deactivateTarget?.username}"؟ لن يستطيع تسجيل الدخول حتى يُعاد تفعيله.`}
+        confirmLabel="تعطيل"
         danger
       />
     </div>

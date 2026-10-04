@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, block_viewer_writes
 from app.models.models import (
     SupplyContract, SupplyContractLine, Customer, Quotation, QuotationLine,
     Material, Invoice, InvoiceLine,
@@ -26,7 +26,7 @@ from app.services.invoice_due import sync_invoice_due_date
 router = APIRouter(
     prefix="/supply-contracts",
     tags=["supply_contracts"],
-    dependencies=[Depends(require_any)],
+    dependencies=[Depends(require_any), Depends(block_viewer_writes)],
 )
 print_router = APIRouter(prefix="/supply-contracts", tags=["supply_contracts_print"], dependencies=[Depends(require_any)])
 
@@ -82,10 +82,21 @@ async def _next_code(db: AsyncSession) -> str:
     n = (count or 0) + 1
     while True:
         code = f"SC-{n:04d}"
-        exists = await db.scalar(select(SupplyContract.id).where(SupplyContract.code == code))
+        # عمود code عليه unique=True على مستوى الجدول كله (مش لكل tenant)،
+        # بينما فلتر الـ tenant التلقائي كان بيخلّي الفحص ده يشوف عقود الـ
+        # tenant الحالي بس → tenant تاني بيطلع له SC-0001 مكرر و IntegrityError
+        # (500) عند الحفظ. نفحص عبر كل المستأجرين.
+        exists = await _code_taken(db, code)
         if not exists:
             return code
         n += 1
+
+
+async def _code_taken(db: AsyncSession, code: str) -> bool:
+    return bool(await db.scalar(
+        select(SupplyContract.id).where(SupplyContract.code == code)
+        .execution_options(skip_tenant_filter=True)
+    ))
 
 
 def _contract_dict(c: SupplyContract) -> dict:
@@ -211,8 +222,20 @@ async def create_contract(data: ContractIn, db: AsyncSession = Depends(get_db)):
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
     if data.date and data.valid_until and data.valid_until < data.date:
         raise HTTPException(400, "تاريخ صلاحية العقد يجب أن يكون بعد تاريخه")
-    code = data.code or await _next_code(db)
-    if await db.scalar(select(SupplyContract.id).where(SupplyContract.code == code)):
+    if data.tax_pct is not None and not (Decimal("0") <= data.tax_pct <= Decimal("100")):
+        raise HTTPException(400, "نسبة الضريبة يجب أن تكون بين 0 و 100")
+    if data.discount_amt is not None and data.discount_amt < 0:
+        raise HTTPException(400, "الخصم لا يمكن أن يكون سالباً")
+    if data.warranty_months is not None and data.warranty_months < 0:
+        raise HTTPException(400, "مدة الضمان لا يمكن أن تكون سالبة")
+    for l in data.lines:
+        if not (l.description or "").strip():
+            raise HTTPException(400, "وصف البند مطلوب")
+    _gross = sum(Decimal(str(l.qty)) * Decimal(str(l.unit_price)) for l in data.lines)
+    if data.discount_amt and data.discount_amt > _gross:
+        raise HTTPException(400, "الخصم أكبر من إجمالي البنود")
+    code = (data.code or "").strip() or await _next_code(db)
+    if await _code_taken(db, code):
         raise HTTPException(400, f"كود {code} مستخدم من قبل")
 
     subtotal, tax_amount, total = _calc_totals(
@@ -224,6 +247,12 @@ async def create_contract(data: ContractIn, db: AsyncSession = Depends(get_db)):
     cust_check = await db.get(Customer, data.customer_id)
     if not cust_check or (tid is not None and cust_check.tenant_id != tid):
         raise HTTPException(400, "العميل غير موجود")
+    if data.quotation_id is not None:
+        q_check = await db.get(Quotation, data.quotation_id)
+        if not q_check or (tid is not None and q_check.tenant_id != tid):
+            raise HTTPException(400, "عرض السعر غير موجود")
+        if q_check.customer_id != data.customer_id:
+            raise HTTPException(400, "عرض السعر يخص عميلاً آخر")
     # تحقق أن كل مادة مرتبطة ببند فعلاً تابعة لنفس الـ tenant — من غيره كان
     # ممكن نمرر material_id تخميني تابع لـ tenant تاني، وعند تأكيد التسليم
     # (confirm_delivery) يتصرف من مخزون مادة مش بتاعتنا خالص.
@@ -299,6 +328,12 @@ async def contract_from_quotation(quotation_id: int, db: AsyncSession = Depends(
         raise HTTPException(404, "عرض السعر غير موجود")
     if q.status not in ("sent", "accepted", "draft"):
         raise HTTPException(400, f"لا يمكن تحويل عرض بحالة '{q.status}' إلى عقد")
+    # منع التحويل المكرر لنفس العرض (ضغطتين على الزر = عقدين بنفس البنود)
+    dup = await db.scalar(select(SupplyContract.code).where(
+        SupplyContract.quotation_id == q.id, SupplyContract.status != "cancelled",
+    ))
+    if dup:
+        raise HTTPException(409, f"عرض السعر محوّل بالفعل إلى العقد {dup}")
 
     code = await _next_code(db)
 
@@ -471,6 +506,22 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
         raise HTTPException(400, f"لا يمكن تأكيد التسليم — حالة العقد الحالية: {c.status}. يجب تفعيل العقد أولاً")
     if c.delivery_confirmed:
         raise HTTPException(400, "تم تأكيد التسليم مسبقاً")
+    # حماية من التنفيذ المزدوج المتزامن (ضغطتين/طلبين في نفس اللحظة): نحجز
+    # التسليم بتحديث ذرّي مشروط — الطلب التاني هيلاقي rowcount = 0. من غيره
+    # الطلبين كانوا بيعدّوا الفحص اللي فوق ويصرفوا المخزون مرتين ويعملوا
+    # فاتورتين وقيدين محاسبيين.
+    from sqlalchemy import update as _sa_update, or_ as _or
+    _claim = await db.execute(
+        _sa_update(SupplyContract)
+        .where(
+            SupplyContract.id == c.id,
+            _or(SupplyContract.delivery_confirmed.is_(None), SupplyContract.delivery_confirmed == False),  # noqa: E712
+        )
+        .values(delivery_confirmed=True)
+        .execution_options(synchronize_session=False)
+    )
+    if _claim.rowcount == 0:
+        raise HTTPException(400, "تم تأكيد التسليم مسبقاً")
     delivery_date = body.delivery_date or date.today()
     c.delivery_confirmed = True
     c.delivery_date      = delivery_date
@@ -568,7 +619,10 @@ async def confirm_delivery(contract_id: int, body: DeliveryIn, db: AsyncSession 
     _tid = _ctid.get() or c.tenant_id
     await journal_sales_invoice_create(
         db, _tid, inv.id, inv.code,
-        _D("0"),   # tax_amount — العقد بيحسب الضريبة داخلياً في c.total
+        # c.total شامل الضريبة (subtotal - discount + tax_amount) — كان بيتبعت
+        # هنا 0 فالضريبة كلها كانت بتتقيد إيراد (4100) بدل التزام ضريبي (2310)،
+        # بعكس فواتير المبيعات العادية (sales.py) اللي بتفصلها صح.
+        _D(str(c.tax_amount or 0)),
         c.total,
         delivery_date,
     )
@@ -658,7 +712,7 @@ async def _company(db: AsyncSession) -> dict:
         return {"name": "ورشة معدات الاعلاف", "sub": "", "phone": "",
                 "address": "", "footer": "شكرا لتعاملكم معنا", "logo_html": "", "legal_html": ""}
     logo_html = (
-        f'<img src="{prof.logo_data}" alt="logo" '
+        f'<img src="{_esc(prof.logo_data)}" alt="logo" '
         'style="max-height:80px;max-width:170px;object-fit:contain;display:block;"/>'
         if prof.logo_data else ""
     )
@@ -1314,6 +1368,17 @@ async def save_contract_schedule_template(
     c = (await db.execute(await _tenant_contract_query(contract_id))).scalar_one_or_none()
     if not c:
         raise HTTPException(404, "العقد غير موجود")
+    if c.delivery_confirmed:
+        # القالب بيتحوّل لأقساط فعلية على الفاتورة لحظة تأكيد التسليم — تعديله
+        # بعد كده ما بيأثرش على الفاتورة وبيخلّي الطباعة متضاربة معاها.
+        raise HTTPException(400, "لا يمكن تعديل خطة الأقساط بعد تأكيد التسليم — عدّل أقساط الفاتورة مباشرة")
+    if not data.installments:
+        raise HTTPException(400, "أضف قسطاً واحداً على الأقل")
+    for ins in data.installments:
+        if ins.pct is None or ins.pct <= 0:
+            raise HTTPException(400, "نسبة كل قسط يجب أن تكون أكبر من صفر")
+        if ins.days_offset is not None and ins.days_offset < 0:
+            raise HTTPException(400, "أيام الاستحقاق لا يمكن أن تكون سالبة")
 
     # تحقق مجموع النسب
     total_pct = sum(ins.pct for ins in data.installments)

@@ -21,8 +21,9 @@ export function useApi(fetcher, deps = []) {
       if (mountedRef.current) setData(result)
     } catch (err) {
       if (mountedRef.current) {
-        setError(err.message)
-        toast(err.message, 'error')
+        const msg = err?.message || 'تعذّر تحميل البيانات'
+        setError(msg)
+        toast(msg, 'error')
       }
     } finally {
       if (mountedRef.current) setLoading(false)
@@ -54,7 +55,7 @@ export function useAction(fn) {
       const result = await fn(...args)
       return result
     } catch (err) {
-      toast(err.message || 'حدث خطأ', 'error')
+      toast(err?.message || 'حدث خطأ', 'error')
       return null
     } finally {
       setLoading(false)

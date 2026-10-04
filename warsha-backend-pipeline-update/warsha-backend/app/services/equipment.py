@@ -8,7 +8,106 @@ from app.schemas.schemas import EquipmentCreate, BOMLineCreate, EquipmentTreeOut
 from app.services.nesting import build_bar_cutting_plan, TOL
 
 
+_ALLOWED_LINE_TYPES = ("fixed", "variable")
+_ALLOWED_CALC_UNITS = ("piece", "meter", "ton_hr", "kw")
+_ALLOWED_EQUIP_STATUSES = ("active", "maintenance", "retired", "damaged")
+
+
+def _tid() -> int:
+    from app.core.database import current_tenant_id as _ctid
+    return _ctid.get() or 1
+
+
 class EquipmentService:
+
+    @staticmethod
+    async def get_tenant_equipment(db: AsyncSession, eq_id: int):
+        """المعدة لو تابعة للـ tenant الحالي فقط، وإلا None."""
+        eq = await db.get(Equipment, eq_id)
+        if eq is None or eq.tenant_id != _tid():
+            return None
+        return eq
+
+    @staticmethod
+    async def validate_equipment_payload(db: AsyncSession, payload: dict, tid: int,
+                                         eq_id: int | None = None, existing: Equipment | None = None) -> None:
+        """تحقق مشترك بين الإنشاء والتعديل — يعدّل payload في مكانه (trim/level) ويرمي ValueError."""
+        for key in ("code", "name_ar", "name_en", "serial_number", "cad_drawing_no", "equip_status", "calc_unit"):
+            if isinstance(payload.get(key), str):
+                payload[key] = payload[key].strip()
+        if not payload.get("name_ar"):
+            raise ValueError("اسم المعدة مطلوب")
+        limits = {"code": 50, "name_ar": 200, "name_en": 200, "serial_number": 100,
+                  "cad_drawing_no": 100, "equip_status": 30, "calc_unit": 20}
+        for key, mx in limits.items():
+            v = payload.get(key)
+            if isinstance(v, str) and len(v) > mx:
+                raise ValueError(f"الحقل {key} أطول من المسموح ({mx} حرف)")
+        if payload.get("calc_unit") in (None, ""):
+            payload["calc_unit"] = "piece"
+        elif (payload["calc_unit"] not in _ALLOWED_CALC_UNITS
+              and (existing is None or payload["calc_unit"] != existing.calc_unit)):
+            raise ValueError(f"وحدة الحساب غير صالحة — المسموح: {', '.join(_ALLOWED_CALC_UNITS)}")
+        if payload.get("equip_status") in (None, ""):
+            payload["equip_status"] = "active"
+        elif (payload["equip_status"] not in _ALLOWED_EQUIP_STATUSES
+              and (existing is None or payload["equip_status"] != existing.equip_status)):
+            # قيمة قديمة مخزّنة مسبقاً تفضل مقبولة طالما لم تتغير
+            raise ValueError(f"حالة المعدة غير صالحة — المسموح: {', '.join(_ALLOWED_EQUIP_STATUSES)}")
+        for key in ("weight_kg", "purchase_value", "length_min", "length_max"):
+            v = payload.get(key)
+            if v is not None and v < 0:
+                raise ValueError(f"قيمة {key} لا يمكن أن تكون سالبة")
+        if payload.get("base_qty") is None:
+            payload["base_qty"] = Decimal("1")
+        elif payload["base_qty"] <= 0:
+            raise ValueError("الكمية الأساسية يجب أن تكون أكبر من صفر")
+        lmin, lmax = payload.get("length_min"), payload.get("length_max")
+        if lmin is not None and lmax is not None and lmin > lmax:
+            raise ValueError("الحد الأدنى للطول أكبر من الحد الأقصى")
+
+        # الأب لازم يكون من نفس الـ tenant، ومش المعدة نفسها أو واحدة من فرعياتها (حلقة)
+        parent_id = payload.get("parent_id")
+        if parent_id:
+            parent = await db.get(Equipment, parent_id)
+            if parent is None or parent.tenant_id != tid:
+                raise ValueError("المعدة الأب غير موجودة")
+            if eq_id is not None:
+                cur, seen = parent, set()
+                while cur is not None and cur.id not in seen:
+                    if cur.id == eq_id:
+                        raise ValueError("لا يمكن جعل المعدة تابعة لنفسها أو لإحدى فرعياتها")
+                    seen.add(cur.id)
+                    cur = await db.get(Equipment, cur.parent_id) if cur.parent_id else None
+            payload["level"] = (parent.level or 0) + 1
+        else:
+            payload["parent_id"] = None
+            payload["level"] = 0
+
+        category_id = payload.get("category_id")
+        if category_id:
+            from app.models.models import EquipmentCategory
+            cat = await db.get(EquipmentCategory, category_id)
+            if cat is None or cat.tenant_id != tid:
+                raise ValueError("تصنيف المعدة غير موجود")
+        else:
+            payload["category_id"] = None
+
+    @staticmethod
+    async def refresh_descendant_levels(db: AsyncSession, eq: Equipment) -> None:
+        """بعد نقل معدة لأب جديد — نحدّث level لكل فرعياتها."""
+        stack, seen = [eq], set()
+        while stack:
+            node = stack.pop()
+            if node.id in seen:
+                continue
+            seen.add(node.id)
+            kids = (await db.execute(
+                select(Equipment).where(Equipment.parent_id == node.id, Equipment.tenant_id == node.tenant_id)
+            )).scalars().all()
+            for k in kids:
+                k.level = (node.level or 0) + 1
+                stack.append(k)
 
     @staticmethod
     async def create_equipment(db: AsyncSession, data: EquipmentCreate) -> Equipment:
@@ -17,6 +116,8 @@ class EquipmentService:
         payload = data.model_dump()
         # نحقن tenant_id تلقائياً من context
         payload['tenant_id'] = _ctid_eq.get() or 1
+        if isinstance(payload.get("code"), str):
+            payload["code"] = payload["code"].strip()
         # توليد الكود تلقائياً إن لم يُذكر — لازم يتحسب لكل tenant على حدة
         # (uq_equipment_tenant_code هو القيد الفعلي)، غير كده أول معدة لعميل
         # جديد بتاخد كود غريب بمجرد وجود عملاء تانيين بعدد معدات أكبر.
@@ -35,17 +136,11 @@ class EquipmentService:
                     break
                 n += 1
             payload["code"] = candidate
+        # تحقق (أب/تصنيف من نفس الـ tenant، قيم غير سالبة، مدى طول سليم) + حساب level من الأب
+        await EquipmentService.validate_equipment_payload(db, payload, payload["tenant_id"])
         # default name_en to name_ar if empty
         if not payload.get("name_en"):
             payload["name_en"] = payload.get("name_ar", "")
-        # نحسب الـ level تلقائياً من المعدة الأب
-        if payload.get("parent_id"):
-            parent = await db.get(Equipment, payload["parent_id"])
-            if parent is None:
-                raise ValueError("المعدة الأب غير موجودة")
-            payload["level"] = (parent.level or 0) + 1
-        else:
-            payload["level"] = 0
 
         # محطة 23 (الروادماب الأصلي): لو مربوطة بفاتورة شراء رسمية، القيم
         # بتتحدد من الفاتورة نفسها — مش من إدخال المستخدم الحر — عشان
@@ -122,7 +217,7 @@ class EquipmentService:
         db.add(new_eq)
         await db.flush()
 
-        bom_lines = await db.execute(select(BOMLine).where(BOMLine.equipment_id == src.id))
+        bom_lines = await db.execute(select(BOMLine).where(BOMLine.equipment_id == src.id, BOMLine.tenant_id == tid))
         for line in bom_lines.scalars():
             db.add(BOMLine(
                 tenant_id=tid, equipment_id=new_eq.id, material_id=line.material_id,
@@ -135,8 +230,28 @@ class EquipmentService:
                 scale_dim_length=line.scale_dim_length,
             ))
 
-        children = await db.execute(select(Equipment).where(Equipment.parent_id == src.id))
-        for child in children.scalars():
+        # التكاليف الثابتة والأبعاد جزء من تعريف المعدة — بدونها تكلفة النسخة
+        # بتطلع أقل من الأصل في الحساب البارامتري.
+        cost_lines = await db.execute(
+            select(EquipmentCostLine).where(EquipmentCostLine.equipment_id == src.id, EquipmentCostLine.tenant_id == tid)
+        )
+        for cl in cost_lines.scalars().all():
+            db.add(EquipmentCostLine(
+                tenant_id=tid, equipment_id=new_eq.id, cost_type=cl.cost_type,
+                description=cl.description, cost_per_unit=cl.cost_per_unit,
+            ))
+        dims = await db.execute(
+            select(EquipmentDimension).where(EquipmentDimension.equipment_id == src.id, EquipmentDimension.tenant_id == tid)
+        )
+        for d in dims.scalars().all():
+            db.add(EquipmentDimension(
+                tenant_id=tid, equipment_id=new_eq.id, dim_key=d.dim_key, dim_value=d.dim_value, unit=d.unit,
+            ))
+
+        children = await db.execute(
+            select(Equipment).where(Equipment.parent_id == src.id, Equipment.tenant_id == tid).order_by(Equipment.id)
+        )
+        for child in children.scalars().all():
             child_code = await EquipmentService._unique_code(db, tid, f"{new_code}-{child.code}")
             await EquipmentService._duplicate_subtree(db, child, tid, child_code, new_eq.id)
 
@@ -147,6 +262,13 @@ class EquipmentService:
         """نسخ معدة مع كل فرعياتها (recursively) وبنود BOM الخاصة بكل مستوى، بكود جديد"""
         from app.core.database import current_tenant_id as _ctid_dup
         tid = _ctid_dup.get() or 1
+        new_code = (new_code or "").strip()
+        if not new_code:
+            raise ValueError("أدخل كوداً جديداً للمعدة المنسوخة")
+        if len(new_code) > 50:
+            raise ValueError("الكود أطول من المسموح (50 حرف)")
+        if new_name_ar is not None:
+            new_name_ar = str(new_name_ar).strip()[:200] or None
 
         src = await db.get(Equipment, eq_id)
         if src is None or src.tenant_id != tid:
@@ -168,7 +290,7 @@ class EquipmentService:
     async def get_direct_children(db: AsyncSession, parent_id: int):
         result = await db.execute(
             select(Equipment)
-            .where(Equipment.parent_id == parent_id)
+            .where(Equipment.parent_id == parent_id, Equipment.tenant_id == _tid())
             .order_by(Equipment.id)
         )
         return result.scalars().all()
@@ -191,7 +313,7 @@ class EquipmentService:
 
         children_result = await db.execute(
             select(Equipment)
-            .where(Equipment.parent_id == eq.id)
+            .where(Equipment.parent_id == eq.id, Equipment.tenant_id == eq.tenant_id)
             .order_by(Equipment.id)
         )
         children_rows = children_result.scalars().all()
@@ -254,8 +376,9 @@ class EquipmentService:
         if equipment is None or equipment.tenant_id != tid_bom:
             raise ValueError("المعدة غير موجودة — لا يمكن إضافة BOM")
         material = await db.get(Material, data.material_id)
-        if material is None:
+        if material is None or material.tenant_id != tid_bom:
             raise ValueError("المادة غير موجودة")
+        EquipmentService.validate_bom_values(payload)
         qty = data.qty
         waste_kg = (data.waste_g or Decimal("0")) / Decimal("1000")
 
@@ -271,6 +394,8 @@ class EquipmentService:
             qty = (data.bar_length_cm / 100) * material.weight_per_meter_kg * count + waste_kg
             payload["calc_weight_kg"] = qty
 
+        if qty is None or qty <= 0:
+            raise ValueError("الكمية يجب أن تكون أكبر من صفر")
         payload["qty"] = qty
         total = qty * data.unit_cost
         line = BOMLine(**payload, total_cost=total)
@@ -278,6 +403,20 @@ class EquipmentService:
         await db.commit()
         await db.refresh(line)
         return line
+
+    @staticmethod
+    def validate_bom_values(values: dict) -> None:
+        """قيم سطر BOM: لا سالب، نوع بند صالح، ملاحظات بطول معقول."""
+        for key in ("qty", "unit_cost", "dim_length_cm", "dim_width_cm", "bar_length_cm", "waste_g", "dim_count"):
+            v = values.get(key)
+            if v is not None and v < 0:
+                raise ValueError(f"قيمة {key} لا يمكن أن تكون سالبة")
+        lt = values.get("line_type")
+        if lt is not None and lt not in _ALLOWED_LINE_TYPES:
+            raise ValueError("نوع البند يجب أن يكون fixed أو variable")
+        notes = values.get("notes")
+        if isinstance(notes, str) and len(notes) > 300:
+            raise ValueError("الملاحظات أطول من المسموح (300 حرف)")
 
     @staticmethod
     async def get_bom(db: AsyncSession, equipment_id: int):
@@ -299,12 +438,12 @@ class EquipmentService:
                 selectinload(BOMLine.material),
                 selectinload(BOMLine.equipment),
             )
-            .where(BOMLine.equipment_id == equipment_id)
+            .where(BOMLine.equipment_id == equipment_id, BOMLine.tenant_id == _tid())
         )
         lines = lines_result.scalars().all()
 
         children_result = await db.execute(
-            select(Equipment).where(Equipment.parent_id == equipment_id).order_by(Equipment.id)
+            select(Equipment).where(Equipment.parent_id == equipment_id, Equipment.tenant_id == _tid()).order_by(Equipment.id)
         )
         children = children_result.scalars().all()
         for child in children:
@@ -320,12 +459,13 @@ class EquipmentService:
         visited.add(equipment_id)
 
         lines_result = await db.execute(
-            select(EquipmentCostLine).where(EquipmentCostLine.equipment_id == equipment_id)
+            select(EquipmentCostLine).where(EquipmentCostLine.equipment_id == equipment_id,
+                                            EquipmentCostLine.tenant_id == _tid())
         )
         lines = list(lines_result.scalars().all())
 
         children_result = await db.execute(
-            select(Equipment).where(Equipment.parent_id == equipment_id).order_by(Equipment.id)
+            select(Equipment).where(Equipment.parent_id == equipment_id, Equipment.tenant_id == _tid()).order_by(Equipment.id)
         )
         children = children_result.scalars().all()
         for child in children:
@@ -410,8 +550,10 @@ class EquipmentService:
                                              quantity: Decimal = Decimal("1")) -> dict:
         """حساب تكلفة BOM لمعدة مترية عند طول مختار L داخل [length_min, length_max]."""
         equipment = await db.get(Equipment, equipment_id)
-        if equipment is None:
+        if equipment is None or equipment.tenant_id != _tid():
             raise ValueError("المعدة غير موجودة")
+        if length is None or length <= 0:
+            raise ValueError("الطول يجب أن يكون أكبر من صفر")
         if equipment.length_min is not None and length < equipment.length_min:
             raise ValueError(f"الطول خارج النطاق المسموح للصنف ({equipment.length_min} - {equipment.length_max})")
         if equipment.length_max is not None and length > equipment.length_max:
@@ -550,14 +692,16 @@ class EquipmentService:
         if mat_ids:
             sheet_rows = (await db.execute(
                 select(SheetStockItem.material_id, func.sum(SheetStockItem.length_cm * SheetStockItem.width_cm * SheetStockItem.qty))
-                .where(SheetStockItem.material_id.in_(mat_ids), SheetStockItem.source == "remnant")
+                .where(SheetStockItem.material_id.in_(mat_ids), SheetStockItem.source == "remnant",
+                       SheetStockItem.tenant_id == _tid())
                 .group_by(SheetStockItem.material_id)
             )).all()
             remnant_sheet_area = {mid: float(total) / 10000 for mid, total in sheet_rows if total}
 
             bar_rows = (await db.execute(
                 select(BarStockItem.material_id, func.sum(BarStockItem.length_cm * BarStockItem.qty))
-                .where(BarStockItem.material_id.in_(mat_ids), BarStockItem.source == "remnant")
+                .where(BarStockItem.material_id.in_(mat_ids), BarStockItem.source == "remnant",
+                       BarStockItem.tenant_id == _tid())
                 .group_by(BarStockItem.material_id)
             )).all()
             remnant_bar_length = {mid: float(total) for mid, total in bar_rows if total}
@@ -710,6 +854,16 @@ class EquipmentService:
         equipment = await db.get(Equipment, equipment_id)
         if equipment is None or equipment.tenant_id != (_ctid_acl.get() or 1):
             raise ValueError("المعدة غير موجودة")
+        description = (description or "").strip()
+        cost_type = (cost_type or "").strip()
+        if not description:
+            raise ValueError("الوصف مطلوب")
+        if len(description) > 300:
+            raise ValueError("الوصف أطول من المسموح (300 حرف)")
+        if not cost_type or len(cost_type) > 30:
+            raise ValueError("نوع التكلفة غير صالح")
+        if cost_per_unit is None or cost_per_unit < 0:
+            raise ValueError("التكلفة لا يمكن أن تكون سالبة")
         line = EquipmentCostLine(
             equipment_id=equipment_id,
             tenant_id=equipment.tenant_id,
@@ -726,7 +880,7 @@ class EquipmentService:
     async def list_cost_lines(db: AsyncSession, equipment_id: int) -> list:
         result = await db.execute(
             select(EquipmentCostLine)
-            .where(EquipmentCostLine.equipment_id == equipment_id)
+            .where(EquipmentCostLine.equipment_id == equipment_id, EquipmentCostLine.tenant_id == _tid())
             .order_by(EquipmentCostLine.id)
         )
         return result.scalars().all()
@@ -734,7 +888,7 @@ class EquipmentService:
     @staticmethod
     async def delete_cost_line(db: AsyncSession, cost_line_id: int) -> None:
         line = await db.get(EquipmentCostLine, cost_line_id)
-        if line is None:
+        if line is None or line.tenant_id != _tid():
             raise ValueError("بند التكلفة غير موجود")
         await db.delete(line)
         await db.commit()
@@ -742,7 +896,17 @@ class EquipmentService:
     @staticmethod
     async def add_dimension(db: AsyncSession, equipment_id: int,
                             dim_key: str, dim_value: str, unit: str):
-        dim = EquipmentDimension(equipment_id=equipment_id, dim_key=dim_key,
+        equipment = await db.get(Equipment, equipment_id)
+        if equipment is None or equipment.tenant_id != _tid():
+            raise LookupError("المعدة غير موجودة")
+        dim_key = (dim_key or "").strip()
+        dim_value = (dim_value or "").strip()
+        unit = (unit or "").strip()
+        if not dim_key or not dim_value:
+            raise ValueError("اسم البُعد وقيمته مطلوبان")
+        if len(dim_key) > 80 or len(dim_value) > 80 or len(unit) > 20:
+            raise ValueError("قيمة البُعد أطول من المسموح")
+        dim = EquipmentDimension(tenant_id=equipment.tenant_id, equipment_id=equipment_id, dim_key=dim_key,
                                  dim_value=dim_value, unit=unit)
         db.add(dim)
         await db.commit()

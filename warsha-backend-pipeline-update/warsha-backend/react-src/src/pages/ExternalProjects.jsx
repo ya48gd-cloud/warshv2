@@ -64,6 +64,22 @@ const TOOL_TYPES = {
 }
 
 // ── helpers ───────────────────────────────────────────────────
+// التاريخ المحلي YYYY-MM-DD (today() في utils بيرجع UTC فممكن يطلع يوم غلط بعد منتصف الليل)
+const localToday = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+// رقم غير سالب (القيمة الفاضية = صفر)
+const isNonNeg = (v) => v === '' || v == null || (Number.isFinite(Number(v)) && Number(v) >= 0)
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100
+
+const EMPTY_PROJECT_FORM = () => ({
+  code: '', title: '', project_type: 'installation', client_id: '', location_id: '',
+  governorate: '', city: '', address: '', distance_km: '',
+  contract_value: '', planned_start: localToday(), planned_end: '',
+  warranty_months: 12, description: '', notes: '',
+})
+
 const badge = (map, val) => {
   const s = map[val] || { label: val, cls: 'badge-gray' }
   return <span className={`badge ${s.cls}`}>{s.label}</span>
@@ -78,19 +94,14 @@ export default function ExternalProjects() {
   const toast = useToast()
 
   const { data: projects, loading, reload } = useApi(() => api.extProjects.list())
-  const { data: dashboard } = useApi(() => api.extProjects.dashboard())
+  const { data: dashboard, reload: reloadDashboard } = useApi(() => api.extProjects.dashboard())
   const { data: customers } = useApi(() => api.customers.list())
 
   const [selected, setSelected] = useState(null)  // فتح صفحة تفاصيل
   const [modal, setModal] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null) // { fn, msg }
   const [filterStatus, setFilterStatus] = useState('all')
-  const [form, setForm] = useState({
-    code: '', title: '', project_type: 'installation', client_id: '', location_id: '',
-    governorate: '', city: '', address: '', distance_km: '',
-    contract_value: '', planned_start: today(), planned_end: '',
-    warranty_months: 12, description: '', notes: '',
-  })
+  const [form, setForm] = useState(EMPTY_PROJECT_FORM)
 
   // مواقع العميل المختار
   const [projLocations, setProjLocations] = useState([])
@@ -112,26 +123,35 @@ export default function ExternalProjects() {
     if (form.planned_start && form.planned_end && form.planned_end < form.planned_start) {
       toast('تاريخ الانتهاء المخطط لازم يكون بعد تاريخ البدء', 'error'); return
     }
+    if (!isNonNeg(form.contract_value)) { toast('قيمة العقد لا يمكن أن تكون سالبة', 'error'); return }
+    if (!isNonNeg(form.distance_km))    { toast('المسافة لا يمكن أن تكون سالبة', 'error'); return }
+    // كان +x || 12 بيحوّل صفر (بدون ضمان) لـ 12 شهر بصمت
+    const wm = form.warranty_months === '' || form.warranty_months == null ? 12 : Number(form.warranty_months)
+    if (!Number.isInteger(wm) || wm < 0) { toast('مدة الضمان لازم تكون عدد صحيح من الشهور (صفر أو أكثر)', 'error'); return }
     await api.extProjects.create({
       ...form,
+      code: form.code.trim(),
+      title: form.title.trim(),
       client_id: +form.client_id,
       location_id: form.location_id ? +form.location_id : null,
       contract_value: +form.contract_value || 0,
       distance_km: form.distance_km ? +form.distance_km : null,
-      warranty_months: +form.warranty_months || 12,
+      warranty_months: wm,
       planned_start: form.planned_start || null,
       planned_end: form.planned_end || null,
     })
     toast('✅ تم إنشاء المشروع')
     setModal(false)
-    reload()
+    // تفريغ النموذج — كان بيفتح المرة الجاية بنفس الكود فيرجع "الكود مستخدم"
+    setForm(EMPTY_PROJECT_FORM())
+    reload(); reloadDashboard()
   })
 
   if (loading) return <PageSpinner />
   if (selected) return (
     <ProjectDetail
       projectId={selected}
-      onBack={() => { setSelected(null); reload() }}
+      onBack={() => { setSelected(null); reload(); reloadDashboard() }}
     />
   )
 
@@ -228,7 +248,7 @@ export default function ExternalProjects() {
                 {projLocations.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
               </Select>
             )}
-            <Input label="قيمة العقد (ج)" type="number" value={form.contract_value}
+            <Input label="قيمة العقد (ج)" type="number" min="0" value={form.contract_value}
               onChange={e => setForm(f => ({ ...f, contract_value: e.target.value }))} />
           </FormGrid>
           <FormGrid cols={3}>
@@ -236,7 +256,7 @@ export default function ExternalProjects() {
               onChange={e => setForm(f => ({ ...f, governorate: e.target.value }))} />
             <Input label="المدينة" value={form.city}
               onChange={e => setForm(f => ({ ...f, city: e.target.value }))} />
-            <Input label="المسافة (كم)" type="number" value={form.distance_km}
+            <Input label="المسافة (كم)" type="number" min="0" value={form.distance_km}
               onChange={e => setForm(f => ({ ...f, distance_km: e.target.value }))} />
           </FormGrid>
           <FormGrid cols={2}>
@@ -282,7 +302,7 @@ function ProjectCard({ project: p, onClick }) {
       <div className="text-xs text-erp-muted mb-3">
         🏢 {p.client_name}
         {p.city && ` | 📍 ${p.city}${p.governorate ? '، ' + p.governorate : ''}`}
-        {p.distance_km && ` | 🛣️ ${p.distance_km} كم`}
+        {p.distance_km > 0 && ` | 🛣️ ${p.distance_km} كم`}
       </div>
 
       {/* Progress bar */}
@@ -346,13 +366,17 @@ function ProjectDetail({ projectId, onBack }) {
 
   const [statusLoading, setStatusLoading] = useState(false)
   const changeStatus = async (status) => {
+    if (status === p?.status) return
+    // الإغلاق/الإلغاء مش بيترجعوا بسهولة (وبيسجلوا تاريخ انتهاء فعلي وحركة أصل) — تأكيد أولاً
+    if (['cancelled', 'closed'].includes(status) &&
+        !window.confirm(`تغيير حالة المشروع إلى "${STATUS_MAP[status]?.label || status}"؟`)) return
     setStatusLoading(true)
     try {
       await api.extProjects.updateStatus(projectId, status)
       toast('✅ تم تحديث الحالة')
       reload()
     } catch (e) {
-      toast(e.message, 'error')
+      toast(e.message || 'فشل تحديث الحالة', 'error')
     } finally {
       setStatusLoading(false)
     }
@@ -368,11 +392,11 @@ function ProjectDetail({ projectId, onBack }) {
         customer_id:      p.client_id,
         project_name:     p.title,
         project_location: loc || null,
-        date:             today(),
+        date:             localToday(),
         start_date:       p.actual_start || p.planned_start || null,
         end_date:         p.actual_end   || p.planned_end   || null,
         contract_value:   p.contract_value || 0,
-        warranty_months:  p.warranty_months || 12,
+        warranty_months:  p.warranty_months ?? 12,
         scope_summary:    p.description || null,
         items:            [],
       })
@@ -416,7 +440,7 @@ function ProjectDetail({ projectId, onBack }) {
                 🏢 {p.client_name}
                 {p.city && ` | 📍 ${p.city}`}
                 {p.governorate && `، ${p.governorate}`}
-                {p.distance_km && ` | 🛣️ ${p.distance_km} كم`}
+                {p.distance_km > 0 && ` | 🛣️ ${p.distance_km} كم`}
               </div>
             </div>
           </div>
@@ -602,26 +626,28 @@ function TabOverview({ p }) {
 function TabTeam({ p, workers, write, toast, reload }) {
   const [modal, setModal] = useState(false)
   const [advModal, setAdvModal] = useState(null)  // member for advance
-  const [form, setForm] = useState({ worker_id: '', role: 'فني', daily_rate: '', planned_days: '', joined_date: today() })
+  const [form, setForm] = useState({ worker_id: '', role: 'فني', daily_rate: '', planned_days: '', joined_date: localToday() })
   const [advAmount, setAdvAmount] = useState('')
 
   const [save, saving] = useAction(async () => {
     if (!form.worker_id || !form.daily_rate || Number(form.daily_rate) <= 0) { toast('اختر العامل وأدخل أجر يومي أكبر من صفر', 'error'); return }
-    // اجر الورشة الأساسي للمقارنة
-    const w = workers?.find(x => x.id === +form.worker_id)
+    const pd = form.planned_days === '' ? 0 : Number(form.planned_days)
+    if (!Number.isInteger(pd) || pd < 0) { toast('الأيام المخططة لازم تكون عدد صحيح (صفر أو أكثر)', 'error'); return }
     await api.extProjects.addMember(p.id, {
       ...form,
       worker_id: +form.worker_id,
       daily_rate: +form.daily_rate,
-      planned_days: +form.planned_days || 0,
+      planned_days: pd,
+      joined_date: form.joined_date || null,   // '' كانت بترجع 422
     })
     toast('✅ تمت إضافة العامل للفريق')
     setModal(false)
+    setForm({ worker_id: '', role: 'فني', daily_rate: '', planned_days: '', joined_date: localToday() })
     reload()
   })
 
   const [saveAdv, savingAdv] = useAction(async () => {
-    if (!advAmount) { toast('أدخل المبلغ', 'error'); return }
+    if (!advAmount || !Number.isFinite(Number(advAmount)) || Number(advAmount) <= 0) { toast('أدخل مبلغ أكبر من صفر', 'error'); return }
     await api.extProjects.addSiteAdvance(p.id, advModal.id, +advAmount)
     toast('✅ تم تسجيل السلفة')
     setAdvModal(null)
@@ -636,9 +662,9 @@ function TabTeam({ p, workers, write, toast, reload }) {
     reload()
   })
 
-  const totalLaborGross = (p.team || []).reduce((s, m) => s + m.gross_amount, 0)
-  const totalAdvances   = (p.team || []).reduce((s, m) => s + m.site_advances, 0)
-  const totalNet        = (p.team || []).reduce((s, m) => s + m.net_amount, 0)
+  const totalLaborGross = (p.team || []).reduce((s, m) => s + (Number(m.gross_amount) || 0), 0)
+  const totalAdvances   = (p.team || []).reduce((s, m) => s + (Number(m.site_advances) || 0), 0)
+  const totalNet        = (p.team || []).reduce((s, m) => s + (Number(m.net_amount) || 0), 0)
 
   return (
     <div className="flex flex-col gap-4">
@@ -731,10 +757,10 @@ function TabTeam({ p, workers, write, toast, reload }) {
             onChange={e => setForm(f => ({ ...f, role: e.target.value }))}
             placeholder="مثال: لحام رئيسي / كهربائي / مساعد" />
           <FormGrid cols={2}>
-            <Input label="الأجر اليومي للمشروع (ج) *" type="number" value={form.daily_rate}
+            <Input label="الأجر اليومي للمشروع (ج) *" type="number" min="0" value={form.daily_rate}
               onChange={e => setForm(f => ({ ...f, daily_rate: e.target.value }))}
               placeholder="شامل بدل السفر والمعيشة" />
-            <Input label="الأيام المخططة" type="number" value={form.planned_days}
+            <Input label="الأيام المخططة" type="number" min="0" step="1" value={form.planned_days}
               onChange={e => setForm(f => ({ ...f, planned_days: e.target.value }))} />
           </FormGrid>
           <Input label="تاريخ الانضمام" type="date" value={form.joined_date}
@@ -748,7 +774,7 @@ function TabTeam({ p, workers, write, toast, reload }) {
 
       {/* Modal سلفة */}
       <Modal open={!!advModal} onClose={() => setAdvModal(null)} title={`سلفة في الموقع — ${advModal?.worker_name}`} size="sm">
-        <Input label="المبلغ (ج) *" type="number" value={advAmount}
+        <Input label="المبلغ (ج) *" type="number" min="0" value={advAmount}
           onChange={e => setAdvAmount(e.target.value)} />
         <ModalFooter>
           <button className="btn" onClick={() => setAdvModal(null)}>إلغاء</button>
@@ -761,7 +787,7 @@ function TabTeam({ p, workers, write, toast, reload }) {
 
 // ── Tab: Attendance ───────────────────────────────────────────
 function TabAttendance({ p, write, toast, reload }) {
-  const [selDate, setSelDate] = useState(today())
+  const [selDate, setSelDate] = useState(localToday())
   const { data: attData, reload: reloadAtt } = useApi(
     () => api.extProjects.getAttendance(p.id, selDate),
     [p.id, selDate]
@@ -780,6 +806,7 @@ function TabAttendance({ p, write, toast, reload }) {
   }
 
   const [saveBulk, saving] = useAction(async () => {
+    if (!selDate) { toast('اختر تاريخ الحضور', 'error'); return }
     const records = Object.entries(bulk).map(([wid, status]) => ({
       worker_id: +wid, status,
     }))
@@ -882,19 +909,25 @@ function TabTools({ p, write, toast, reload }) {
   const [modal, setModal] = useState(false)
   const [retModal, setRetModal] = useState(null)
   const [confirmAction, setConfirmAction] = useState(null)
-  const [form, setForm] = useState({ tool_name: '', tool_type: 'hand_tool', quantity: 1, unit: 'قطعة', condition_out: 'good', withdrawn_date: today() })
+  const [form, setForm] = useState({ tool_name: '', tool_type: 'hand_tool', quantity: 1, unit: 'قطعة', condition_out: 'good', withdrawn_date: localToday() })
   const [retForm, setRetForm] = useState({ returned_qty: '', condition_in: 'good' })
 
   const [save, saving] = useAction(async () => {
-    if (!form.tool_name) { toast('أدخل اسم الأداة', 'error'); return }
-    await api.extProjects.addTool(p.id, form)
+    if (!String(form.tool_name || '').trim()) { toast('أدخل اسم الأداة', 'error'); return }
+    const qty = Number(form.quantity)
+    if (form.quantity === '' || !Number.isFinite(qty) || qty <= 0) { toast('الكمية يجب أن تكون أكبر من صفر', 'error'); return }
+    await api.extProjects.addTool(p.id, { ...form, tool_name: form.tool_name.trim(), quantity: qty, withdrawn_date: form.withdrawn_date || null })
     toast('✅ تمت الإضافة')
     setModal(false)
+    setForm({ tool_name: '', tool_type: 'hand_tool', quantity: 1, unit: 'قطعة', condition_out: 'good', withdrawn_date: localToday() })
     reload()
   })
 
   const [returnTool, returning] = useAction(async () => {
-    await api.extProjects.returnTool(p.id, retModal.id, retForm)
+    const rq = Number(retForm.returned_qty)
+    if (retForm.returned_qty === '' || !Number.isFinite(rq) || rq < 0) { toast('أدخل الكمية المرجعة (صفر أو أكثر)', 'error'); return }
+    if (rq > Number(retModal.quantity) + 1e-9) { toast(`الكمية المرجعة (${rq}) أكبر من الكمية المسحوبة (${retModal.quantity})`, 'error'); return }
+    await api.extProjects.returnTool(p.id, retModal.id, { ...retForm, returned_qty: rq })
     toast('✅ تم تسجيل الإرجاع')
     setRetModal(null)
     reload()
@@ -974,7 +1007,7 @@ function TabTools({ p, write, toast, reload }) {
             </Select>
           </FormGrid>
           <FormGrid cols={2}>
-            <Input label="الكمية" type="number" step="1" value={form.quantity}
+            <Input label="الكمية" type="number" step="1" min="1" value={form.quantity}
               onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))} />
             <Input label="تاريخ الخروج" type="date" value={form.withdrawn_date}
               onChange={e => setForm(f => ({ ...f, withdrawn_date: e.target.value }))} />
@@ -988,7 +1021,7 @@ function TabTools({ p, write, toast, reload }) {
 
       <Modal open={!!retModal} onClose={() => setRetModal(null)} title={`إرجاع: ${retModal?.tool_name}`} size="sm">
         <div className="flex flex-col gap-3">
-          <Input label="الكمية المرجعة" type="number" value={retForm.returned_qty}
+          <Input label="الكمية المرجعة" type="number" min="0" max={retModal?.quantity} value={retForm.returned_qty}
             onChange={e => setRetForm(f => ({ ...f, returned_qty: e.target.value }))} />
           <Select label="الحالة عند الإرجاع" value={retForm.condition_in}
             onChange={e => setRetForm(f => ({ ...f, condition_in: e.target.value }))}>
@@ -1006,6 +1039,9 @@ function TabTools({ p, write, toast, reload }) {
 
       <ConfirmDialog
         open={!!confirmAction}
+        title="تأكيد الحذف"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         message={confirmAction?.msg || 'هل تريد الحذف؟'}
         onConfirm={() => { confirmAction?.fn(); setConfirmAction(null) }}
         onCancel={() => setConfirmAction(null)}
@@ -1018,11 +1054,21 @@ function TabTools({ p, write, toast, reload }) {
 function TabMaterials({ p, materials, write, toast, reload }) {
   const [modal, setModal] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
-  const [form, setForm] = useState({ source: 'stock', material_id: '', description: '', quantity: '', unit: 'قطعة', unit_cost: '', usage_date: today() })
+  const [form, setForm] = useState({ source: 'stock', material_id: '', description: '', quantity: '', unit: 'قطعة', unit_cost: '', usage_date: localToday() })
 
   const [save, saving] = useAction(async () => {
     if (!form.description && !form.material_id) { toast('أدخل وصف المادة', 'error'); return }
     if (!form.quantity || Number(form.quantity) <= 0) { toast('أدخل كمية أكبر من صفر', 'error'); return }
+    if (!String(form.description || '').trim()) { toast('أدخل وصف المادة', 'error'); return }
+    if (!form.usage_date) { toast('أدخل تاريخ الاستخدام', 'error'); return }
+    if (!isNonNeg(form.unit_cost)) { toast('سعر الوحدة لا يمكن أن يكون سالباً', 'error'); return }
+    if (form.source === 'stock' && form.material_id) {
+      const mat = (Array.isArray(materials) ? materials : []).find(x => String(x.id) === String(form.material_id))
+      const avail = mat ? Number(mat.available_qty ?? mat.stock_qty) : NaN
+      if (Number.isFinite(avail) && Number(form.quantity) > avail + 1e-9) {
+        toast(`الكمية المطلوبة (${form.quantity}) أكبر من المتاح بالمخزون (${avail})`, 'error'); return
+      }
+    }
     await api.extProjects.addMaterial(p.id, {
       ...form,
       material_id: form.material_id ? +form.material_id : null,
@@ -1031,6 +1077,7 @@ function TabMaterials({ p, materials, write, toast, reload }) {
     })
     toast('✅ تمت الإضافة')
     setModal(false)
+    setForm({ source: 'stock', material_id: '', description: '', quantity: '', unit: 'قطعة', unit_cost: '', usage_date: localToday() })
     reload()
   })
 
@@ -1040,8 +1087,8 @@ function TabMaterials({ p, materials, write, toast, reload }) {
     reload()
   })
 
-  const stockTotal = (p.materials || []).filter(m => m.source === 'stock').reduce((s, m) => s + m.total_cost, 0)
-  const localTotal = (p.materials || []).filter(m => m.source === 'local_purchase').reduce((s, m) => s + m.total_cost, 0)
+  const stockTotal = (p.materials || []).filter(m => m.source === 'stock').reduce((s, m) => s + (Number(m.total_cost) || 0), 0)
+  const localTotal = (p.materials || []).filter(m => m.source === 'local_purchase').reduce((s, m) => s + (Number(m.total_cost) || 0), 0)
 
   return (
     <div className="flex flex-col gap-4">
@@ -1100,15 +1147,20 @@ function TabMaterials({ p, materials, write, toast, reload }) {
                 setForm(f => ({ ...f, material_id: e.target.value, description: mat?.name_ar || f.description, unit_cost: mat?.unit_cost || f.unit_cost, unit: mat?.unit || f.unit }))
               }}>
               <option value="">— اختر من المخزون —</option>
-              {materials?.map(m => <option key={m.id} value={m.id}>{m.name_ar} ({m.unit}) — {egp(m.unit_cost)}</option>)}
+              {(Array.isArray(materials) ? materials : []).map(m => (
+                <option key={m.id} value={m.id}>
+                  {m.name_ar} ({m.unit}) — {egp(m.unit_cost)}
+                  {(m.available_qty ?? m.stock_qty) != null ? ` — متاح: ${Number(m.available_qty ?? m.stock_qty)}` : ''}
+                </option>
+              ))}
             </Select>
           )}
           <Input label="الوصف *" value={form.description}
             onChange={e => setForm(f => ({ ...f, description: e.target.value }))} />
           <FormGrid cols={3}>
-            <Input label="الكمية *" type="number" step="0.01" value={form.quantity}
+            <Input label="الكمية *" type="number" step="0.01" min="0" value={form.quantity}
               onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))} />
-            <Input label="سعر الوحدة (ج)" type="number" step="0.01" value={form.unit_cost}
+            <Input label="سعر الوحدة (ج)" type="number" step="0.01" min="0" value={form.unit_cost}
               onChange={e => setForm(f => ({ ...f, unit_cost: e.target.value }))} />
             <Input label="التاريخ" type="date" value={form.usage_date}
               onChange={e => setForm(f => ({ ...f, usage_date: e.target.value }))} />
@@ -1122,6 +1174,9 @@ function TabMaterials({ p, materials, write, toast, reload }) {
 
       <ConfirmDialog
         open={!!confirmAction}
+        title="تأكيد الحذف"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         message={confirmAction?.msg || 'هل تريد الحذف؟'}
         onConfirm={() => { confirmAction?.fn(); setConfirmAction(null) }}
         onCancel={() => setConfirmAction(null)}
@@ -1134,13 +1189,23 @@ function TabMaterials({ p, materials, write, toast, reload }) {
 function TabTrips({ p, write, toast, reload }) {
   const [modal, setModal] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
+  const EMPTY_TRIP = () => ({
+    trip_date: localToday(), trip_type: 'team_go', vehicle_type: 'company_van',
+    vehicle_plate: '', driver_name: '', from_location: 'الورشة', to_location: '',
+    distance_km: '', passengers: 1, fuel_cost: '', toll_cost: 0, rental_cost: 0, other_cost: 0,
+  })
   const [form, setForm] = useState({
-    trip_date: today(), trip_type: 'team_go', vehicle_type: 'company_van',
+    trip_date: localToday(), trip_type: 'team_go', vehicle_type: 'company_van',
     vehicle_plate: '', driver_name: '', from_location: 'الورشة', to_location: '',
     distance_km: '', passengers: 1, fuel_cost: '', toll_cost: 0, rental_cost: 0, other_cost: 0,
   })
 
   const [save, saving] = useAction(async () => {
+    if (!form.trip_date) { toast('أدخل تاريخ الرحلة', 'error'); return }
+    for (const [k, label] of [['fuel_cost', 'الوقود'], ['toll_cost', 'الأوتوستراد'], ['rental_cost', 'الإيجار'], ['other_cost', 'التكاليف الأخرى'], ['distance_km', 'المسافة']]) {
+      if (!isNonNeg(form[k])) { toast(`${label} لا يمكن أن يكون سالباً`, 'error'); return }
+    }
+    if (!isNonNeg(form.passengers) || !Number.isInteger(Number(form.passengers || 0))) { toast('عدد الأفراد لازم يكون عدد صحيح (صفر أو أكثر)', 'error'); return }
     await api.extProjects.addTrip(p.id, {
       ...form,
       passengers: +form.passengers || 1,
@@ -1152,6 +1217,7 @@ function TabTrips({ p, write, toast, reload }) {
     })
     toast('✅ تمت الإضافة')
     setModal(false)
+    setForm(EMPTY_TRIP())
     reload()
   })
 
@@ -1161,7 +1227,7 @@ function TabTrips({ p, write, toast, reload }) {
     reload()
   })
 
-  const totalTrips = (p.trips || []).reduce((s, t) => s + t.total_cost, 0)
+  const totalTrips = (p.trips || []).reduce((s, t) => s + (Number(t.total_cost) || 0), 0)
 
   return (
     <div className="flex flex-col gap-4">
@@ -1250,6 +1316,9 @@ function TabTrips({ p, write, toast, reload }) {
 
       <ConfirmDialog
         open={!!confirmAction}
+        title="تأكيد الحذف"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         message={confirmAction?.msg || 'هل تريد الحذف؟'}
         onConfirm={() => { confirmAction?.fn(); setConfirmAction(null) }}
         onCancel={() => setConfirmAction(null)}
@@ -1262,10 +1331,12 @@ function TabTrips({ p, write, toast, reload }) {
 function TabExpenses({ p, workers, write, toast, reload }) {
   const [modal, setModal] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
-  const [form, setForm] = useState({ expense_date: today(), expense_type: 'food', description: '', amount: '', persons_count: 1, paid_by: '', receipt_ref: '' })
+  const [form, setForm] = useState({ expense_date: localToday(), expense_type: 'food', description: '', amount: '', persons_count: 1, paid_by: '', receipt_ref: '' })
 
   const [save, saving] = useAction(async () => {
-    if (!form.description || !form.amount || Number(form.amount) <= 0) { toast('أدخل وصف ومبلغ أكبر من صفر', 'error'); return }
+    if (!String(form.description || '').trim() || !form.amount || Number(form.amount) <= 0) { toast('أدخل وصف ومبلغ أكبر من صفر', 'error'); return }
+    if (!form.expense_date) { toast('أدخل تاريخ المصروف', 'error'); return }
+    if (!isNonNeg(form.persons_count) || !Number.isInteger(Number(form.persons_count || 0))) { toast('عدد الأفراد لازم يكون عدد صحيح (صفر أو أكثر)', 'error'); return }
     await api.extProjects.addExpense(p.id, {
       ...form,
       amount: +form.amount,
@@ -1274,6 +1345,7 @@ function TabExpenses({ p, workers, write, toast, reload }) {
     })
     toast('✅ تمت الإضافة')
     setModal(false)
+    setForm({ expense_date: localToday(), expense_type: 'food', description: '', amount: '', persons_count: 1, paid_by: '', receipt_ref: '' })
     reload()
   })
 
@@ -1286,7 +1358,7 @@ function TabExpenses({ p, workers, write, toast, reload }) {
   // تجميع المصاريف بالنوع
   const byType = {}
   ;(p.expenses || []).forEach(e => {
-    byType[e.expense_type] = (byType[e.expense_type] || 0) + e.amount
+    byType[e.expense_type] = (byType[e.expense_type] || 0) + (Number(e.amount) || 0)
   })
   const total = Object.values(byType).reduce((s, v) => s + v, 0)
 
@@ -1346,9 +1418,9 @@ function TabExpenses({ p, workers, write, toast, reload }) {
             onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
             placeholder="مثال: غداء الفريق في مطعم طريق الإسكندرية" />
           <FormGrid cols={3}>
-            <Input label="المبلغ (ج) *" type="number" value={form.amount}
+            <Input label="المبلغ (ج) *" type="number" min="0" value={form.amount}
               onChange={e => setForm(f => ({ ...f, amount: e.target.value }))} />
-            <Input label="عدد الأفراد" type="number" value={form.persons_count}
+            <Input label="عدد الأفراد" type="number" min="0" step="1" value={form.persons_count}
               onChange={e => setForm(f => ({ ...f, persons_count: e.target.value }))} />
             <Select label="دفعه" value={form.paid_by}
               onChange={e => setForm(f => ({ ...f, paid_by: e.target.value }))}>
@@ -1365,6 +1437,9 @@ function TabExpenses({ p, workers, write, toast, reload }) {
 
       <ConfirmDialog
         open={!!confirmAction}
+        title="تأكيد الحذف"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         message={confirmAction?.msg || 'هل تريد الحذف؟'}
         onConfirm={() => { confirmAction?.fn(); setConfirmAction(null) }}
         onCancel={() => setConfirmAction(null)}
@@ -1378,16 +1453,24 @@ function TabProgress({ p, workers, write, toast, reload }) {
   const [modal, setModal] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
   const [form, setForm] = useState({
-    report_date: today(), completion_pct: 0, work_done: '', issues: '',
+    report_date: localToday(), completion_pct: 0, work_done: '', issues: '',
     next_steps: '', client_notes: '', client_approved: false,
     workers_present: p.team?.length || 0, reporter_id: '',
   })
 
   const [save, saving] = useAction(async () => {
+    if (!form.report_date) { toast('أدخل تاريخ التقرير', 'error'); return }
+    const cp = Number(form.completion_pct)
+    if (form.completion_pct === '' || !Number.isInteger(cp) || cp < 0 || cp > 100) {
+      toast('نسبة الإنجاز لازم تكون عدد صحيح بين 0 و 100', 'error'); return
+    }
+    const wp = Number(form.workers_present || 0)
+    if (!Number.isInteger(wp) || wp < 0) { toast('عدد العمال الحاضرين لازم يكون عدد صحيح (صفر أو أكثر)', 'error'); return }
+    if (!String(form.work_done || '').trim()) { toast('اكتب ما تم إنجازه اليوم', 'error'); return }
     await api.extProjects.addProgress(p.id, {
       ...form,
       completion_pct: +form.completion_pct,
-      workers_present: +form.workers_present,
+      workers_present: wp,
       reporter_id: form.reporter_id ? +form.reporter_id : null,
     })
     toast('✅ تم حفظ التقرير')
@@ -1439,9 +1522,9 @@ function TabProgress({ p, workers, write, toast, reload }) {
           <FormGrid cols={3}>
             <Input label="التاريخ *" type="date" value={form.report_date}
               onChange={e => setForm(f => ({ ...f, report_date: e.target.value }))} />
-            <Input label="نسبة الإنجاز (%)" type="number" min="0" max="100" value={form.completion_pct}
+            <Input label="نسبة الإنجاز (%)" type="number" min="0" max="100" step="1" value={form.completion_pct}
               onChange={e => setForm(f => ({ ...f, completion_pct: e.target.value }))} />
-            <Input label="عدد العمال الحاضرين" type="number" value={form.workers_present}
+            <Input label="عدد العمال الحاضرين" type="number" min="0" step="1" value={form.workers_present}
               onChange={e => setForm(f => ({ ...f, workers_present: e.target.value }))} />
           </FormGrid>
           <Textarea label="ما تم اليوم *" rows={3} value={form.work_done}
@@ -1466,6 +1549,9 @@ function TabProgress({ p, workers, write, toast, reload }) {
 
       <ConfirmDialog
         open={!!confirmAction}
+        title="تأكيد الحذف"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         message={confirmAction?.msg || 'هل تريد الحذف؟'}
         onConfirm={() => { confirmAction?.fn(); setConfirmAction(null) }}
         onCancel={() => setConfirmAction(null)}
@@ -1480,19 +1566,27 @@ function TabPayments({ p, write, toast, reload }) {
   const [recModal, setRecModal] = useState(null)
   const [confirmAction, setConfirmAction] = useState(null)
   const [form, setForm] = useState({ milestone: '', milestone_pct: 0, due_amount: '', due_date: '' })
-  const [recForm, setRecForm] = useState({ paid_amount: '', payment_method: 'cash', reference: '', paid_date: today() })
+  const [recForm, setRecForm] = useState({ paid_amount: '', payment_method: 'cash', reference: '', paid_date: localToday() })
 
   const [save, saving] = useAction(async () => {
-    if (!form.milestone || !form.due_amount) { toast('بيانات ناقصة', 'error'); return }
-    await api.extProjects.addPayment(p.id, { ...form, due_amount: +form.due_amount, milestone_pct: +form.milestone_pct || 0 })
+    if (!String(form.milestone || '').trim() || !form.due_amount) { toast('أدخل اسم المرحلة والمبلغ المستحق', 'error'); return }
+    if (!(Number(form.due_amount) > 0)) { toast('المبلغ المستحق يجب أن يكون أكبر من صفر', 'error'); return }
+    const mp = form.milestone_pct === '' ? 0 : Number(form.milestone_pct)
+    if (!Number.isInteger(mp) || mp < 0 || mp > 100) { toast('نسبة المرحلة لازم تكون عدد صحيح بين 0 و 100', 'error'); return }
+    // due_date: '' كانت بترجع 422 فمكنش ممكن تضيف دفعة من غير تاريخ استحقاق
+    await api.extProjects.addPayment(p.id, { ...form, milestone: form.milestone.trim(), due_amount: +form.due_amount, milestone_pct: mp, due_date: form.due_date || null })
     toast('✅ تمت الإضافة')
     setModal(false)
+    setForm({ milestone: '', milestone_pct: 0, due_amount: '', due_date: '' })
     reload()
   })
 
   const [receive, receiving] = useAction(async () => {
-    if (!recForm.paid_amount) { toast('أدخل المبلغ', 'error'); return }
-    await api.extProjects.receivePayment(p.id, recModal.id, { ...recForm, paid_amount: +recForm.paid_amount })
+    const amt = Number(recForm.paid_amount)
+    if (!recForm.paid_amount || !Number.isFinite(amt) || amt <= 0) { toast('أدخل مبلغ أكبر من صفر', 'error'); return }
+    const remaining = round2((Number(recModal?.due_amount) || 0) - (Number(recModal?.paid_amount) || 0))
+    if (amt > remaining + 0.01) { toast(`المبلغ المقبوض (${amt}) أكبر من المتبقي على المرحلة (${remaining})`, 'error'); return }
+    await api.extProjects.receivePayment(p.id, recModal.id, { ...recForm, paid_amount: amt, paid_date: recForm.paid_date || null })
     toast('✅ تم تسجيل الدفعة')
     setRecModal(null)
     reload()
@@ -1504,8 +1598,8 @@ function TabPayments({ p, write, toast, reload }) {
     reload()
   })
 
-  const totalDue = (p.payments || []).reduce((s, pay) => s + pay.due_amount, 0)
-  const totalPaid = (p.payments || []).reduce((s, pay) => s + pay.paid_amount, 0)
+  const totalDue = (p.payments || []).reduce((s, pay) => s + (Number(pay.due_amount) || 0), 0)
+  const totalPaid = (p.payments || []).reduce((s, pay) => s + (Number(pay.paid_amount) || 0), 0)
 
   const statusColors = { pending: 'var(--amber)', partial: 'var(--blue)', paid: 'var(--green)', overdue: 'var(--red)' }
   const statusLabels = { pending: 'مستحق', partial: 'جزئي', paid: 'محصّل', overdue: 'متأخر' }
@@ -1556,7 +1650,7 @@ function TabPayments({ p, write, toast, reload }) {
                     <div className="flex gap-1">
                       {pay.status !== 'paid' && (
                         <button className="btn btn-sm text-xs" style={{ color: 'var(--green)' }}
-                          onClick={() => { setRecModal(pay); setRecForm({ paid_amount: pay.due_amount - pay.paid_amount, payment_method: 'cash', reference: '', paid_date: today() }) }}>
+                          onClick={() => { setRecModal(pay); setRecForm({ paid_amount: round2(pay.due_amount - pay.paid_amount), payment_method: 'cash', reference: '', paid_date: localToday() }) }}>
                           💵 قبض
                         </button>
                       )}
@@ -1576,9 +1670,9 @@ function TabPayments({ p, write, toast, reload }) {
             onChange={e => setForm(f => ({ ...f, milestone: e.target.value }))}
             placeholder="مثال: مقدم 30% عند التوقيع" />
           <FormGrid cols={2}>
-            <Input label="النسبة (%)" type="number" value={form.milestone_pct}
+            <Input label="النسبة (%)" type="number" min="0" max="100" step="1" value={form.milestone_pct}
               onChange={e => setForm(f => ({ ...f, milestone_pct: e.target.value }))} />
-            <Input label="المبلغ المستحق (ج) *" type="number" value={form.due_amount}
+            <Input label="المبلغ المستحق (ج) *" type="number" min="0" value={form.due_amount}
               onChange={e => setForm(f => ({ ...f, due_amount: e.target.value }))} />
           </FormGrid>
           <Input label="تاريخ الاستحقاق" type="date" value={form.due_date}
@@ -1592,7 +1686,7 @@ function TabPayments({ p, write, toast, reload }) {
 
       <Modal open={!!recModal} onClose={() => setRecModal(null)} title={`قبض دفعة — ${recModal?.milestone}`} size="sm">
         <div className="flex flex-col gap-3">
-          <Input label="المبلغ المقبوض (ج) *" type="number" value={recForm.paid_amount}
+          <Input label="المبلغ المقبوض (ج) *" type="number" min="0" value={recForm.paid_amount}
             onChange={e => setRecForm(f => ({ ...f, paid_amount: e.target.value }))} />
           <FormGrid cols={2}>
             <Select label="طريقة الدفع" value={recForm.payment_method}
@@ -1615,6 +1709,9 @@ function TabPayments({ p, write, toast, reload }) {
 
       <ConfirmDialog
         open={!!confirmAction}
+        title="تأكيد الحذف"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         message={confirmAction?.msg || 'هل تريد الحذف؟'}
         onConfirm={() => { confirmAction?.fn(); setConfirmAction(null) }}
         onCancel={() => setConfirmAction(null)}

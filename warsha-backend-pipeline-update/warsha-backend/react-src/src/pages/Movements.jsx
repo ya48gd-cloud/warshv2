@@ -5,7 +5,7 @@
  * الحديد وارد: عدد أسياخ ↔ وزن إجمالي
  * الحديد صادر: بالوزن | بالطول | بعدد الأسياخ
  */
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useApi, useAction } from '../hooks/useApi'
 import { useAuth } from '../store/auth'
 import { useToast } from '../store/toast'
@@ -15,6 +15,7 @@ import Modal, { ModalFooter } from '../components/ui/Modal'
 import { Input, Select, Textarea, FormGrid } from '../components/ui/Field'
 import { PageSpinner } from '../components/ui/Spinner'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
+import StockTransferModal from '../components/ui/StockTransferModal'
 
 const DESTINATIONS = [
   { value: 'workshop',    label: 'الورشة' },
@@ -79,19 +80,36 @@ function PlateDimRows({ dims, onChange, onAdd, onRemove }) {
   )
 }
 
-export default function Movements() {
+export default function Movements({ warehouseId = '', preset = null, onPresetConsumed, onStockChanged } = {}) {
   const { canWrite } = useAuth()
   const write = canWrite('inventory')
   const toast = useToast()
 
-  const { data: materials } = useApi(() => api.inventory.materials())
+  const { data: materials, reload: reloadMats } = useApi(() => api.inventory.materials())
   const { data: workOrders } = useApi(() => api.accounting.workOrders().catch(bgErr('أوامر الإنتاج', [])))
+  // المخازن الفعّالة — الحركة بتتسجل على مخزن محدد (افتراضي: مخزن الخامات RAW)
+  const { data: warehouses } = useApi(() => api.warehouses.list().catch(bgErr('المخازن', [])))
+  const rawWhId = useMemo(() => {
+    const raw = (warehouses || []).find(w => w.code === 'RAW') || (warehouses || [])[0]
+    return raw ? String(raw.id) : ''
+  }, [warehouses])
+  const [transferOpen, setTransferOpen] = useState(false)
 
   const [matId, setMatId] = useState('')
+  // مادة محددة → حركاتها (في المخزن المختار لو فيه، والرصيد = رصيدها فيه)
+  // مخزن من غير مادة → كل حركات المخزن ده لكل المواد
   const { data: movs, loading, reload } = useApi(
-    () => matId ? api.inventory.movements(matId) : Promise.resolve([]),
-    [matId]
+    () => matId ? api.inventory.movements(matId, warehouseId)
+      : warehouseId ? api.inventory.warehouseMovements(warehouseId)
+      : Promise.resolve([]),
+    [matId, warehouseId]
   )
+  const selWh = useMemo(
+    () => (warehouses || []).find(w => String(w.id) === String(warehouseId)) || null,
+    [warehouses, warehouseId])
+  const showMatCol = !matId && !!warehouseId
+  const hasList = !!matId || !!warehouseId
+  const colCount = 9 + (showMatCol ? 1 : 0) + (write ? 1 : 0)
 
   // بطاقة الرصيد في الشريط العلوي مرتبطة بالمادة المختارة من قائمة الفلترة فوق فقط
   const topBarMat = useMemo(() => materials?.find(m => m.id == matId), [materials, matId])
@@ -144,9 +162,44 @@ export default function Movements() {
     // bar
     bar_length_cm: '',
     waste_g: '',
+    // المخزن المفتوح في شريط المخازن فوق هو الافتراضي، وإلا مخزن الخامات
+    warehouse_id: warehouseId || rawWhId,
   })
-  const openModal = () => { setForm({ ...emptyForm(), material_id: matId }); setModal(true) }
+  // ov: { type: 'in'|'out', materialId, warehouseId } — لما الفورم يتفتح من شاشة
+  // الأرصدة (زرار وارد/صرف على مخزن أو صنف) بيتفتح جاهز بدل ما المستخدم يختار تاني
+  const openModal = (ov = {}) => {
+    // الافتراضيات لازم تتحسب من مادة الفلتر الحالية (matId) — مش من selectedMat اللي
+    // ممكن يكون لسه شايل مادة اتختارت في مودال سابق (form.material_id القديم)
+    const mid = ov.materialId ?? matId
+    const m = mid ? materials?.find(x => String(x.id) === String(mid)) : null
+    const mPlate = m?.is_plate || m?.material_kind === 'plate'
+    const mBar = m?.material_kind === 'bar'
+    const type = ov.type === 'out' ? 'out' : 'in'
+    setForm({
+      ...emptyForm(),
+      material_id: mid,
+      movement_type: type,
+      warehouse_id: ov.warehouseId || warehouseId || rawWhId,
+      withdrawal_unit: type === 'in'
+        ? (mPlate ? 'plate_in' : mBar ? 'bar_count' : 'weight')
+        : (mPlate ? 'weight' : mBar ? 'bar_length' : 'weight'),
+      unit_cost: m?.unit_cost || '',
+      plate_length_cm: m?.plate_length_cm || '',
+      plate_width_cm:  m?.plate_width_cm  || '',
+      plate_weight_kg: m?.plate_weight_kg || '',
+    })
+    setModal(true)
+  }
   const f = (field, val) => setForm(prev => ({ ...prev, [field]: val }))
+
+  // فتح الفورم جاهز لما نيجي من زرار وارد/صرف في شاشة الأرصدة — بعد ما المواد
+  // والمخازن يتحمّلوا عشان الافتراضيات (نوع السحب/السعر/المخزن) تتحسب صح
+  useEffect(() => {
+    if (!preset || !materials || !warehouses) return
+    if (preset.materialId) setMatId(String(preset.materialId))
+    openModal(preset)
+    onPresetConsumed?.()
+  }, [preset, materials, warehouses]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Calculations ─────────────────────────────────────────────
 
@@ -220,13 +273,27 @@ export default function Movements() {
   }, [form.movement_type, form.withdrawal_unit, plateOutFullWeight, calcKgFromArea, calcQtyBar, form.qty, form.pieces_count, form.weight_per_piece])
 
   const stockQty = Number(selectedMat?.stock_qty || 0)
+
+  // رصيد المادة في كل مخزن (StockQuant) — عشان نعرض المتاح في المخزن المختار
+  const { data: matQuants, reload: reloadQuants } = useApi(
+    () => (modal && activeMatId) ? api.inventory.quants(activeMatId).catch(() => []) : Promise.resolve([]),
+    [modal, activeMatId]
+  )
+  const whId = form.warehouse_id || rawWhId
+  const whAvail = useMemo(() => (matQuants || [])
+    .filter(q => String(q.warehouse_id) === String(whId))
+    .reduce((s, q) => s + Number(q.qty || 0), 0), [matQuants, whId])
+  const whName = (warehouses || []).find(w => String(w.id) === String(whId))?.name_ar || ''
+  const isOverWarehouse = form.movement_type === 'out' && !!whId && computedOutQty > 0 && computedOutQty > whAvail + 1e-9
   const isOverBalance = form.movement_type === 'out' && computedOutQty > 0 && computedOutQty > stockQty
 
   // ── Confirmed post (after dialog) ─────────────────────────────
   const [doPost, posting] = useAction(async (payload) => {
     await api.inventory.createMov(payload)
     toast('تمت الحركة بنجاح')
-    setModal(false); setConfirmOut(null); reload()
+    // الرصيد المعروض فوق وفحص "يتجاوز الرصيد" بيعتمدوا على stock_qty من قائمة المواد —
+    // لازم تتحدّث هي كمان مش جدول الحركات بس
+    setModal(false); setConfirmOut(null); reload(); reloadMats(); reloadQuants(); onStockChanged?.()
   })
 
   // ── عكس حركة (بدل حذفها) ───────────────────────────────────────
@@ -234,7 +301,7 @@ export default function Movements() {
   const [doReverse, reversing] = useAction(async (m) => {
     await api.inventory.deleteMovement(m.id)
     toast('تم عكس الحركة بنجاح')
-    setConfirmReverse(null); reload()
+    setConfirmReverse(null); reload(); reloadMats(); onStockChanged?.()
   })
 
   // ── Save ──────────────────────────────────────────────────────
@@ -243,6 +310,13 @@ export default function Movements() {
     if (!matIdToUse)     { toast('اختر المادة',     'error'); return }
     if (!form.unit_cost || Number(form.unit_cost) <= 0) { toast('أدخل سعر وحدة أكبر من صفر', 'error'); return }
     if (form.movement_type === 'out' && !form.destination) { toast('اختر الوجهة', 'error'); return }
+    if (!form.movement_date) { toast('التاريخ مطلوب', 'error'); return }
+    // نفس قواعد الباك-إند: مفيش أبعاد/أوزان/هالك/أعداد سالبة
+    const nonNeg = ['plate_length_cm', 'plate_width_cm', 'plate_weight_kg', 'bar_length_cm', 'waste_g', 'weight_per_piece', 'pieces_count', 'plate_pieces_per_dim']
+    if (nonNeg.some(k => form[k] !== '' && form[k] != null && Number(form[k]) < 0) ||
+        (form.plateDims || []).some(d => Number(d.length) < 0 || Number(d.width) < 0)) {
+      toast('الأبعاد والأوزان والأعداد لا يمكن أن تكون سالبة', 'error'); return
+    }
 
     let qty = Number(form.qty || 0)
     let payload = {
@@ -256,6 +330,7 @@ export default function Movements() {
       withdrawal_unit: form.withdrawal_unit,
       destination:   form.movement_type === 'out' ? form.destination : null,
       source:        form.movement_type === 'in'  ? form.source      : null,
+      warehouse_id:  whId ? Number(whId) : null,
     }
 
     if (form.movement_type === 'in') {
@@ -336,6 +411,9 @@ export default function Movements() {
 
     if (qty <= 0) { toast('الكمية يجب أن تكون أكبر من صفر', 'error'); return }
     payload.qty = qty
+    if (form.movement_type === 'out' && whId && qty > whAvail + 1e-9) {
+      toast(`الرصيد في "${whName}" غير كافٍ — المتاح ${whAvail.toFixed(3)} ${selectedMat?.unit || ''}`, 'error'); return
+    }
 
     // OUT movements: always show confirmation dialog (with balance warning if over stock)
     if (form.movement_type === 'out') {
@@ -345,7 +423,7 @@ export default function Movements() {
 
     await api.inventory.createMov(payload)
     toast('تمت الحركة بنجاح')
-    setModal(false); reload()
+    setModal(false); reload(); reloadMats(); onStockChanged?.()
   })
 
   const addDim    = () => setForm(p => ({ ...p, plateDims: [...p.plateDims, { id: Date.now(), length:'', width:'' }] }))
@@ -407,40 +485,62 @@ export default function Movements() {
         )}
 
         {write && (
-          <button className="btn btn-primary btn-sm flex-shrink-0" onClick={openModal}>+ تسجيل حركة</button>
+          <button className="btn btn-primary btn-sm flex-shrink-0" onClick={() => openModal()}>+ تسجيل حركة</button>
+        )}
+        {write && (
+          <button className="btn btn-sm flex-shrink-0" onClick={() => setTransferOpen(true)}>⇄ تحويل بين المخازن</button>
         )}
       </div>
 
+      {selWh && (
+        <div className="text-xs text-erp-muted">
+          {matId ? <>حركات المادة المختارة في <b>{selWh.name_ar}</b> — الرصيد هو رصيدها في المخزن ده</>
+                 : <>كل حركات <b>{selWh.name_ar}</b> لكل المواد (آخر 300 حركة) — اختر مادة لعرض رصيدها التراكمي</>}
+        </div>
+      )}
       {/* Movements table */}
       <div className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
           <table className="erp-table">
             <thead>
               <tr>
-                <th>التاريخ</th><th>النوع</th><th>الكمية (كجم)</th>
+                <th>التاريخ</th>{showMatCol && <th>المادة</th>}<th>النوع</th><th>المخزن</th><th>الكمية</th>
                 <th>تفاصيل</th><th>السعر</th><th>الإجمالي</th>
-                <th>الوجهة / المرجع</th><th>الرصيد</th>
+                <th>الوجهة / المرجع</th><th>{selWh && matId ? `الرصيد في ${selWh.name_ar}` : 'الرصيد'}</th>
                 {write && <th></th>}
               </tr>
             </thead>
             <tbody>
-              {loading && matId && (
-                <tr><td colSpan={write ? 9 : 8} className="text-center py-10 animate-pulse text-erp-muted">جاري التحميل…</td></tr>
+              {loading && hasList && (
+                <tr><td colSpan={colCount} className="text-center py-10 animate-pulse text-erp-muted">جاري التحميل…</td></tr>
               )}
-              {!matId && (
-                <tr><td colSpan={write ? 9 : 8} className="text-center py-10 text-erp-muted">اختر مادة أولاً</td></tr>
+              {!hasList && (
+                <tr><td colSpan={colCount} className="text-center py-10 text-erp-muted">اختر مادة، أو اختر مخزن من الشريط فوق لعرض كل حركاته</td></tr>
               )}
-              {matId && !loading && !movs?.length && (
-                <tr><td colSpan={write ? 9 : 8} className="text-center py-10 text-erp-muted">لا توجد حركات</td></tr>
+              {hasList && !loading && !movs?.length && (
+                <tr><td colSpan={colCount} className="text-center py-10 text-erp-muted">
+                  {selWh ? `لا توجد حركات في ${selWh.name_ar}` : 'لا توجد حركات'}
+                </td></tr>
               )}
               {movs?.map(m => {
-                const isIn = m.movement_type === 'in'
+                const isTransfer = m.movement_type === 'transfer'
+                // جوه مخزن معيّن التحويل بيبقى داخل أو خارج بالنسبة له
+                const isIn = m.warehouse_direction ? m.warehouse_direction === 'in' : m.movement_type === 'in'
+                const whFrom = m.source_warehouse_name, whTo = m.destination_warehouse_name
                 return (
                   <tr key={m.id}>
                     <td className="text-xs text-erp-muted">{fmtDate(m.movement_date)}</td>
+                    {showMatCol && (
+                      <td>
+                        <div className="font-medium text-sm">{m.material_name || '—'}</div>
+                        <div className="text-[10px] text-erp-muted font-mono">{m.material_code}</div>
+                      </td>
+                    )}
                     <td>
-                      <span className={`badge ${isIn ? 'badge-green' : 'badge-red'}`}>
-                        {isIn ? '↓ وارد' : '↑ صادر'}
+                      <span className={`badge ${isTransfer ? 'badge-blue' : isIn ? 'badge-green' : 'badge-red'}`}>
+                        {isTransfer
+                          ? (m.warehouse_direction ? (isIn ? '⇄ تحويل وارد' : '⇄ تحويل صادر') : '⇄ تحويل')
+                          : isIn ? '↓ وارد' : '↑ صادر'}
                       </span>
                       {m.withdrawal_unit === 'plate_area'  && <span className="badge badge-blue mr-1 text-[10px]">مقاسات</span>}
                       {m.withdrawal_unit === 'plate_count' && <span className="badge badge-blue mr-1 text-[10px]">لوح كامل</span>}
@@ -451,11 +551,15 @@ export default function Movements() {
                       {m.state === 'reversed' && <span className="badge badge-gray mr-1 text-[10px]">معكوسة</span>}
                       {m.source_doc_type === 'reversal' && <span className="badge badge-gray mr-1 text-[10px]">حركة عكس</span>}
                     </td>
+                    <td className="text-xs whitespace-nowrap">
+                      {isTransfer ? <>{whFrom || '—'} ← {whTo || '—'}</>
+                        : m.movement_type === 'in' ? (whTo || '—') : (whFrom || '—')}
+                    </td>
                     <td className="font-semibold font-mono">
-                      {Number(m.qty||0).toFixed(3)}
+                      {Number(m.qty||0).toFixed(3)} {showMatCol && m.unit ? <span className="text-[10px] text-erp-muted">{m.unit}</span> : null}
                     </td>
                     <td className="text-xs text-erp-muted">
-                      {m.pieces_count && !m.plate_area_m2 && !m.bar_length_cm && (
+                      {!!m.pieces_count && !m.plate_area_m2 && !m.bar_length_cm && (
                         <div>{m.pieces_count} قطعة/سيخ{m.weight_per_piece ? ` × ${Number(m.weight_per_piece).toFixed(3)} كجم` : ''}</div>
                       )}
                       {m.plate_area_m2 && (
@@ -473,7 +577,7 @@ export default function Movements() {
                       )}
                       {m.bar_length_cm && (
                         <div style={{ color: 'var(--amber)' }}>طول: {m.bar_length_cm} سم
-                          {m.pieces_count && m.pieces_count > 1 ? ` × ${m.pieces_count}` : ''}
+                          {m.pieces_count > 1 ? ` × ${m.pieces_count}` : ''}
                         </div>
                       )}
                       {m.waste_g && <div className="text-[10px]">هالك: {m.waste_g} جم</div>}
@@ -487,7 +591,7 @@ export default function Movements() {
                       {m.notes && <div className="text-[11px]">{m.notes}</div>}
                       {!m.reference && !m.notes && '—'}
                     </td>
-                    <td className="font-medium font-mono">{Number(m.balance_after||0).toFixed(3)}</td>
+                    <td className="font-medium font-mono">{m.balance_after == null ? '—' : Number(m.balance_after).toFixed(3)}</td>
                     {write && (
                       <td>
                         {m.state !== 'reversed' && m.source_doc_type !== 'reversal' && (
@@ -513,7 +617,24 @@ export default function Movements() {
             <div>
               <label className="field-label">المادة *</label>
               <select className="field-select w-full" value={form.material_id || ''}
-                onChange={e => f('material_id', e.target.value)}>
+                onChange={e => {
+                  // تغيير المادة من داخل المودال: نرجّع نوع الإدخال والسعر لافتراضي المادة الجديدة
+                  // (قبل كده لو كانت "لوح كامل" واتغيرت لمادة عامة، مفيش ولا خانة كمية بتظهر)
+                  const m = materials?.find(x => String(x.id) === String(e.target.value))
+                  const mPlate = m?.is_plate || m?.material_kind === 'plate'
+                  const mBar = m?.material_kind === 'bar'
+                  setForm(prev => ({
+                    ...prev,
+                    material_id: e.target.value,
+                    withdrawal_unit: prev.movement_type === 'in'
+                      ? (mPlate ? 'plate_in' : mBar ? 'bar_count' : 'weight')
+                      : (mBar ? 'bar_length' : 'weight'),
+                    unit_cost: m?.unit_cost || prev.unit_cost || '',
+                    plate_length_cm: m?.plate_length_cm || '',
+                    plate_width_cm:  m?.plate_width_cm  || '',
+                    plate_weight_kg: m?.plate_weight_kg || '',
+                  }))
+                }}>
                 <option value="">— اختر مادة —</option>
                 {materials?.map(m => (
                   <option key={m.id} value={m.id}>
@@ -566,6 +687,23 @@ export default function Movements() {
             <Input label="التاريخ *" type="date" value={form.movement_date}
               onChange={e => f('movement_date', e.target.value)} />
           </FormGrid>
+
+          {/* المخزن: "إلى مخزن" للوارد، "من مخزن" للصادر */}
+          <div>
+            <label className="field-label">{form.movement_type === 'in' ? 'إلى مخزن *' : 'من مخزن *'}</label>
+            <select className="field-select w-full" value={whId}
+              onChange={e => f('warehouse_id', e.target.value)}>
+              {(warehouses || []).map(w => (
+                <option key={w.id} value={w.id}>{w.name_ar}</option>
+              ))}
+            </select>
+            {activeMatId && whId && (
+              <div className="text-xs mt-1" style={{ color: isOverWarehouse ? 'var(--red, #EF4444)' : 'var(--erp-muted)' }}>
+                الرصيد في هذا المخزن: <span className="font-semibold font-mono">{whAvail.toFixed(3)}</span> {selectedMat?.unit || ''}
+                {isOverWarehouse && ` — ⚠️ الكمية المطلوبة (${computedOutQty.toFixed(3)}) أكبر من المتاح`}
+              </div>
+            )}
+          </div>
 
           {/* ════ WARED (IN) ════ */}
           {form.movement_type === 'in' && (
@@ -843,7 +981,7 @@ export default function Movements() {
 
         <ModalFooter>
           <button className="btn" onClick={() => setModal(false)}>إلغاء</button>
-          <button className="btn btn-primary" onClick={save} disabled={saving || posting}>
+          <button className="btn btn-primary" onClick={save} disabled={saving || posting || isOverWarehouse}>
             {saving ? '…' : 'تسجيل الحركة'}
           </button>
         </ModalFooter>
@@ -862,6 +1000,16 @@ export default function Movements() {
               ? `⚠️ تحذير: الكمية المطلوبة (${Number(confirmOut.qty).toFixed(3)} كجم) تتجاوز الرصيد الحالي (${stockQty.toFixed(3)} كجم). هل تريد المتابعة؟`
               : `هل تريد سحب ${Number(confirmOut.qty).toFixed(3)} كجم من المخزون؟`}`
           : ''}
+      />
+
+      <StockTransferModal
+        open={transferOpen}
+        onClose={() => setTransferOpen(false)}
+        materials={materials}
+        warehouses={warehouses}
+        initialMaterialId={matId}
+        onDone={() => { reload(); reloadMats(); onStockChanged?.() }}
+        initialFromWarehouseId={warehouseId}
       />
 
       {/* ════ Confirm reverse movement ════ */}

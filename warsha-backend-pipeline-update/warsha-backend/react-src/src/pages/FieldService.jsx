@@ -38,15 +38,52 @@ const MOVEMENT_TYPE_BADGE = {
 }
 const MOVEMENT_TYPES = ['installed', 'relocated', 'maintained', 'returned']
 
+// التاريخ المحلي YYYY-MM-DD (today() في utils بيرجع UTC)
+const localToday = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// اسم المادة — موديل Material مفيهوش حقل name (name_ar / name_en بس)،
+// فكانت قائمة اختيار العدة بتظهر فاضية.
+const matName = (m) => m?.name_ar || m?.name || m?.name_en || m?.code || `#${m?.id}`
+
+// بناء payload نظيف لأمر الخدمة — كان الفورم بيتبعت زي ما هو، فـ location_id: ''
+// (بيتضبط تلقائي عند تغيير العميل) أو planned_date: '' كانوا بيرجعوا 422
+// ويمنعوا إنشاء/تعديل أي مشروع.
+const buildOrderPayload = (f) => ({
+  code:            String(f.code || '').trim(),
+  customer_id:     Number(f.customer_id),
+  location_id:     f.location_id ? Number(f.location_id) : null,
+  asset_id:        f.asset_id ? Number(f.asset_id) : null,
+  order_type:      f.order_type || 'maintenance',
+  title:           String(f.title || '').trim(),
+  description:     f.description || null,
+  priority:        f.priority || 'normal',
+  planned_date:    f.planned_date || null,
+  estimated_hours: (f.estimated_hours === '' || f.estimated_hours == null) ? null : Number(f.estimated_hours),
+  notes:           f.notes || null,
+})
+
+const validateOrderForm = (f) => {
+  if (!String(f.code || '').trim())  return 'الكود مطلوب'
+  if (!String(f.title || '').trim()) return 'العنوان مطلوب'
+  if (!f.customer_id)                return 'اختر العميل'
+  if (f.estimated_hours !== '' && f.estimated_hours != null && (!Number.isFinite(Number(f.estimated_hours)) || Number(f.estimated_hours) < 0))
+    return 'الساعات التقديرية لا يمكن أن تكون سالبة'
+  return null
+}
+
 // ══════════════════════════════════════════════════════════════
 // PROJECT CARD
 // ══════════════════════════════════════════════════════════════
-function ProjectCard({ order, onClick, write, onQuickStatus }) {
+function ProjectCard({ order, onClick, write, onQuickStatus, onDelete }) {
   const st  = STATUS_BADGE[order.status]  || 'badge-gray'
   const pri = PRIORITY_BADGE[order.priority] || 'badge-blue'
   const visitCount   = order.visits?.length || 0
   const workerCount  = order.assignments?.length || 0
-  const hasAlert     = order.status === 'on_hold' || (order.planned_date && new Date(order.planned_date) < new Date() && order.status !== 'completed')
+  // مقارنة نصية بالتاريخ المحلي — new Date('YYYY-MM-DD') كان بيعلّم مشاريع النهارده "متأخرة"، وكمان الملغاة
+  const hasAlert     = order.status === 'on_hold' || (order.planned_date && String(order.planned_date).slice(0, 10) < localToday() && !['completed', 'cancelled'].includes(order.status))
 
   return (
     <div
@@ -99,13 +136,18 @@ function ProjectCard({ order, onClick, write, onQuickStatus }) {
       {/* Quick actions */}
       {write && (
         <div className="flex gap-1" onClick={e => e.stopPropagation()}>
-          {order.status === 'pending' && (
+          {['pending', 'assigned'].includes(order.status) && (
             <button className="btn btn-sm text-[11px] flex-1" style={{ color:'var(--amber)' }}
               onClick={() => onQuickStatus(order.id, 'in_progress')}>▶ بدء</button>
           )}
           {order.status === 'in_progress' && (
             <button className="btn btn-sm text-[11px] flex-1" style={{ color:'var(--green)' }}
-              onClick={() => onQuickStatus(order.id, 'completed')}>✔ إتمام</button>
+              onClick={() => { if (window.confirm(`إتمام المشروع "${order.title}"؟`)) onQuickStatus(order.id, 'completed') }}>✔ إتمام</button>
+          )}
+          {/* الحذف مسموح بالباك-إند للمعلّق/الملغي فقط — كان ConfirmDialog الحذف موجود من غير أي زرار يفتحه */}
+          {onDelete && ['pending', 'cancelled'].includes(order.status) && (
+            <button className="btn btn-sm btn-danger text-[11px]" title="حذف المشروع"
+              onClick={() => onDelete(order)}>🗑</button>
           )}
         </div>
       )}
@@ -116,25 +158,32 @@ function ProjectCard({ order, onClick, write, onQuickStatus }) {
 // ══════════════════════════════════════════════════════════════
 // LABOR TAB
 // ══════════════════════════════════════════════════════════════
-function LaborTab({ orderId, write }) {
+function LaborTab({ orderId, write, onChanged }) {
   const toast = useToast()
   const { data: workers } = useApi(() => api.workers.list())
   const { data: entries, reload } = useApi(() => api.fieldService.listLabor(orderId), [orderId])
   const [modal, setModal] = useState(false)
-  const [form, setForm]   = useState({ entry_date: today(), days: 1, daily_wage: '', allowance: 0, advance: 0 })
+  const [form, setForm]   = useState({ entry_date: localToday(), days: 1, daily_wage: '', allowance: 0, advance: 0 })
 
-  const totalPay     = (entries || []).reduce((s, e) => s + e.total_pay, 0)
-  const totalAdvance = (entries || []).reduce((s, e) => s + e.advance,   0)
+  const totalPay     = (entries || []).reduce((s, e) => s + (Number(e.total_pay) || 0), 0)
+  const totalAdvance = (entries || []).reduce((s, e) => s + (Number(e.advance) || 0),   0)
 
   const computed = (Number(form.days) || 0) * (Number(form.daily_wage) || 0) + (Number(form.allowance) || 0)
 
   const [save, saving] = useAction(async () => {
     if (!form.worker_id)  { toast('اختر العامل',  'error'); return }
-    if (!form.daily_wage) { toast('أدخل الأجر اليومي', 'error'); return }
+    if (!form.entry_date) { toast('أدخل التاريخ', 'error'); return }
+    if (form.daily_wage === '' || form.daily_wage == null) { toast('أدخل الأجر اليومي', 'error'); return }
+    const days = Number(form.days)
+    if (!Number.isFinite(days) || days <= 0) { toast('عدد الأيام يجب أن يكون أكبر من صفر', 'error'); return }
+    for (const [k, label] of [['daily_wage', 'الأجر اليومي'], ['allowance', 'البدل'], ['advance', 'السلفة']]) {
+      const v = Number(form[k] || 0)
+      if (!Number.isFinite(v) || v < 0) { toast(`${label} لا يمكن أن يكون سالباً`, 'error'); return }
+    }
     await api.fieldService.addLabor(orderId, {
       worker_id:  Number(form.worker_id),
       entry_date: form.entry_date,
-      days:       Number(form.days)       || 1,
+      days,
       daily_wage: Number(form.daily_wage) || 0,
       allowance:  Number(form.allowance)  || 0,
       advance:    Number(form.advance)    || 0,
@@ -142,13 +191,13 @@ function LaborTab({ orderId, write }) {
     })
     toast('✅ تمت الإضافة')
     setModal(false)
-    setForm({ entry_date: today(), days: 1, daily_wage: '', allowance: 0, advance: 0 })
-    reload()
+    setForm({ entry_date: localToday(), days: 1, daily_wage: '', allowance: 0, advance: 0 })
+    reload(); onChanged?.()   // تكلفة العمالة في رأس المشروع كانت بتفضل قديمة
   })
 
-  const [doDelete] = useAction(async (id) => {
+  const [doDelete, deletingLabor] = useAction(async (id) => {
     await api.fieldService.deleteLabor(orderId, id)
-    toast('تم الحذف'); reload()
+    toast('تم الحذف'); reload(); onChanged?.()
   })
 
   return (
@@ -199,8 +248,8 @@ function LaborTab({ orderId, write }) {
                 <td className="font-semibold" style={{ color:'var(--teal)' }}>{egp(e.total_pay)}</td>
                 {write && (
                   <td>
-                    <button className="btn btn-sm btn-danger text-xs"
-                      onClick={() => doDelete(e.id)}>🗑</button>
+                    <button className="btn btn-sm btn-danger text-xs" disabled={deletingLabor}
+                      onClick={() => { if (window.confirm(`حذف قيد عمالة "${e.worker_name}"؟`)) doDelete(e.id) }}>🗑</button>
                   </td>
                 )}
               </tr>
@@ -226,12 +275,12 @@ function LaborTab({ orderId, write }) {
           <FormGrid cols={3}>
             <Input label="عدد الأيام" type="number" step="0.5" min="0.5" value={form.days}
               onChange={e => setForm(f => ({ ...f, days: e.target.value }))} />
-            <Input label="الأجر اليومي (ج) *" type="number" step="0.01" value={form.daily_wage}
+            <Input label="الأجر اليومي (ج) *" type="number" step="0.01" min="0" value={form.daily_wage}
               onChange={e => setForm(f => ({ ...f, daily_wage: e.target.value }))} />
-            <Input label="بدل معيشة/سفر (ج)" type="number" step="0.01" value={form.allowance}
+            <Input label="بدل معيشة/سفر (ج)" type="number" step="0.01" min="0" value={form.allowance}
               onChange={e => setForm(f => ({ ...f, allowance: e.target.value }))} />
           </FormGrid>
-          <Input label="سلفة (ج)" type="number" step="0.01" value={form.advance}
+          <Input label="سلفة (ج)" type="number" step="0.01" min="0" value={form.advance}
             onChange={e => setForm(f => ({ ...f, advance: e.target.value }))} />
           {computed > 0 && (
             <div className="flex justify-between px-3 py-2 rounded text-sm"
@@ -255,7 +304,7 @@ function LaborTab({ orderId, write }) {
 // ══════════════════════════════════════════════════════════════
 // TOOLS TAB — عهدة العدة
 // ══════════════════════════════════════════════════════════════
-function ToolsTab({ orderId, write }) {
+function ToolsTab({ orderId, write, onChanged }) {
   const toast = useToast()
   const { data: materials } = useApi(() => api.inventory.materials())
   const { data: workers   } = useApi(() => api.workers.list())
@@ -263,43 +312,62 @@ function ToolsTab({ orderId, write }) {
 
   const [withdrawModal, setWithdrawModal] = useState(false)
   const [returnModal,   setReturnModal]   = useState(null)   // tool row
-  const [wForm, setWForm] = useState({ withdrawn_date: today(), qty: 1 })
-  const [rForm, setRForm] = useState({ returned_date: today(), returned_qty: 1, damaged_qty: 0 })
+  const [wForm, setWForm] = useState({ withdrawn_date: localToday(), qty: 1 })
+  const [rForm, setRForm] = useState({ returned_date: localToday(), returned_qty: 1, damaged_qty: 0 })
 
   const openCount    = (tools || []).filter(t => t.status === 'withdrawn').length
   const damagedCount = (tools || []).filter(t => t.status === 'damaged').length
 
   const [saveWithdraw, savingW] = useAction(async () => {
     if (!wForm.material_id) { toast('اختر العدة', 'error'); return }
+    if (!wForm.withdrawn_date) { toast('أدخل تاريخ السحب', 'error'); return }
+    const qty = Number(wForm.qty)
+    if (!Number.isFinite(qty) || qty <= 0) { toast('الكمية يجب أن تكون أكبر من صفر', 'error'); return }
+    const mat = (materials || []).find(m => String(m.id) === String(wForm.material_id))
+    const avail = mat ? Number(mat.available_qty ?? mat.stock_qty) : NaN
+    if (Number.isFinite(avail) && qty > avail + 1e-9) {
+      toast(`الكمية المطلوبة (${qty}) أكبر من المتاح بالمخزون (${avail})`, 'error'); return
+    }
     await api.fieldService.withdrawTool(orderId, {
       material_id:    Number(wForm.material_id),
       worker_id:      wForm.worker_id ? Number(wForm.worker_id) : null,
-      qty:            Number(wForm.qty) || 1,
+      qty,
       withdrawn_date: wForm.withdrawn_date,
       notes:          wForm.notes || null,
     })
     toast('✅ تم تسجيل السحب')
     setWithdrawModal(false)
-    setWForm({ withdrawn_date: today(), qty: 1 })
-    reload()
+    setWForm({ withdrawn_date: localToday(), qty: 1 })
+    reload(); onChanged?.()
   })
 
   const [saveReturn, savingR] = useAction(async () => {
     if (!returnModal) return
+    if (!rForm.returned_date) { toast('أدخل تاريخ الإرجاع', 'error'); return }
+    // كان Number(...) || qty بيحوّل "صفر مرتجع" (كله تالف/مفقود) لإرجاع الكمية كاملة
+    const retQty = rForm.returned_qty === '' ? 0 : Number(rForm.returned_qty)
+    const dmgQty = rForm.damaged_qty === '' ? 0 : Number(rForm.damaged_qty)
+    if (!Number.isFinite(retQty) || !Number.isFinite(dmgQty) || retQty < 0 || dmgQty < 0) {
+      toast('الكمية لا يمكن أن تكون سالبة', 'error'); return
+    }
+    if (retQty + dmgQty > Number(returnModal.qty) + 1e-9) {
+      toast(`إجمالي المرتجع والتالف (${retQty + dmgQty}) أكبر من الكمية المسحوبة (${returnModal.qty})`, 'error'); return
+    }
+    if (retQty + dmgQty === 0) { toast('أدخل الكمية المرتجعة أو التالفة', 'error'); return }
     await api.fieldService.returnTool(orderId, returnModal.id, {
       returned_date: rForm.returned_date,
-      returned_qty:  Number(rForm.returned_qty) || returnModal.qty,
-      damaged_qty:   Number(rForm.damaged_qty)  || 0,
+      returned_qty:  retQty,
+      damaged_qty:   dmgQty,
       notes:         rForm.notes || null,
     })
     toast('✅ تم تسجيل الإرجاع')
     setReturnModal(null)
-    reload()
+    reload(); onChanged?.()
   })
 
-  const [doDelete] = useAction(async (id) => {
+  const [doDelete, deletingTool] = useAction(async (id) => {
     await api.fieldService.deleteTool(orderId, id)
-    toast('تم الحذف'); reload()
+    toast('تم الحذف'); reload(); onChanged?.()
   })
 
   return (
@@ -356,12 +424,13 @@ function ToolsTab({ orderId, write }) {
                       {t.status === 'withdrawn' && (
                         <button className="btn btn-sm text-[11px]"
                           style={{ color:'var(--green)', borderColor:'var(--green-lt)' }}
-                          onClick={() => { setRForm({ returned_date: today(), returned_qty: t.qty, damaged_qty: 0 }); setReturnModal(t) }}>
+                          onClick={() => { setRForm({ returned_date: localToday(), returned_qty: t.qty, damaged_qty: 0 }); setReturnModal(t) }}>
                           ↩ إرجاع
                         </button>
                       )}
                       {t.status === 'withdrawn' && (
-                        <button className="btn btn-sm btn-danger text-xs" onClick={() => doDelete(t.id)}>🗑</button>
+                        <button className="btn btn-sm btn-danger text-xs" disabled={deletingTool}
+                          onClick={() => { if (window.confirm(`حذف سحب "${t.material_name}" وإرجاع الكمية للمخزون؟`)) doDelete(t.id) }}>🗑</button>
                       )}
                     </div>
                   </td>
@@ -378,7 +447,12 @@ function ToolsTab({ orderId, write }) {
           <Select label="العدة / المادة *" value={wForm.material_id || ''}
             onChange={e => setWForm(f => ({ ...f, material_id: e.target.value }))}>
             <option value="">— اختر —</option>
-            {(materials || []).map(m => <option key={m.id} value={m.id}>{m.name}{m.unit ? ` (${m.unit})` : ''}</option>)}
+            {(Array.isArray(materials) ? materials : []).map(m => (
+              <option key={m.id} value={m.id}>
+                {matName(m)}{m.unit ? ` (${m.unit})` : ''}
+                {(m.available_qty ?? m.stock_qty) != null ? ` — متاح: ${Number(m.available_qty ?? m.stock_qty)}` : ''}
+              </option>
+            ))}
           </Select>
           <FormGrid cols={2}>
             <Input label="الكمية" type="number" step="0.001" min="0.001" value={wForm.qty}
@@ -407,7 +481,7 @@ function ToolsTab({ orderId, write }) {
         title={`إرجاع: ${returnModal?.material_name}`} size="sm">
         <div className="flex flex-col gap-3">
           <FormGrid cols={2}>
-            <Input label="الكمية المرتجعة" type="number" step="0.001" value={rForm.returned_qty}
+            <Input label="الكمية المرتجعة" type="number" step="0.001" min="0" value={rForm.returned_qty}
               onChange={e => setRForm(f => ({ ...f, returned_qty: e.target.value }))} />
             <Input label="الكمية التالفة" type="number" step="0.001" min="0" value={rForm.damaged_qty}
               onChange={e => setRForm(f => ({ ...f, damaged_qty: e.target.value }))} />
@@ -433,16 +507,27 @@ function VisitsTab({ order, write, onReload }) {
   const toast   = useToast()
   const { data: workers } = useApi(() => api.workers.list())
   const [modal, setModal] = useState(false)
-  const [form,  setForm]  = useState({ visit_date: today(), status: 'completed' })
+  const [form,  setForm]  = useState({ visit_date: localToday(), status: 'completed' })
   const [assignModal, setAssignModal] = useState(false)
   const [assignIds, setAssignIds]     = useState([])
 
   const [saveVisit, saving] = useAction(async () => {
     if (!form.visit_date) { toast('تاريخ الزيارة مطلوب', 'error'); return }
-    await api.fieldService.recordVisit(order.id, form)
+    if (form.labor_hours != null && form.labor_hours !== '' && (!Number.isFinite(Number(form.labor_hours)) || Number(form.labor_hours) < 0)) {
+      toast('ساعات العمل لا يمكن أن تكون سالبة', 'error'); return
+    }
+    if (form.arrival_time && form.departure_time && form.departure_time < form.arrival_time) {
+      toast('وقت المغادرة يجب أن يكون بعد وقت الوصول', 'error'); return
+    }
+    await api.fieldService.recordVisit(order.id, {
+      ...form,
+      labor_hours:    form.labor_hours ? Number(form.labor_hours) : null,
+      arrival_time:   form.arrival_time || null,
+      departure_time: form.departure_time || null,
+    })
     toast('✅ تم تسجيل الزيارة')
     setModal(false)
-    setForm({ visit_date: today(), status: 'completed' })
+    setForm({ visit_date: localToday(), status: 'completed' })
     onReload()
   })
 
@@ -525,7 +610,7 @@ function VisitsTab({ order, write, onReload }) {
           <FormGrid cols={2}>
             <Input label="تاريخ الزيارة *" type="date" value={form.visit_date}
               onChange={e => setForm(f => ({ ...f, visit_date: e.target.value }))} />
-            <Input label="ساعات العمل" type="number" step="0.5" value={form.labor_hours || ''}
+            <Input label="ساعات العمل" type="number" step="0.5" min="0" value={form.labor_hours || ''}
               onChange={e => setForm(f => ({ ...f, labor_hours: +e.target.value }))} />
           </FormGrid>
           <FormGrid cols={2}>
@@ -594,14 +679,23 @@ function ProjectWorkspace({ orderId, write, customers, onBack, onReload }) {
 
   const handleReload = () => { reload(); onReload() }
 
-  const [updateStatus] = useAction(async (status) => {
+  const [updateStatusRaw, updatingStatus] = useAction(async (status) => {
     await api.fieldService.updateOrderStatus(order.id, { status })
     toast('تم تحديث الحالة')
     handleReload()
   })
+  // تأكيد قبل الإلغاء/الإتمام (لا رجوع منهما من الواجهة) + منع الضغط المزدوج
+  const updateStatus = (status) => {
+    if (updatingStatus) return
+    if (status === 'cancelled' && !window.confirm(`إلغاء المشروع "${order.title}"؟`)) return
+    if (status === 'completed' && !window.confirm(`إتمام المشروع "${order.title}"؟`)) return
+    updateStatusRaw(status)
+  }
 
   const [save, saving] = useAction(async () => {
-    await api.fieldService.updateOrder(order.id, form)
+    const err = validateOrderForm(form)
+    if (err) { toast(err, 'error'); return }
+    await api.fieldService.updateOrder(order.id, buildOrderPayload(form))
     toast('✅ تم الحفظ')
     setEditModal(false)
     handleReload()
@@ -662,7 +756,7 @@ function ProjectWorkspace({ orderId, write, customers, onBack, onReload }) {
         {/* Status actions */}
         {write && (
           <div className="flex gap-2 flex-wrap mt-4 pt-3 border-t border-erp-border">
-            {order.status === 'pending'     && <button className="btn btn-sm text-xs" style={{ color:'var(--amber)' }} onClick={() => updateStatus('in_progress')}>▶ بدء التنفيذ</button>}
+            {['pending', 'assigned'].includes(order.status) && <button className="btn btn-sm text-xs" style={{ color:'var(--amber)' }} disabled={updatingStatus} onClick={() => updateStatus('in_progress')}>▶ بدء التنفيذ</button>}
             {order.status === 'in_progress' && <button className="btn btn-sm text-xs" style={{ color:'var(--green)' }} onClick={() => updateStatus('completed')}>✔ إتمام المشروع</button>}
             {order.status === 'in_progress' && <button className="btn btn-sm text-xs" style={{ color:'var(--amber)' }} onClick={() => updateStatus('on_hold')}>⏸ إيقاف مؤقت</button>}
             {order.status === 'on_hold'     && <button className="btn btn-sm text-xs" style={{ color:'var(--blue)'  }} onClick={() => updateStatus('in_progress')}>▶ استئناف</button>}
@@ -697,8 +791,8 @@ function ProjectWorkspace({ orderId, write, customers, onBack, onReload }) {
 
       {/* Tab content */}
       {activeTab === 'visits' && <VisitsTab order={order} write={write} onReload={handleReload} />}
-      {activeTab === 'labor'  && <LaborTab  orderId={order.id} write={write} />}
-      {activeTab === 'tools'  && <ToolsTab  orderId={order.id} write={write} />}
+      {activeTab === 'labor'  && <LaborTab  orderId={order.id} write={write} onChanged={handleReload} />}
+      {activeTab === 'tools'  && <ToolsTab  orderId={order.id} write={write} onChanged={handleReload} />}
 
       {/* Edit Modal */}
       <Modal open={editModal} onClose={() => setEditModal(false)} title="تعديل المشروع">
@@ -750,7 +844,7 @@ function AssetProfile({ assetId, write, onBack, onReload }) {
   const { data: asset, loading, reload } = useApi(() => api.fieldService.getAsset(assetId), [assetId])
   const [locations, setLocations] = useState([])
   const [moveModal, setMoveModal] = useState(false)
-  const [form, setForm] = useState({ event_type: 'relocated', event_date: today() })
+  const [form, setForm] = useState({ event_type: 'relocated', event_date: localToday() })
 
   useEffect(() => {
     if (!asset?.customer_id) { setLocations([]); return }
@@ -767,12 +861,12 @@ function AssetProfile({ assetId, write, onBack, onReload }) {
     await api.fieldService.addMovement(assetId, {
       event_type: form.event_type,
       to_location_id: form.to_location_id ? Number(form.to_location_id) : null,
-      event_date: form.event_date || today(),
+      event_date: form.event_date || localToday(),
       notes: form.notes || null,
     })
     toast('✅ تم تسجيل الحركة')
     setMoveModal(false)
-    setForm({ event_type: 'relocated', event_date: today() })
+    setForm({ event_type: 'relocated', event_date: localToday() })
     handleReload()
   })
 
@@ -970,11 +1064,14 @@ function AssetsView({ write, customers }) {
   }
 
   const [save, saving] = useAction(async () => {
-    if (!form.name || !form.customer_id) { toast('الاسم والعميل مطلوبان', 'error'); return }
+    if (!String(form.name || '').trim() || !form.customer_id) { toast('الاسم والعميل مطلوبان', 'error'); return }
+    if (form.delivery_date && form.warranty_end && form.warranty_end < form.delivery_date) {
+      toast('نهاية الضمان يجب أن تكون بعد تاريخ التسليم', 'error'); return
+    }
     const payload = {
       customer_id: Number(form.customer_id),
       equipment_id: form.equipment_id ? Number(form.equipment_id) : null,
-      name: form.name,
+      name: String(form.name).trim(),
       model: form.model || null,
       serial_number: form.serial_number || null,
       delivery_date: form.delivery_date || null,
@@ -1122,6 +1219,8 @@ function AssetsView({ write, customers }) {
         open={!!delTarget}
         title="حذف المعدة"
         message={`هل تريد حذف "${delTarget?.name}"؟`}
+        confirmLabel="حذف"
+        confirmVariant="danger"
         onConfirm={del}
         onCancel={() => setDel(null)}
         loading={deleting}
@@ -1178,13 +1277,15 @@ export default function FieldService() {
   }), [orders])
 
   const openAdd = () => {
-    setForm({ order_type:'maintenance', priority:'normal', planned_date: today(), status:'pending' })
+    setForm({ order_type:'maintenance', priority:'normal', planned_date: localToday(), status:'pending' })
     setCreateModal(true)
   }
 
   const [save, saving] = useAction(async () => {
     if (!form.title || !form.customer_id || !form.code) { toast('كود وعنوان والعميل مطلوبان', 'error'); return }
-    await api.fieldService.createOrder(form)
+    const err = validateOrderForm(form)
+    if (err) { toast(err, 'error'); return }
+    await api.fieldService.createOrder(buildOrderPayload(form))
     toast('✅ تم إنشاء المشروع')
     setCreateModal(false)
     reload()
@@ -1297,6 +1398,7 @@ export default function FieldService() {
                 write={write}
                 onClick={() => { setActiveOrder(o.id); setView('workspace') }}
                 onQuickStatus={quickStatus}
+                onDelete={write ? setDel : undefined}
               />
             ))}
           </div>
@@ -1345,6 +1447,8 @@ export default function FieldService() {
         open={!!delTarget}
         title="حذف المشروع"
         message={`هل تريد حذف "${delTarget?.title}"؟`}
+        confirmLabel="حذف"
+        confirmVariant="danger"
         onConfirm={del}
         onCancel={() => setDel(null)}
         loading={deleting}

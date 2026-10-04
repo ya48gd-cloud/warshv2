@@ -35,13 +35,24 @@ export default function WorkshopProfile() {
   const [uploading, setUploading]       = useState(false)
   const [deletingLogo, setDeletingLogo] = useState(false)
   const [confirmDeleteLogo, setConfirmDeleteLogo] = useState(false)
+  // إصلاح: لو فشل تحميل البيانات كان الفورم بيفضل بالقيم الافتراضية
+  // ("ورشة معدات الأعلاف"...) وزرار الحفظ شغال — ضغطة حفظ واحدة كانت
+  // بتمسح بيانات الورشة الحقيقية. دلوقتي بنمنع الحفظ لحد ما التحميل ينجح.
+  const [loadError, setLoadError]       = useState(null)
+  const [reloadKey, setReloadKey]       = useState(0)
+
+  // تنظيف الـ object URL المؤقت عند تغييره أو مغادرة الصفحة (منع تسريب ذاكرة)
+  useEffect(() => () => { if (logoBlobUrl) URL.revokeObjectURL(logoBlobUrl) }, [logoBlobUrl])
 
   // تحميل بيانات الورشة من الباك
   useEffect(() => {
     let alive = true
+    setLoading(true)
+    setLoadError(null)
     api.workshop.get()
       .then(data => {
         if (!alive) return
+        _cache = data
         setForm({
           name:           data.name           || '',
           description:    data.description    || '',
@@ -70,30 +81,54 @@ export default function WorkshopProfile() {
             .catch(() => {})
         }
       })
-      .catch(() => toast('تعذّر تحميل بيانات الورشة', 'error'))
+      .catch((err) => {
+        if (!alive) return
+        const m = err?.message || 'تعذّر تحميل بيانات الورشة'
+        setLoadError(m)
+        toast(`تعذّر تحميل بيانات الورشة: ${m}`, 'error')
+      })
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [])
+  }, [reloadKey])
 
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }))
 
   const save = async () => {
-    if (!form.name?.trim()) { toast('اسم الورشة مطلوب', 'error'); return }
+    if (saving) return
+    if (loadError) { toast('لا يمكن الحفظ قبل تحميل بيانات الورشة الحالية بنجاح', 'error'); return }
+    const name = (form.name || '').trim()
+    if (!name) { toast('اسم الورشة مطلوب', 'error'); return }
+    const email = (form.email || '').trim()
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      toast('البريد الإلكتروني غير صحيح', 'error'); return
+    }
     setSaving(true)
     try {
-      await api.workshop.update(form)
+      const payload = { ...form, name, email, currency: (form.currency || '').trim() || 'ج.م' }
+      const updated = await api.workshop.update(payload)
+      // تحديث الكاش المشترك (الطباعة/التقارير) والعملة العامة فوراً بدل ما
+      // تفضل القيم القديمة لحد إعادة تحميل الصفحة
+      if (updated && typeof updated === 'object') {
+        _cache = updated
+        if (updated.currency) window.__ERP_CURRENCY__ = updated.currency
+      }
       toast('تم حفظ البيانات')
-    } catch {
-      toast('فشل الحفظ', 'error')
+    } catch (err) {
+      toast(err?.message ? `فشل الحفظ: ${err.message}` : 'فشل الحفظ', 'error')
     } finally {
       setSaving(false)
     }
   }
 
+  const ALLOWED_LOGO_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/svg+xml']
+
   const handleLogo = async (e) => {
     const file = e.target.files?.[0]
     if (!file) return
-    if (file.size > 5 * 1024 * 1024) { toast('حجم اللوجو أكبر من 5 ميجابايت', 'error'); return }
+    if (file.type && !ALLOWED_LOGO_TYPES.includes(file.type)) {
+      toast('نوع الملف غير مدعوم — استخدم PNG أو JPG أو WEBP أو SVG', 'error'); e.target.value = ''; return
+    }
+    if (file.size > 5 * 1024 * 1024) { toast('حجم اللوجو أكبر من 5 ميجابايت', 'error'); e.target.value = ''; return }
     setUploading(true)
     try {
       const fd = new FormData()
@@ -104,7 +139,12 @@ export default function WorkshopProfile() {
         headers: token ? { 'Authorization': `Bearer ${token}` } : {},
         body: fd,
       })
-      if (!res.ok) throw new Error('upload failed')
+      if (!res.ok) {
+        let detail = ''
+        try { const j = await res.json(); detail = typeof j?.detail === 'string' ? j.detail : '' } catch { /* ignore */ }
+        if (res.status === 401) window.dispatchEvent(new CustomEvent('erp:session-expired'))
+        throw new Error(detail || 'فشل رفع اللوجو')
+      }
       const data = await res.json()
       setHasLogo(true)
       setLogoData(data.logo_data || null)
@@ -112,8 +152,8 @@ export default function WorkshopProfile() {
       // تحديث الكاش المشترك فوراً
       _cache = data
       toast('تم رفع اللوجو')
-    } catch {
-      toast('فشل رفع اللوجو', 'error')
+    } catch (err) {
+      toast(err?.message || 'فشل رفع اللوجو', 'error')
     } finally {
       setUploading(false)
       e.target.value = ''
@@ -129,8 +169,8 @@ export default function WorkshopProfile() {
       if (logoBlobUrl) { URL.revokeObjectURL(logoBlobUrl); setLogoBlobUrl(null) }
       if (_cache) _cache = { ..._cache, logo_data: null, has_logo: false }
       toast('تم حذف اللوجو')
-    } catch {
-      toast('فشل الحذف', 'error')
+    } catch (err) {
+      toast(err?.message ? `فشل الحذف: ${err.message}` : 'فشل الحذف', 'error')
     } finally {
       setDeletingLogo(false)
     }
@@ -155,7 +195,14 @@ export default function WorkshopProfile() {
   const logoSrc = logoData || logoBlobUrl || null
 
   return (
-    <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 1fr' }}>
+    <div className="grid gap-4 grid-cols-1 md:grid-cols-2">
+      {loadError && (
+        <div className="card md:col-span-2 flex items-center justify-between gap-3 text-sm"
+             style={{ background: 'var(--red-lt)', color: 'var(--red)' }}>
+          <span>تعذّر تحميل بيانات الورشة ({loadError}) — الحفظ معطّل لحماية البيانات الحالية.</span>
+          <button className="btn btn-sm" onClick={() => setReloadKey(k => k + 1)}>إعادة المحاولة</button>
+        </div>
+      )}
       {/* Logo panel */}
       <div className="card flex flex-col gap-4">
         <div className="text-sm font-semibold">لوجو التقارير</div>
@@ -204,7 +251,7 @@ export default function WorkshopProfile() {
           <input className="field-input w-full" value={form.description}
                  onChange={e => f('description', e.target.value)} />
         </div>
-        <div className="grid gap-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2">
           <div>
             <label className="field-label">التليفون (أرضي)</label>
             <input className="field-input w-full" value={form.phone}
@@ -216,7 +263,7 @@ export default function WorkshopProfile() {
                    onChange={e => f('mobile', e.target.value)} placeholder="010xxxxxxxx" />
           </div>
         </div>
-        <div className="grid gap-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2">
           <div>
             <label className="field-label">البريد الإلكتروني</label>
             <input className="field-input w-full" type="email" value={form.email}
@@ -228,7 +275,7 @@ export default function WorkshopProfile() {
                    onChange={e => f('currency', e.target.value)} placeholder="ج.م" />
           </div>
         </div>
-        <div className="grid gap-3" style={{ gridTemplateColumns: '1fr 1fr' }}>
+        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2">
           <div>
             <label className="field-label">البطاقة الضريبية</label>
             <input className="field-input w-full" value={form.tax_id}
@@ -250,7 +297,7 @@ export default function WorkshopProfile() {
           <textarea className="field-input w-full" rows={2} value={form.report_footer}
                     onChange={e => f('report_footer', e.target.value)} />
         </div>
-        <button className="btn btn-primary self-start" onClick={save} disabled={saving}>
+        <button className="btn btn-primary self-start" onClick={save} disabled={saving || !!loadError}>
           {saving ? '…' : '💾 حفظ البيانات'}
         </button>
       </div>

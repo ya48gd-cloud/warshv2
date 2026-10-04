@@ -6,7 +6,8 @@
 export const egp = (n, currency) => {
   const sym = currency || (typeof window !== 'undefined' && window.__ERP_CURRENCY__) || 'ج'
   // نستخدم الأرقام الغربية (latn) لأن الوثائق المالية تعتمدها حتى في البيئات العربية
-  return Number(n || 0).toLocaleString('ar-EG', {
+  const v = Number(n || 0)
+  return (Number.isFinite(v) ? v : 0).toLocaleString('ar-EG', {
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
     numberingSystem: 'latn',
@@ -14,7 +15,7 @@ export const egp = (n, currency) => {
 }
 
 /** Format a number with decimals */
-export const num = (n, d = 1) => Number(n || 0).toFixed(d)
+export const num = (n, d = 1) => { const v = Number(n || 0); return (Number.isFinite(v) ? v : 0).toFixed(d) }
 
 /** Arabic status labels */
 export const WO_STATUS = {
@@ -39,7 +40,12 @@ export const QUOTE_STATUS = {
 }
 
 /** Today as YYYY-MM-DD */
-export const today = () => new Date().toISOString().slice(0, 10)
+// بالتوقيت المحلي — toISOString() بيرجع تاريخ UTC فكان بعد منتصف الليل
+// بالتوقيت المحلي (أو قبل الـ 2/3 صباحاً في مصر) بيرجع تاريخ امبارح
+export const today = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 
 /**
  * Format a date string to Arabic-friendly format.
@@ -48,12 +54,19 @@ export const today = () => new Date().toISOString().slice(0, 10)
  */
 export const fmtDate = (s) => {
   if (!s) return '—'
-  const d = s.includes('T') ? new Date(s) : new Date(s + 'T00:00:00')
+  // حماية: قيمة Date/رقم (مش نص) كانت بتكسر s.includes، وتاريخ غير صالح كان بيطلع "Invalid Date"
+  let d
+  if (s instanceof Date || typeof s === 'number') d = new Date(s)
+  else {
+    const str = String(s)
+    d = str.includes('T') || str.includes(' ') ? new Date(str.replace(' ', 'T')) : new Date(str + 'T00:00:00')
+  }
+  if (isNaN(d.getTime())) return String(s)
   return d.toLocaleDateString('ar-EG', { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
 /** Truncate a string */
-export const trunc = (s, n = 30) => s && s.length > n ? s.slice(0, n) + '…' : (s || '—')
+export const trunc = (s, n = 30) => { if (s == null || s === '') return '—'; s = String(s); return s.length > n ? s.slice(0, n) + '…' : s }
 
 /** Clamp 0–100 */
 export const pct = (v, t) => t ? Math.min(100, Math.round((v / t) * 100)) : 0

@@ -63,7 +63,15 @@ function KpiCard({ k }) {
   )
 }
 
-function AlertBar({ alerts }) {
+// روابط التنبيهات الذكية بترجع مسارات زي "/materials/12" — نحولها لمفتاح صفحة
+const ALERT_LINK_PAGES = { 'warranty-certs': 'workcompletioncerts' }
+function alertPage(link) {
+  if (!link || typeof link !== 'string') return null
+  const seg = link.replace(/^\/+/, '').split(/[/?#]/)[0]
+  return seg ? (ALERT_LINK_PAGES[seg] || seg) : null
+}
+
+function AlertBar({ alerts, onNavigate }) {
   if (!alerts?.length) return null
   return (
     <div className="flex flex-col gap-2 mb-4">
@@ -77,7 +85,10 @@ function AlertBar({ alerts }) {
               <span className="font-semibold" style={{ color: col }}>{a.icon} {a.title}</span>
               {a.detail && <span className="text-erp-muted text-xs mr-2">— {a.detail}</span>}
             </div>
-            {a.action && <span className="text-xs font-medium cursor-pointer" style={{ color: col }}>{a.action} →</span>}
+            {a.action && (alertPage(a.link) && onNavigate
+              ? <button type="button" className="text-xs font-medium cursor-pointer" style={{ color: col, background: 'none', border: 'none', fontFamily: 'inherit', flexShrink: 0 }}
+                  onClick={() => onNavigate(alertPage(a.link))}>{a.action} →</button>
+              : <span className="text-xs font-medium" style={{ color: col, flexShrink: 0 }}>{a.action} →</span>)}
           </div>
         )
       })}
@@ -106,21 +117,35 @@ function ControlPanel({ onNavigate }) {
         active_work_orders: { value: kpis.open_work_orders, label: 'أوامر نشطة', color: 'blue', icon: '📋' },
         low_stock_items:    { value: kpis.low_stock_count,  label: 'مواد ناقصة', color: 'red',  icon: '⚠️' },
       } : {},
-      alerts: [], work_orders: wos, low_stock: lowStock, mrp: []
+      alerts: [],
+      work_orders: (Array.isArray(wos) ? wos : []).filter(w => ['in_progress', 'draft'].includes(w.status)),
+      low_stock: Array.isArray(lowStock) ? lowStock : [],
+      mrp: []
     }
   }))
 
   if (loading) return <PageSpinner />
 
   const kpis     = data?.kpis || {}
-  const alerts   = [...(alertsData || []), ...(data?.alerts || [])]
-  const wos      = data?.work_orders || []
-  const lowStock = data?.low_stock || []
-  const mrp      = data?.mrp || []
+  // /production/alerts و /dashboard/full.alerts بيرجعوا نفس التنبيهات الذكية —
+  // كان كل تنبيه بيظهر مرتين. بنشيل المكرر (نفس العنوان + التفاصيل).
+  const alerts   = (() => {
+    const seen = new Set()
+    return [...(Array.isArray(alertsData) ? alertsData : []), ...(Array.isArray(data?.alerts) ? data.alerts : [])]
+      .filter(a => {
+        if (!a) return false
+        const k = `${a.level}|${a.title}|${a.detail ?? ''}`
+        if (seen.has(k)) return false
+        seen.add(k); return true
+      })
+  })()
+  const wos      = Array.isArray(data?.work_orders) ? data.work_orders : []
+  const lowStock = Array.isArray(data?.low_stock) ? data.low_stock : []
+  const mrp      = Array.isArray(data?.mrp) ? data.mrp : []
 
   return (
     <div className="flex flex-col gap-4">
-      <AlertBar alerts={alerts} />
+      <AlertBar alerts={alerts} onNavigate={onNavigate} />
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {KPI_ORDER.map(k => kpis[k] ? <KpiCard key={k} k={kpis[k]} /> : null)}
@@ -136,11 +161,13 @@ function ControlPanel({ onNavigate }) {
                   <thead><tr><th>الكود</th><th>المعدة</th><th>الحالة</th><th>التقدم</th><th>التكلفة</th></tr></thead>
                   <tbody>
                     {wos.slice(0, 6).map(wo => {
-                      const pct = wo.cost_pct > 1 ? Math.min(100, wo.cost_pct) : Math.min(100, (wo.cost_pct || 0) * 100)
+                      // cost_pct بيرجع من الباك إند كنسبة مئوية (0-100) في /dashboard/full و /accounting/work-orders —
+                      // الكود القديم كان بيضرب القيم <= 1 في 100 (1% كانت بتظهر 100%)
+                      const pct = Math.max(0, Math.min(100, Math.round(Number(wo.cost_pct) || 0)))
                       return (
                         <tr key={wo.id} className="cursor-pointer" onClick={() => onNavigate?.('workorders')}>
                           <td className="font-medium font-mono text-xs">{wo.code}</td>
-                          <td className="text-erp-muted text-xs">{wo.equipment_name_ar || wo.equipment_name || '—'}</td>
+                          <td className="text-erp-muted text-xs">{wo.equipment_name_ar || wo.equipment_name || wo.equipment || '—'}</td>
                           <td><StatusBadge map={WO_STATUS} value={wo.status} /></td>
                           <td>
                             <div className="w-20">
@@ -169,14 +196,14 @@ function ControlPanel({ onNavigate }) {
                   <thead><tr><th>المادة</th><th>المتوفر</th><th>الحد</th><th>النقص</th></tr></thead>
                   <tbody>
                     {lowStock.slice(0, 6).map(m => {
-                      const p = m.pct || 0
+                      const p = m.pct ?? (Number(m.reorder_level) > 0 ? Math.round(Number(m.stock_qty || 0) / Number(m.reorder_level) * 100) : 0)
                       const col = p < 25 ? 'var(--red)' : p < 50 ? 'var(--amber-md)' : 'var(--teal)'
                       return (
                         <tr key={m.id} className="cursor-pointer" onClick={() => onNavigate?.('materials')}>
-                          <td><div className="font-medium text-xs">{m.name_ar || m.code}</div></td>
-                          <td className="font-semibold text-xs" style={{ color: col }}>{Number(m.stock_qty).toFixed(1)} {m.unit}</td>
-                          <td className="text-erp-muted text-xs">{Number(m.reorder_level).toFixed(1)}</td>
-                          <td className="text-xs" style={{ color: 'var(--red)' }}>{Number(m.shortage).toFixed(1)}</td>
+                          <td><div className="font-medium text-xs">{m.name_ar || m.name || m.code}</div></td>
+                          <td className="font-semibold text-xs" style={{ color: col }}>{Number(m.stock_qty || 0).toFixed(1)} {m.unit}</td>
+                          <td className="text-erp-muted text-xs">{Number(m.reorder_level || 0).toFixed(1)}</td>
+                          <td className="text-xs" style={{ color: 'var(--red)' }}>{Number(m.shortage ?? Math.max(0, Number(m.reorder_level || 0) - Number(m.stock_qty || 0))).toFixed(1)}</td>
                         </tr>
                       )
                     })}
@@ -197,10 +224,10 @@ function ControlPanel({ onNavigate }) {
                      style={{ background: 'var(--amber-lt)' }}>
                   <div>
                     <div className="font-medium text-sm">{s.material_name}</div>
-                    <div className="text-xs text-erp-muted mt-0.5">نقص: {Number(s.shortage).toFixed(1)} — وصول: {s.expected_by}</div>
+                    <div className="text-xs text-erp-muted mt-0.5">نقص: {Number(s.shortage || 0).toFixed(1)} — وصول: {s.expected_by ? fmtDate(s.expected_by) : '—'}</div>
                   </div>
                   <div className="text-xs font-semibold" style={{ color: 'var(--amber)' }}>
-                    {Number(s.suggested_qty).toFixed(1)} وحدة
+                    {Number(s.suggested_qty || 0).toFixed(1)} {s.unit || 'وحدة'}
                   </div>
                 </div>
               ))
@@ -288,8 +315,12 @@ function buildPredictions(data) {
 
   const now = Date.now()
   const churnBuckets = { high: 0, medium: 0, low: 0 }
-  ;(customers || []).forEach(c => {
-    const days = Math.round((now - (c.last_order_date ? new Date(c.last_order_date).getTime() : 0)) / 86400000)
+  ;(Array.isArray(customers) ? customers : []).forEach(c => {
+    // عميل بدون أي طلب/فاتورة مش "خطر فقدان" — كان بيتحسب كأن آخر طلب سنة 1970
+    if (!c.last_order_date) return
+    const t = new Date(c.last_order_date).getTime()
+    if (Number.isNaN(t)) return
+    const days = Math.round((now - t) / 86400000)
     if (days > 90) churnBuckets.high++
     else if (days > 60) churnBuckets.medium++
     else churnBuckets.low++
@@ -319,6 +350,7 @@ function SectionCard({ title, badge, badgeColor, children }) {
 }
 
 function RevenueChart({ history, forecastNext, forecastNext2 }) {
+  if (!history?.length) return <div style={{ textAlign: 'center', color: '#94A3B8', padding: '30px 0', fontSize: 12 }}>لا توجد بيانات مبيعات كافية</div>
   const now = new Date()
   const data = (history || []).map((v, i) => {
     const idx = (now.getMonth() - (history.length - 1 - i) + 12) % 12
@@ -346,28 +378,33 @@ function RevenueChart({ history, forecastNext, forecastNext2 }) {
 
 function RealCashFlowChart() {
   const [cf, setCf] = useState(null)
-  const toast = useToast()
+  const [cfError, setCfError] = useState(false)
   useEffect(() => {
+    let alive = true
     api.dashboard.cashflowChart()
-      .then(setCf)
-      .catch(bgErr('كاش فلو', () => {}))
+      .then(r => { if (alive) setCf(r) })
+      // كان الفشل بيسيب المكوّن على "جاري التحميل..." للأبد
+      .catch(bgErr('كاش فلو', () => { if (alive) setCfError(true) }))
+    return () => { alive = false }
   }, [])
+  if (cfError) return <div style={{ textAlign: 'center', color: '#94A3B8', padding: '30px 0', fontSize: 12 }}>تعذّر تحميل بيانات التدفق النقدي</div>
   if (!cf) return <div style={{ textAlign: 'center', color: '#94A3B8', padding: '30px 0', fontSize: 12 }}>جاري التحميل...</div>
+  if (!Array.isArray(cf.labels) || cf.labels.length === 0) return <div style={{ textAlign: 'center', color: '#94A3B8', padding: '30px 0', fontSize: 12 }}>لا توجد حركات نقدية</div>
 
   // نعرض آخر 14 يوم بس عشان الرسم يكون واضح
   const slice = 14
   const labels  = cf.labels.slice(-slice)
-  const inflow  = cf.inflow.slice(-slice)
-  const outflow = cf.outflow.slice(-slice)
-  const net     = cf.net.slice(-slice)
+  const inflow  = (cf.inflow  || []).slice(-slice)
+  const outflow = (cf.outflow || []).slice(-slice)
+  const net     = (cf.net     || []).slice(-slice)
   const chartData = labels.map((d, i) => ({
-    date: d.slice(5),  // MM-DD فقط
+    date: String(d).slice(5),  // MM-DD فقط
     تحصيلات: inflow[i],
     مدفوعات: outflow[i],
     صافي: net[i],
   }))
-  const totalIn  = cf.inflow.reduce((a, b) => a + b, 0)
-  const totalOut = cf.outflow.reduce((a, b) => a + b, 0)
+  const totalIn  = (cf.inflow  || []).reduce((a, b) => a + (Number(b) || 0), 0)
+  const totalOut = (cf.outflow || []).reduce((a, b) => a + (Number(b) || 0), 0)
   const totalNet = totalIn - totalOut
 
   return (
@@ -480,7 +517,10 @@ function TickerStrip({ prices }) {
       background: '#0B1F3A', borderRadius: 12, padding: '10px 14px',
       display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12,
     }}>
-      <div style={{ fontSize: 10, color: '#64748B', marginLeft: 6, flexShrink: 0 }}>أسعار السوق</div>
+      <div style={{ fontSize: 10, color: '#64748B', marginLeft: 6, flexShrink: 0 }}>
+        أسعار السوق
+        <div style={{ fontSize: 8, color: '#475569', marginTop: 1 }}>أسعار استرشادية تقريبية — ليست لحظية</div>
+      </div>
       {Object.values(prices).map((p, i) => {
         const displayVal = p.value >= 10000 ? fmt(p.value / 1000, 1) + 'K' : fmt(p.value, p.value < 100 ? 2 : 0)
         return (
@@ -540,14 +580,17 @@ function AnalyticsPanel() {
         salesData.collection_rate = Math.round((salesData.mtd_collected || 0) / salesData.mtd_invoiced * 100)
       const combined = {
         ...execDash, lowStock, workOrders, customers, smartAlerts: smartAlerts || [],
-        sales:      { ...salesData, monthly: salesSummary?.monthly_breakdown?.map(m => m.total) || [180000,210000,195000,240000,228000,305000] },
+        sales:      { ...salesData, monthly: (salesSummary?.monthly_breakdown || []).map(m => Number(m.total) || 0) },
         purchases:  { ...(execDash.purchases || {}), ...purchSummary },
         production: { ...(execDash.production || {}), by_type: prodByType?.by_type || [] },
       }
       setErpData(combined)
       setPreds(buildPredictions(combined))
       setLastUpdate(new Date().toLocaleTimeString('ar-EG'))
-    } catch (e) { console.warn('Analytics:', e) }
+    } catch (e) {
+      console.warn('Analytics:', e)
+      if (!silent) toast(e?.message || 'تعذّر تحميل بيانات التحليلات', 'error')
+    }
     finally { setLoading(false); setRefreshing(false) }
   }, [])
 
@@ -591,7 +634,7 @@ function AnalyticsPanel() {
       <TickerStrip prices={prices} />
 
       {/* KPI row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+      <div className="grid grid-cols-2 md:grid-cols-4" style={{ gap: 10 }}>
         {[
           { label: 'أوامر إنتاج نشطة', value: prod.open_work_orders || 0,     icon: '🏭', color: '#3B82F6' },
           { label: 'مبيعات الشهر',      value: fmtK(sal.mtd_invoiced),         icon: '💰', color: '#22C55E' },
@@ -606,7 +649,7 @@ function AnalyticsPanel() {
       </div>
 
       {/* Charts row 1 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr 1fr', gap: 12 }}>
+      <div className="grid grid-cols-1 lg:grid-cols-[1.5fr_1fr_1fr]" style={{ gap: 12 }}>
         <SectionCard title="تنبؤ المبيعات" badge="تنبؤ خطي" badgeColor="blue">
           <div style={{ fontSize: 10, color: '#94A3B8', marginBottom: 6 }}>الخط المتقطع = التنبؤ</div>
           <RevenueChart history={preds?.salesHistory} forecastNext={preds?.forecastNext} forecastNext2={preds?.forecastNext2} />
@@ -621,7 +664,7 @@ function AnalyticsPanel() {
       </div>
 
       {/* Charts row 2 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+      <div className="grid grid-cols-1 md:grid-cols-2" style={{ gap: 12 }}>
         <SectionCard title="توقع نفاد المخزون" badge="الأيام المتبقية" badgeColor="red">
           <div style={{ fontSize: 10, color: '#94A3B8', marginBottom: 6 }}>بناءً على معدل الاستهلاك اليومي</div>
           <StockoutBars items={preds?.stockoutItems} />

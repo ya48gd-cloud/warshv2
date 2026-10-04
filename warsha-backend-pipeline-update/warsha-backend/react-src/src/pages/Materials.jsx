@@ -14,6 +14,7 @@ import Modal, { ModalFooter } from '../components/ui/Modal'
 import { Input, Select, FormGrid } from '../components/ui/Field'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
 import { PageSpinner } from '../components/ui/Spinner'
+import StockTransferModal from '../components/ui/StockTransferModal'
 
 const barWord = (name) => (name || '').trim().split(/\s+/)[0] || 'سيخ'
 
@@ -32,7 +33,11 @@ const TABS = [
   { key: 'consumable', label: '🧴 مستهلكات' },
 ]
 
-export default function Materials() {
+// أصناف النظام اللي بتتولّد من الإنتاج (تحت التشغيل / تام / هالك / نسالة) —
+// مكانها الطبيعي مخزنها، مش وسط قايمة الخامات
+const isProductionItem = (m) => /^(WIP|FG|SCRAP|REMNANT)-/.test(m?.code || '')
+
+export default function Materials({ warehouseId = '', warehouseSummary = [], onStockChanged, onMovement } = {}) {
   const { canWrite } = useAuth()
   const toast = useToast()
   const write = canWrite('inventory')
@@ -40,6 +45,29 @@ export default function Materials() {
   const { data: materials, loading, reload } = useApi(() => api.inventory.materials())
   const { data: categories, reload: reloadCats } = useApi(() => api.inventory.categories().catch(bgErr('فئات الأصناف', [])))
   const { data: suppliers } = useApi(() => api.purchases.suppliers().catch(bgErr('قائمة الموردين', [])))
+  // توزيع رصيد كل مادة على المخازن (StockQuant) + المخازن نفسها لتحويل الرصيد بينها
+  const { data: whDist, reload: reloadDist } = useApi(() => api.inventory.warehouseDistribution().catch(bgErr('توزيع المخازن', {})))
+  const { data: warehouses } = useApi(() => api.warehouses.list().catch(bgErr('المخازن', [])))
+  const [transferMat, setTransferMat] = useState(null) // null = مقفول، '' = بدون مادة محددة
+  const [showProd, setShowProd] = useState(false)   // "كل المخازن": إظهار أصناف الإنتاج
+  const [showZero, setShowZero] = useState(false)   // مخزن محدد: إظهار الأصناف اللي رصيدها صفر فيه
+  const selWh = useMemo(
+    () => (warehouseSummary || []).find(w => String(w.id) === String(warehouseId)) || null,
+    [warehouseSummary, warehouseId])
+  const whQtyOf = (m) => (whDist?.[String(m.id)] || [])
+    .filter(d => String(d.warehouse_id) === String(warehouseId))
+    .reduce((s, d) => s + Number(d.qty || 0), 0)
+  const afterStockChange = () => { reload(); reloadDist(); onStockChanged?.() }
+
+  // القايمة الأساسية حسب المخزن المختار — كل الفلاتر التانية بتشتغل فوقها
+  const baseList = useMemo(() => {
+    if (!materials) return []
+    if (warehouseId) {
+      return materials.filter(m => Math.abs(whQtyOf(m)) > 1e-9 || (showZero && !isProductionItem(m)))
+    }
+    return showProd ? materials : materials.filter(m => !isProductionItem(m))
+  }, [materials, whDist, warehouseId, showProd, showZero]) // eslint-disable-line react-hooks/exhaustive-deps
+  const prodCount = useMemo(() => (materials || []).filter(isProductionItem).length, [materials])
 
   const [q, setQ]               = useState('')
   const [filterLow, setFilterLow] = useState(false)
@@ -58,7 +86,7 @@ export default function Materials() {
   const filtered = useMemo(() => {
     if (!materials) return []
     const lq = q.toLowerCase()
-    let list = materials
+    let list = baseList
     if (activeTab !== 'all') {
       list = list.filter(m => {
         const kind = m.material_kind || (m.is_plate ? 'plate' : 'general')
@@ -73,11 +101,11 @@ export default function Materials() {
       m.code?.toLowerCase().includes(lq)
     )
     return list
-  }, [materials, q, filterLow, filterCat, activeTab])
+  }, [materials, baseList, q, filterLow, filterCat, activeTab])
 
   const lowCount = useMemo(
-    () => (materials || []).filter(m => Number(m.stock_qty) <= Number(m.reorder_level)).length,
-    [materials]
+    () => baseList.filter(m => Number(m.stock_qty) <= Number(m.reorder_level)).length,
+    [baseList]
   )
 
   const formDensity = useMemo(() => {
@@ -121,6 +149,16 @@ export default function Materials() {
     if (!form.name_ar?.trim()) errs.name_ar     = 'الاسم بالعربي مطلوب'
     if (!form.category_id)     errs.category_id  = 'اختر الفئة'
     if (!form.unit_cost || Number(form.unit_cost) <= 0) errs.unit_cost = 'سعر الوحدة مطلوب'
+    // نفس قواعد الباك-إند (MaterialCreate validators) عشان المستخدم يشوف الخطأ قبل الإرسال
+    if (form.name_ar && form.name_ar.trim().length > 200) errs.name_ar = 'اسم المادة طويل جداً (الحد الأقصى 200 حرف)'
+    if (form.code && String(form.code).length > 50) { toast('كود المادة طويل جداً (الحد الأقصى 50 حرف)', 'error'); return }
+    if (form.reorder_level !== '' && form.reorder_level != null && Number(form.reorder_level) < 0) {
+      toast('حد إعادة الطلب لا يمكن أن يكون سالباً', 'error'); return
+    }
+    const dimFields = ['thickness_mm', 'plate_length_cm', 'plate_width_cm', 'plate_weight_kg', 'bar_length_cm', 'bar_weight_kg']
+    if (dimFields.some(k => form[k] !== '' && form[k] != null && Number(form[k]) < 0)) {
+      toast('الأبعاد والأوزان لا يمكن أن تكون سالبة', 'error'); return
+    }
     if (Object.keys(errs).length) { setFormErrors(errs); toast('تحقق من الحقول المطلوبة', 'error'); return }
     setFormErrors({})
     const payload = {
@@ -147,8 +185,24 @@ export default function Materials() {
 
   const [doDelete] = useAction(async () => {
     await api.inventory.deleteMat(deleteTarget.id)
-    toast('تم الحذف'); setDeleteTarget(null); reload()
+    toast('تم الحذف'); setDeleteTarget(null); reload(); reloadCats()
   })
+
+  // حذف فئة — كان بيتنفّذ فورًا من غير أي تأكيد
+  const [catDeleteTarget, setCatDeleteTarget] = useState(null)
+  const [deletingCat, setDeletingCat] = useState(false)
+  const confirmDeleteCat = async (c) => {
+    if (!c || deletingCat) return
+    setDeletingCat(true)
+    try {
+      await api.inventory.deleteCat(c.id)
+      toast('تم حذف الصنف'); await reloadCats()
+    } catch (err) {
+      toast(err?.message || 'تعذّر حذف الصنف', 'error')
+    } finally {
+      setDeletingCat(false)
+    }
+  }
 
   const [addCategory, addingCat] = useAction(async () => {
     const name = newCatName.trim()
@@ -165,6 +219,25 @@ export default function Materials() {
 
   return (
     <div className="flex flex-col gap-4">
+      {/* سياق المخزن المختار: ملخصه + عمليات عليه مباشرة */}
+      {selWh && (
+        <div className="card flex items-center gap-3 py-3 flex-wrap" style={{ borderInlineStart: '4px solid var(--teal)' }}>
+          <div className="flex-1 min-w-48">
+            <div className="font-semibold">{selWh.name_ar}</div>
+            <div className="text-xs text-erp-muted">
+              {Number(selWh.items_count || 0)} صنف فيه رصيد · قيمة المخزون <b className="font-mono">{egp(selWh.total_value)}</b>
+            </div>
+          </div>
+          {write && onMovement && <button className="btn btn-sm" onClick={() => onMovement({ type: 'in' })}>📥 وارد لهذا المخزن</button>}
+          {write && onMovement && <button className="btn btn-sm" onClick={() => onMovement({ type: 'out' })}>📤 صرف من هذا المخزن</button>}
+          {write && <button className="btn btn-sm" onClick={() => setTransferMat('')}>⇄ تحويل من هذا المخزن</button>}
+          <label className="text-xs flex items-center gap-1 cursor-pointer">
+            <input type="checkbox" checked={showZero} onChange={e => setShowZero(e.target.checked)} />
+            إظهار الأصناف غير الموجودة فيه
+          </label>
+        </div>
+      )}
+
       {/* Toolbar */}
       <div className="card flex items-center gap-3 py-3 flex-wrap">
         <div className="flex-1 min-w-48">
@@ -181,10 +254,17 @@ export default function Materials() {
           ))}
         </select>
         <div className="text-xs text-erp-muted">{filtered.length} مادة</div>
+        {!warehouseId && prodCount > 0 && (
+          <label className="text-xs flex items-center gap-1 cursor-pointer" title="أصناف بيولّدها النظام من أوامر الإنتاج: تحت التشغيل، تام الصنع، هالك، نسالة">
+            <input type="checkbox" checked={showProd} onChange={e => setShowProd(e.target.checked)} />
+            أصناف الإنتاج ({prodCount})
+          </label>
+        )}
         <button className="btn btn-sm text-xs" title="تصدير Excel"
           onClick={() => api.export.materials()}>📥 Excel</button>
         {write && <button className="btn btn-sm" onClick={() => setCatModal(true)}>+ صنف</button>}
         {write && <button className="btn btn-sm" style={{background:'var(--teal)',color:'#fff',borderColor:'var(--teal)'}} onClick={() => setShowCatalog(true)}>📦 من الكتالوج</button>}
+        {write && !selWh && <button className="btn btn-sm" onClick={() => setTransferMat('')}>⇄ تحويل بين المخازن</button>}
         {write && <button className="btn btn-primary btn-sm" onClick={openAdd}>+ مادة جديدة</button>}
       </div>
 
@@ -192,8 +272,8 @@ export default function Materials() {
       <div className="flex gap-1 flex-wrap">
         {TABS.map(tab => {
           const count = tab.key === 'all'
-            ? (materials || []).length
-            : (materials || []).filter(m => (m.material_kind || (m.is_plate ? 'plate' : 'general')) === tab.key).length
+            ? baseList.length
+            : baseList.filter(m => (m.material_kind || (m.is_plate ? 'plate' : 'general')) === tab.key).length
           return (
             <button key={tab.key} className="btn btn-sm"
               style={activeTab === tab.key ? { background: 'var(--blue)', color: '#fff', borderColor: 'var(--blue)' } : {}}
@@ -211,22 +291,27 @@ export default function Materials() {
             <thead>
               <tr>
                 <th>الكود</th><th>الاسم</th><th>الفئة</th><th>النوع</th>
-                <th>مستوى المخزون</th><th>محجوز</th><th>متاح</th><th>سعر الوحدة</th><th>القيمة الإجمالية</th>
+                <th>{selWh ? `الرصيد في ${selWh.name_ar}` : 'مستوى المخزون'}</th>
+                <th>{selWh ? 'محجوز (كل المخازن)' : 'محجوز'}</th><th>{selWh ? 'متاح (كل المخازن)' : 'متاح'}</th>
+                <th>سعر الوحدة</th><th>{selWh ? 'القيمة في المخزن' : 'القيمة الإجمالية'}</th>
                 <th>مواصفات المادة</th>
-                {write && <th style={{ width: 90 }}>إجراءات</th>}
+                {write && <th style={{ width: 120 }}>إجراءات</th>}
               </tr>
             </thead>
             <tbody>
               {!filtered.length && (
                 <tr><td colSpan={write ? 11 : 10} className="text-center text-erp-muted py-10">
-                  {q || filterLow ? 'لا توجد نتائج' : 'لا توجد مواد — أضف أول مادة'}
+                  {q || filterLow || filterCat || activeTab !== 'all' ? 'لا توجد نتائج'
+                    : selWh ? `مفيش أصناف فيها رصيد في ${selWh.name_ar}` : 'لا توجد مواد — أضف أول مادة'}
                 </td></tr>
               )}
               {filtered.map(m => {
-                const stock    = Number(m.stock_qty   || 0)
+                const totalStock = Number(m.stock_qty || 0)
+                // في مخزن محدد: الرقم الأساسي والقيمة = رصيد المخزن ده؛ حد الطلب بيفضل على الإجمالي
+                const stock    = warehouseId ? whQtyOf(m) : totalStock
                 const reorder  = Number(m.reorder_level || 0)
-                const low      = reorder > 0 && stock <= reorder
-                const empty    = stock <= 0
+                const low      = reorder > 0 && totalStock <= reorder
+                const empty    = warehouseId ? stock <= 0 : totalStock <= 0
                 const pct      = reorder > 0 ? Math.min(100, (stock / reorder) * 100) : 100
                 const barColor = empty ? '#ef4444' : low ? '#f59e0b' : '#22c55e'
                 const totalVal = stock * Number(m.unit_cost || 0)
@@ -295,6 +380,20 @@ export default function Materials() {
                       <div style={{ height: 5, background: 'var(--erp-border)', borderRadius: 3, overflow: 'hidden' }}>
                         <div style={{ height: '100%', width: `${pct}%`, background: barColor, borderRadius: 3, transition: 'width .3s' }} />
                       </div>
+                      {warehouseId && Math.abs(totalStock - stock) > 1e-9 && (
+                        <div className="text-[10px] text-erp-muted mt-1">إجمالي كل المخازن: <b className="font-mono">{totalStock.toFixed(2)}</b> {m.unit}</div>
+                      )}
+                      {/* توزيع الرصيد على المخازن */}
+                      {!warehouseId && (whDist?.[String(m.id)] || []).filter(d => Number(d.qty)).length > 1 && (
+                        <div className="flex flex-wrap gap-1 mt-1" title="الرصيد في كل مخزن">
+                          {whDist[String(m.id)].filter(d => Number(d.qty)).map(d => (
+                            <span key={d.warehouse_id ?? 'none'} className="text-[10px] px-1.5 py-0.5 rounded"
+                              style={{ background: 'var(--bg)', border: '1px solid var(--erp-border)', color: d.qty < 0 ? 'var(--red)' : 'var(--erp-text)' }}>
+                              {(d.warehouse_name || '').replace(/^مخزن\s+/, '')}: <b className="font-mono">{Number(d.qty).toFixed(2)}</b>
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </td>
                     <td className="text-sm" style={{ color: 'var(--amber)' }}>
                       {Number(m.reserved_qty || 0) > 0 ? `${Number(m.reserved_qty).toFixed(2)} ${m.unit}` : '—'}
@@ -337,6 +436,9 @@ export default function Materials() {
                     {write && (
                       <td><div className="flex gap-1">
                         <button className="btn btn-sm text-xs" onClick={() => openEdit(m)}>✏️</button>
+                        {onMovement && <button className="btn btn-sm text-xs" title={selWh ? `وارد إلى ${selWh.name_ar}` : 'وارد'} onClick={() => onMovement({ type: 'in', materialId: String(m.id) })}>📥</button>}
+                        {onMovement && <button className="btn btn-sm text-xs" title={selWh ? `صرف من ${selWh.name_ar}` : 'صرف'} onClick={() => onMovement({ type: 'out', materialId: String(m.id) })}>📤</button>}
+                        <button className="btn btn-sm text-xs" title="تحويل بين المخازن" onClick={() => setTransferMat(String(m.id))}>⇄</button>
                         <button className="btn btn-sm btn-danger text-xs" onClick={() => setDeleteTarget(m)}>🗑</button>
                       </div></td>
                     )}
@@ -349,6 +451,15 @@ export default function Materials() {
       </div>
 
       {showCatalog && <CatalogPicker onImport={() => reload()} onClose={() => setShowCatalog(false)} />}
+      <StockTransferModal
+        open={transferMat !== null}
+        onClose={() => setTransferMat(null)}
+        materials={materials}
+        warehouses={warehouses}
+        initialMaterialId={transferMat}
+        initialFromWarehouseId={warehouseId}
+        onDone={afterStockChange}
+      />
       {/* Modal */}
       <Modal open={!!modal} onClose={() => setModal(null)}
         title={modal?.mode === 'edit' ? 'تعديل مادة' : 'مادة جديدة'}>
@@ -581,15 +692,8 @@ export default function Materials() {
                       <span className="text-[11px] text-erp-muted mr-2">({c.material_count ?? 0} مادة)</span>
                     </span>
                     <button className="btn btn-sm" title="حذف الصنف"
-                      style={{ color: 'var(--red)' }}
-                      onClick={async () => {
-                        try {
-                          await api.inventory.deleteCat(c.id)
-                          toast('تم حذف الصنف'); await reloadCats()
-                        } catch (err) {
-                          toast(err?.message || 'تعذّر حذف الصنف', 'error')
-                        }
-                      }}>🗑</button>
+                      style={{ color: 'var(--red)' }} disabled={deletingCat}
+                      onClick={() => setCatDeleteTarget(c)}>🗑</button>
                   </div>
                 ))}
                 {!(categories || []).length && (
@@ -602,9 +706,20 @@ export default function Materials() {
       )}
 
       <ConfirmDialog
+        open={!!catDeleteTarget}
+        onClose={() => setCatDeleteTarget(null)}
+        onConfirm={() => confirmDeleteCat(catDeleteTarget)}
+        title="حذف فئة"
+        message={`حذف الفئة "${catDeleteTarget?.name_ar || ''}"؟`}
+        confirmLabel="حذف"
+        danger
+      />
+
+      <ConfirmDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
         onConfirm={doDelete}
+        confirmLabel="حذف"
         title="حذف مادة"
         message={`حذف "${deleteTarget?.name_ar}"؟ سيُحذف كل تاريخ حركاته.`}
         danger

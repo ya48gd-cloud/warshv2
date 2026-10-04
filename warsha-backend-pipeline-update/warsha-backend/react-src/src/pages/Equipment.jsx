@@ -101,6 +101,13 @@ function LengthCalculatorPanel({ eq }) {
 
   useEffect(() => {
     if (collapsed) return
+    // تحقق محلي قبل النداء: لا نرسل أطوالاً خارج نطاق الصنف
+    if (!Number.isFinite(length) || length < min || length > max) {
+      setLoading(false)
+      setResult(null)
+      setError(`الطول يجب أن يكون بين ${min} و ${max} متر`)
+      return
+    }
     setLoading(true)
     setError(null)
     const t = setTimeout(() => {
@@ -242,6 +249,15 @@ function BOMAddForm({ eq, materials, onSaved }) {
   const [addLine, adding] = useAction(async () => {
     if (!form.material_id) { toast('اختر المادة أولاً', 'error'); return }
     if (!form.unit_cost || Number(form.unit_cost) <= 0) { toast('أدخل سعر الوحدة', 'error'); return }
+    if (!isBar && !isPlate && (form.qty === '' || isNaN(Number(form.qty)) || Number(form.qty) <= 0)) {
+      toast('الكمية يجب أن تكون أكبر من صفر', 'error'); return
+    }
+    for (const [k, label] of [['bar_length_cm', 'الطول'], ['dim_length_cm', 'الطول'], ['dim_width_cm', 'العرض'], ['dim_count', 'العدد']]) {
+      if (form[k] !== '' && form[k] != null && (isNaN(Number(form[k])) || Number(form[k]) <= 0)) {
+        toast(`${label} يجب أن يكون أكبر من صفر`, 'error'); return
+      }
+    }
+    if (form.dim_count && !Number.isInteger(Number(form.dim_count))) { toast('العدد يجب أن يكون رقماً صحيحاً', 'error'); return }
     const payload = {
       equipment_id: eq.id,
       material_id: Number(form.material_id),
@@ -432,6 +448,8 @@ function BOMTab({ eq, write }) {
   }
 
   const [saveEdit, savingEdit] = useAction(async () => {
+    if (editForm.qty === '' || isNaN(Number(editForm.qty)) || Number(editForm.qty) <= 0) { toast('الكمية يجب أن تكون أكبر من صفر', 'error'); return }
+    if (editForm.unit_cost === '' || isNaN(Number(editForm.unit_cost)) || Number(editForm.unit_cost) < 0) { toast('سعر الوحدة يجب أن يكون رقماً غير سالب', 'error'); return }
     await api.patch(`/equipment/bom/${editingLine}`, {
       qty: Number(editForm.qty),
       unit_cost: Number(editForm.unit_cost),
@@ -553,14 +571,15 @@ function BOMTab({ eq, write }) {
 function DimensionsTab({ eq, write }) {
   const toast = useToast()
   const { data, loading, reload } = useApi(() => api.get(`/equipment/${eq.id}`), [eq.id])
-  const [form, setForm] = useState({ dim_key: '', dim_value: '', unit: 'mm' })
+  // الافتراضي 'مم' ليطابق أول خيار ظاهر في القائمة (كان 'mm' فيُحفظ بقيمة غير المعروضة)
+  const [form, setForm] = useState({ dim_key: '', dim_value: '', unit: 'مم' })
   const [confirmDimDel, setConfirmDimDel] = useState(null)
 
   const [addDim, adding] = useAction(async () => {
-    if (!form.dim_key || !form.dim_value) { toast('اسم وقيمة المقاس مطلوبان', 'error'); return }
-    await api.post(`/equipment/${eq.id}/dimensions?dim_key=${encodeURIComponent(form.dim_key)}&dim_value=${encodeURIComponent(form.dim_value)}&unit=${encodeURIComponent(form.unit)}`, {})
+    if (!form.dim_key?.trim() || !form.dim_value?.trim()) { toast('اسم وقيمة المقاس مطلوبان', 'error'); return }
+    await api.post(`/equipment/${eq.id}/dimensions?dim_key=${encodeURIComponent(form.dim_key.trim())}&dim_value=${encodeURIComponent(form.dim_value.trim())}&unit=${encodeURIComponent(form.unit)}`, {})
     toast('تمت الإضافة')
-    setForm({ dim_key: '', dim_value: '', unit: 'mm' })
+    setForm(f => ({ dim_key: '', dim_value: '', unit: f.unit }))
     reload()
   })
 
@@ -598,7 +617,7 @@ function DimensionsTab({ eq, write }) {
           <thead><tr><th>المقاس</th><th>القيمة</th><th>الوحدة</th>{write && <th></th>}</tr></thead>
           <tbody>
             {!dims.length && (
-              <tr><td colSpan={write ? 4 : 3} className="text-center text-erp-muted py-8">لا توجد مقاسات</td></tr>
+              <tr><td colSpan={write ? 4 : 3} className="text-center text-erp-muted py-8">{loading ? 'جاري التحميل…' : 'لا توجد مقاسات'}</td></tr>
             )}
             {dims.map(d => (
               <tr key={d.id}>
@@ -653,7 +672,11 @@ function CADTab({ eq }) {
         } catch {}
       }
       if (res?.ok) { toast('تم رفع الملف'); reload() }
-      else toast('فشل رفع الملف', 'error')
+      else {
+        let detail = null
+        try { detail = (await res?.json())?.detail } catch (_) {}
+        toast(typeof detail === 'string' && detail ? detail : 'فشل رفع الملف', 'error')
+      }
     } finally { setUploading(false); e.target.value = '' }
   }
 
@@ -688,7 +711,7 @@ function CADTab({ eq }) {
                 <span className="text-xl">{f.filename?.endsWith('.pdf') ? '📄' : f.filename?.match(/\.(png|jpg)$/i) ? '🖼' : '📐'}</span>
                 <div>
                   <div className="font-medium text-sm">{f.filename}</div>
-                  <div className="text-[11px] text-erp-muted">{f.revision} — {(f.file_size/1024).toFixed(0)} KB</div>
+                  <div className="text-[11px] text-erp-muted">{f.revision} — {f.file_size != null ? `${(Number(f.file_size)/1024).toFixed(0)} KB` : '—'}</div>
                 </div>
               </div>
               <div className="flex gap-2">
@@ -978,11 +1001,35 @@ export default function Equipment() {
   const openEdit = (eq) => {
     setForm({ ...eq })
     setModal({ mode: 'edit', item: eq })
+    // عقدة الشجرة لا تحمل purchase_invoice_id — نجلب التفاصيل الكاملة حتى لا يُمسح
+    // ربط فاتورة الشراء عند الحفظ (PUT يستبدل كل الحقول).
+    api.equipment.get(eq.id)
+      .then(full => {
+        if (!full) return
+        setForm(f => (f.id === eq.id ? { ...f, purchase_invoice_id: full.purchase_invoice_id ?? null } : f))
+      })
+      .catch(() => {})
   }
 
   const [save, saving] = useAction(async () => {
     if (!form.name_ar?.trim()) { toast('الاسم بالعربي مطلوب', 'error'); return }
     if (!form.code?.trim())    { toast('الكود مطلوب', 'error'); return }
+    const numOrNull = (v) => (v === '' || v == null ? null : Number(v))
+    const wKg = numOrNull(form.weight_kg)
+    if (wKg != null && (isNaN(wKg) || wKg < 0)) { toast('الوزن يجب أن يكون رقماً غير سالب', 'error'); return }
+    const pVal = numOrNull(form.purchase_value)
+    if (pVal != null && (isNaN(pVal) || pVal < 0)) { toast('قيمة الشراء يجب أن تكون رقماً غير سالب', 'error'); return }
+    const bQty = numOrNull(form.base_qty)
+    if (bQty != null && (isNaN(bQty) || bQty <= 0)) { toast('الكمية الأساسية للـ BOM يجب أن تكون أكبر من صفر', 'error'); return }
+    if (Number(form.level ?? 0) > 0 && !form.parent_id) { toast('اختر المعدة الأم للمستويات الفرعية (L1 فأعلى)', 'error'); return }
+    if (form.parent_id && form.id && Number(form.parent_id) === Number(form.id)) { toast('لا يمكن أن تكون المعدة أمّاً لنفسها', 'error'); return }
+    if (form.calc_unit === 'meter') {
+      const lMin = numOrNull(form.length_min)
+      const lMax = numOrNull(form.length_max)
+      if ((lMin == null) !== (lMax == null)) { toast('أدخل أقل وأقصى طول معاً أو اتركهما فارغين', 'error'); return }
+      if (lMin != null && (isNaN(lMin) || isNaN(lMax) || lMin <= 0 || lMax <= 0)) { toast('أطوال الصنف يجب أن تكون أكبر من صفر', 'error'); return }
+      if (lMin != null && lMin > lMax) { toast('أقل طول يجب ألا يتجاوز أقصى طول', 'error'); return }
+    }
     const payload = {
       code: form.code, name_ar: form.name_ar, name_en: form.name_en || form.name_ar,
       description: form.description || null,
@@ -999,8 +1046,16 @@ export default function Equipment() {
       base_qty: form.base_qty ? Number(form.base_qty) : 1,
       length_min: form.calc_unit === 'meter' && form.length_min !== '' && form.length_min != null ? Number(form.length_min) : null,
       length_max: form.calc_unit === 'meter' && form.length_max !== '' && form.length_max != null ? Number(form.length_max) : null,
+      // يحافظ على ربط فاتورة الشراء القائم (الحفظ يستبدل كل الحقول)
+      purchase_invoice_id: form.purchase_invoice_id ?? null,
     }
-    if (modal?.mode === 'edit') await api.equipment.update(form.id, payload)
+    payload.code = payload.code.trim()
+    payload.name_ar = payload.name_ar.trim()
+    if (modal?.mode === 'edit') {
+      const updated = await api.equipment.update(form.id, payload)
+      // حدّث لوحة التفاصيل لو المعدة المعدّلة هي المختارة (كانت تعرض بيانات قديمة)
+      if (updated && selected?.id === form.id) setSelected(s => ({ ...s, ...updated }))
+    }
     else await api.equipment.create(payload)
     toast('تم الحفظ')
     setModal(null)
@@ -1019,8 +1074,10 @@ export default function Equipment() {
 
   const [doDuplicate, duplicating] = useAction(async (eq) => {
     const newCode = window.prompt(`أدخل كود المعدة الجديدة (نسخة من "${eq.name_ar}"):`, `${eq.code}-COPY`)
-    if (!newCode) return
-    const created = await api.equipment.duplicate(eq.id, { code: newCode })
+    if (newCode == null) return
+    if (!newCode.trim()) { toast('الكود الجديد مطلوب', 'error'); return }
+    if (duplicating) return
+    const created = await api.equipment.duplicate(eq.id, { code: newCode.trim() })
     toast('تم نسخ المعدة')
     reload()
     reloadEqs()
@@ -1212,6 +1269,7 @@ export default function Equipment() {
                     <button className="btn btn-sm" title="حذف التصنيف"
                       style={{ color: 'var(--red)' }}
                       onClick={async () => {
+                        if (!window.confirm(`حذف التصنيف "${c.name_ar}"؟`)) return
                         try {
                           await api.equipment.deleteCategory(c.id)
                           toast('تم حذف التصنيف'); await reloadCats()

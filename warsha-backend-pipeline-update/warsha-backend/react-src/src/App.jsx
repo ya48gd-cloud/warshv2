@@ -100,6 +100,34 @@ const PAGE_MAP = {
   installments:         Installments,
 }
 
+// مفاتيح صفحات قديمة/بديلة ما زالت تُستدعى من بعض الصفحات (مثل Dashboard و
+// البحث العام في Topbar: onNavigate('materials')) — كانت تقع بصمت على لوحة
+// التحكم. نوجّهها للصفحة الحالية المكافئة.
+const PAGE_ALIASES = {
+  materials:  'inventory',
+  movements:  'inventory',
+  analytics:  'dashboard',
+  production: 'workorders',
+  costing:    'workorders',
+  purchases:  'purchaseorders',
+  quotations: 'orders',
+  creditnotes: 'invoices',
+  workshop:   'users',
+}
+
+function NotFoundPage({ page, onNavigate }) {
+  return (
+    <div className="card" style={{ textAlign: 'center', padding: '48px 24px' }} role="alert">
+      <div style={{ fontSize: 40, marginBottom: 12 }}>🔎</div>
+      <div className="text-base font-semibold" style={{ marginBottom: 6 }}>الصفحة غير موجودة</div>
+      <div className="text-sm text-erp-muted" style={{ marginBottom: 16 }}>
+        لم يتم العثور على الصفحة المطلوبة{page ? ` (${String(page)})` : ''}.
+      </div>
+      <button className="btn btn-primary btn-sm" onClick={() => onNavigate('dashboard')}>العودة للوحة التحكم</button>
+    </div>
+  )
+}
+
 export default function App() {
   const { user, loading } = useAuth()
   const [page, setPage] = useState('dashboard')
@@ -132,12 +160,31 @@ export default function App() {
   // استماع لحدث انتهاء الجلسة من client.js — تسجيل خروج تلقائي
   const { logout } = useAuth()
   useEffect(() => {
-    const handler = () => logout()
+    const handler = () => {
+      // أكتر من طلب ممكن يرجع 401 في نفس اللحظة — نعرض التنبيه مرة واحدة بس
+      if (!window.__ERP_SESSION_TOAST_SHOWN__) {
+        window.__ERP_SESSION_TOAST_SHOWN__ = true
+        window.dispatchEvent(new CustomEvent('erp:toast', {
+          detail: { msg: 'انتهت صلاحية الجلسة — سجّل الدخول مرة أخرى', type: 'warn' },
+        }))
+        setTimeout(() => { window.__ERP_SESSION_TOAST_SHOWN__ = false }, 5000)
+      }
+      logout()
+    }
     window.addEventListener('erp:session-expired', handler)
     return () => window.removeEventListener('erp:session-expired', handler)
   }, [logout])
 
-  const navigate = useCallback((p, params = null) => { setPage(p); setPageParams(params) }, [])
+  const navigate = useCallback((p, params = null) => {
+    const target = PAGE_ALIASES[p] || p
+    setPage(target); setPageParams(params)
+  }, [])
+
+  // بعد تسجيل الخروج (أو انتهاء الجلسة) نرجع للوحة التحكم — عشان لو دخل
+  // مستخدم بدور مختلف مايفتحش على صفحة المستخدم السابق
+  useEffect(() => {
+    if (!user) { setPage('dashboard'); setPageParams(null) }
+  }, [user])
   const refresh   = useCallback(() => setRefreshKey(k => k + 1), [])
 
   // Super Admin route
@@ -151,7 +198,7 @@ export default function App() {
 
   if (!user) return <Login />
 
-  const PageComponent = PAGE_MAP[page] || Dashboard
+  const PageComponent = PAGE_MAP[page] || null
 
   return (
     <ErrorBoundary>
@@ -160,9 +207,12 @@ export default function App() {
         <div className="main-content">
           <Topbar page={page} user={user} onRefresh={refresh} onNavigate={navigate} />
           <main className="flex-1 p-5 overflow-auto">
-            <ErrorBoundary>
+            {/* key={page}: الانتقال لصفحة أخرى يصفّر حالة الخطأ بدل ما تفضل شاشة الخطأ عالقة */}
+            <ErrorBoundary key={page}>
               <Suspense fallback={<PageSpinner />}>
-                <PageComponent key={`${page}-${refreshKey}`} onNavigate={navigate} pageParams={pageParams} />
+                {PageComponent
+                  ? <PageComponent key={`${page}-${refreshKey}`} onNavigate={navigate} pageParams={pageParams} />
+                  : <NotFoundPage page={page} onNavigate={navigate} />}
               </Suspense>
             </ErrorBoundary>
           </main>

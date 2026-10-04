@@ -307,3 +307,101 @@ async def test_delete_invoice_cleans_up_attachments(cli):
 
     dl = await cli.get(f"{BASE}/attachments/{att_id}/download")
     assert dl.status_code == 404
+
+
+
+# ════════════════ ROUND 3: PURCHASES VALIDATION / SECURITY FIXES ═══════
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_write_purchases_but_can_read(cli):
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.api.auth import create_token
+    tok = create_token(user_id=991, username="viewer_pur", role="viewer", tenant_id=1)
+    sid = (await cli.post(f"{BASE}/suppliers", json=_supplier())).json()["id"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {tok}"}) as vcli:
+        assert (await vcli.post(f"{BASE}/suppliers", json=_supplier())).status_code == 403
+        assert (await vcli.post(f"{BASE}/invoices", json=_invoice(sid))).status_code == 403
+        assert (await vcli.delete(f"{BASE}/suppliers/{sid}")).status_code == 403
+        assert (await vcli.post("/api/v1/purchase-orders", json={
+            "order_date": str(date.today()), "supplier_id": sid,
+            "lines": [{"description": "x", "ordered_qty": 1, "unit_cost": 1}]})).status_code == 403
+        assert (await vcli.get(f"{BASE}/suppliers")).status_code == 200
+        assert (await vcli.get(f"{BASE}/invoices")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_invoice_rejects_bad_tax_discount_and_due_date(cli):
+    sid = (await cli.post(f"{BASE}/suppliers", json=_supplier())).json()["id"]
+    p = _invoice(sid)
+    p["code"] = f"PI-BAD-{sid}"
+    for patch in ({"tax_pct": -5}, {"tax_pct": 150}, {"discount_amt": -1},
+                  {"discount_amt": 99999}, {"due_date": "2000-01-01"}):
+        r = await cli.post(f"{BASE}/invoices", json={**p, **patch})
+        assert r.status_code == 400, (patch, r.text)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_invoice_code_returns_400_not_500(cli):
+    sid = (await cli.post(f"{BASE}/suppliers", json=_supplier())).json()["id"]
+    p = _invoice(sid)
+    p["code"] = f"PI-DUP-{sid}"
+    assert (await cli.post(f"{BASE}/invoices", json=p)).status_code == 201
+    r = await cli.post(f"{BASE}/invoices", json=p)
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.asyncio
+async def test_auto_invoice_code_unique_after_delete(cli):
+    """الكود التلقائي PI-YYYY-NNNN كان بالعدّ فقط → بعد حذف فاتورة يطلع مكرر (500)."""
+    sid = (await cli.post(f"{BASE}/suppliers", json=_supplier())).json()["id"]
+    p = _invoice(sid)
+    p.pop("code")
+    a = (await cli.post(f"{BASE}/invoices", json=p)).json()["id"]
+    b = await cli.post(f"{BASE}/invoices", json=p)
+    assert b.status_code == 201, b.text
+    assert (await cli.delete(f"{BASE}/invoices/{a}")).status_code == 200
+    c = await cli.post(f"{BASE}/invoices", json=p)
+    assert c.status_code == 201, c.text
+    assert c.json()["code"] != b.json()["code"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_supplier_code_returns_400(cli):
+    r = await cli.post(f"{BASE}/suppliers", json={**_supplier(), "code": "SUP-DUPX"})
+    assert r.status_code == 201
+    r2 = await cli.post(f"{BASE}/suppliers", json={**_supplier(), "code": "SUP-DUPX"})
+    assert r2.status_code == 400, r2.text
+    r3 = await cli.post(f"{BASE}/suppliers", json={**_supplier(), "name": "   "})
+    assert r3.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_generic_attach_rejects_path_traversal_entity_type(cli):
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    r = await cli.post(
+        f"{BASE}/attach?entity_type=../../evil&entity_id=1",
+        files={"file": ("x.png", png_bytes, "image/png")},
+    )
+    assert r.status_code == 400, r.text
+    ok = await cli.post(
+        f"{BASE}/attach?entity_type=supplier_payment&entity_id=1",
+        files={"file": ("x.png", png_bytes, "image/png")},
+    )
+    assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.asyncio
+async def test_print_purchase_invoice_escapes_html(cli):
+    sid = (await cli.post(f"{BASE}/suppliers", json=_supplier())).json()["id"]
+    p = _invoice(sid)
+    p["code"] = f"PI-XSS-{sid}"
+    p["notes"] = "<script>alert(1)</script>"
+    p["lines"][0]["description"] = "<img src=x onerror=alert(2)>"
+    iid = (await cli.post(f"{BASE}/invoices", json=p)).json()["id"]
+    r = await cli.get(f"{BASE}/invoices/{iid}/print")
+    assert r.status_code == 200
+    assert "<script>alert(1)</script>" not in r.text
+    assert "<img src=x onerror" not in r.text
+

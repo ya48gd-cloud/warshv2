@@ -247,3 +247,66 @@ async def test_delete_po_cleans_up_attachments(cli):
 
     dl = await cli.get(f"{PUR}/attachments/{att_id}/download")
     assert dl.status_code == 404
+
+
+
+# ════════════════ ROUND 3: PO VALIDATION / GAP FIXES ═══════════════════
+
+@pytest.mark.asyncio
+async def test_po_rejects_bad_tax_and_discount(cli):
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    for patch in ({"tax_pct": -1}, {"tax_pct": 101}, {"discount_amt": -5}, {"discount_amt": 100000}):
+        r = await cli.post(BASE, json={**_po_payload(sid, mid), **patch})
+        assert r.status_code == 400, (patch, r.text)
+
+
+@pytest.mark.asyncio
+async def test_po_code_generation_does_not_collide_across_tenants(cli, cli2):
+    """purchase_orders.code فريد على مستوى الجدول — tenant تاني كان ياخد نفس
+    PO-0001 (الفحص كان مقيّد بالـ tenant) → IntegrityError 500."""
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    r1 = await cli.post(BASE, json=_po_payload(sid, mid))
+    assert r1.status_code == 201, r1.text
+    r_s2 = await cli2.post(f"{PUR}/suppliers", json={"name": "مورد t2"})
+    r_m2 = await cli2.post(f"{INV}/materials", json={"name_ar": "مادة t2", "unit": "كجم", "unit_cost": 1})
+    r2 = await cli2.post(BASE, json=_po_payload(r_s2.json()["id"], r_m2.json()["id"]))
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["code"] != r1.json()["code"]
+
+
+@pytest.mark.asyncio
+async def test_receive_invoice_applies_po_discount(cli):
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    payload = _po_payload(sid, mid)  # 20 x 10 = 200
+    payload["discount_amt"] = 20     # 10%
+    po_id = (await cli.post(BASE, json=payload)).json()["id"]
+    await cli.patch(f"{BASE}/{po_id}/approve")
+    line_id = (await cli.get(f"{BASE}/{po_id}")).json()["lines"][0]["id"]
+    r = await cli.post(f"{BASE}/{po_id}/receive", json={
+        "receive_date": str(date.today()),
+        "lines": [{"line_id": line_id, "received_qty": 10}],
+        "create_invoice": True,
+    })
+    assert r.status_code == 200, r.text
+    inv = (await cli.get(f"{PUR}/invoices/{r.json()['invoice_id']}")).json()
+    assert inv["discount_amt"] == 10.0
+    assert inv["total"] == 90.0
+
+
+@pytest.mark.asyncio
+async def test_receive_rejects_empty_lines_and_date_before_order(cli):
+    sid = await _make_supplier(cli)
+    mid = await _make_material(cli)
+    po_id = (await cli.post(BASE, json=_po_payload(sid, mid))).json()["id"]
+    await cli.patch(f"{BASE}/{po_id}/approve")
+    line_id = (await cli.get(f"{BASE}/{po_id}")).json()["lines"][0]["id"]
+    r = await cli.post(f"{BASE}/{po_id}/receive", json={
+        "receive_date": str(date.today()), "lines": [], "create_invoice": False})
+    assert r.status_code == 400
+    r2 = await cli.post(f"{BASE}/{po_id}/receive", json={
+        "receive_date": "2000-01-01",
+        "lines": [{"line_id": line_id, "received_qty": 1}], "create_invoice": False})
+    assert r2.status_code == 400

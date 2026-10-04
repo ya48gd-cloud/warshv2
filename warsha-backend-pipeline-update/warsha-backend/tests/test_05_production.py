@@ -816,3 +816,166 @@ async def test_viewer_role_forbidden_from_production_write_endpoints(client):
     assert r_ok.status_code == 200
     r_ok2 = await client.post(f"{PROD}/bins", json={"code": "PB1"}, headers=prod_headers)
     assert r_ok2.status_code == 201, r_ok2.text
+
+
+# ════════════════ Round 3: validation / gap hardening (production backend) ═══════
+
+@pytest.mark.asyncio
+async def test_cancelled_work_order_blocks_issue_reserve_complete(cli):
+    """أمر إنتاج ملغي: لا صرف، لا حجز، ولا إنهاء (كان الإنهاء بيعمل FG وهمي)."""
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo = await _make_work_order_qty(cli, eq_id, qty=1)
+    wo_id, wo_code = wo["id"], wo["code"]
+    r = await cli.patch(f"{ACC}/work-orders/{wo_id}/status", params={"status": "cancelled"})
+    assert r.status_code == 200, r.text
+
+    r = await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 5, "stage": "cut",
+    })
+    assert r.status_code == 400, r.text
+    r = await cli.post(f"{PROD}/reserve/{wo_id}", json={"material_id": mid, "qty": 5})
+    assert r.status_code == 400, r.text
+    r = await cli.post(f"{PROD}/complete/{wo_id}")
+    assert r.status_code == 400, r.text
+
+    mats = (await cli.get(f"{INV}/materials")).json()
+    assert not any(m["code"] == f"FG-{wo_code}" for m in mats)
+    raw = next(m for m in mats if m["id"] == mid)
+    assert float(raw["stock_qty"]) == 100.0
+
+
+@pytest.mark.asyncio
+async def test_issue_to_done_work_order_rejected(cli):
+    eq_id = await _make_equipment(cli)
+    mid = await _make_material(cli, qty=100)
+    wo = await _make_work_order_qty(cli, eq_id, qty=1)
+    wo_id = wo["id"]
+    r = await cli.post(f"{PROD}/complete/{wo_id}")
+    assert r.status_code == 200, r.text
+    r = await cli.post(f"{PROD}/issue", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 5, "stage": "cut",
+    })
+    assert r.status_code == 400, r.text
+    # scrap tied to a completed work order is rejected (record it as general scrap instead)
+    r = await cli.post(f"{PROD}/scrap", json={
+        "work_order_id": wo_id, "material_id": mid, "qty": 1, "reason": "damage",
+    })
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.asyncio
+async def test_stock_count_cannot_be_closed_twice(cli):
+    mid = await _make_material(cli, qty=50)
+    count_id = (await cli.post(f"{PROD}/stock-count")).json()["id"]
+    r = await cli.post(f"{PROD}/stock-count/{count_id}/scan", json={"material_id": mid, "actual_qty": 40})
+    assert r.status_code == 200, r.text
+    r1 = await cli.post(f"{PROD}/stock-count/{count_id}/close")
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["adjustments"] == 1
+    r2 = await cli.post(f"{PROD}/stock-count/{count_id}/close")
+    assert r2.status_code == 400, r2.text
+    r3 = await cli.post(f"{PROD}/stock-count/{count_id}/scan", json={"material_id": mid, "actual_qty": 1})
+    assert r3.status_code == 400, r3.text
+    mats = (await cli.get(f"{INV}/materials")).json()
+    assert float(next(m for m in mats if m["id"] == mid)["stock_qty"]) == 40.0
+
+
+@pytest.mark.asyncio
+async def test_stage_skip_done_and_invalid_status_rejected(cli):
+    eq_id = await _make_equipment(cli)
+    wo = await _make_work_order_qty(cli, eq_id, qty=1)
+    stages = await _run_all_stages_to_done(cli, wo["id"])
+    first = stages[0]
+    assert (await cli.patch(f"{PROD}/stages/{first['id']}/start")).status_code == 200
+    assert (await cli.patch(f"{PROD}/stages/{first['id']}/complete")).status_code == 200
+    r = await cli.patch(f"{PROD}/stages/{first['id']}/skip")
+    assert r.status_code == 400, r.text
+    r = await cli.put(f"{PROD}/stages/{stages[1]['id']}", json={"status": "bogus"})
+    assert r.status_code == 422, r.text
+    r = await cli.put(f"{PROD}/stages/{stages[1]['id']}", json={"planned_hours": -1})
+    assert r.status_code == 422, r.text
+    r = await cli.put(f"{PROD}/stages/{stages[1]['id']}", json={"assigned_worker_id": 999999})
+    assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_quality_inspection_validation(cli):
+    base = {"inspection_date": str(date.today()), "qty_inspected": 10, "qty_passed": 5}
+    r = await cli.post(f"{PROD}/v2/quality", json={**base, "qty_failed": 3, "qty_rework": 5})
+    assert r.status_code == 422, r.text  # 5+3+5 > 10
+    r = await cli.post(f"{PROD}/v2/quality", json={**base, "qty_failed": -1})
+    assert r.status_code == 422, r.text
+    r = await cli.post(f"{PROD}/v2/quality", json={**base, "inspection_type": "xyz"})
+    assert r.status_code == 422, r.text
+    r = await cli.post(f"{PROD}/v2/quality", json={**base, "work_order_id": 999999})
+    assert r.status_code == 404, r.text
+    r = await cli.post(f"{PROD}/v2/quality", json={**base, "qty_failed": 5})
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.asyncio
+async def test_schedule_transitions_and_link_order_tenant_check(cli):
+    eq_id = await _make_equipment(cli)
+    wo = await _make_work_order_qty(cli, eq_id, qty=1)
+    r = await cli.post(f"{PROD}/v2/schedules", json={
+        "work_order_id": wo["id"], "scheduled_start": str(date.today()),
+        "scheduled_end": str(date.today()), "priority": 11,
+    })
+    assert r.status_code == 422, r.text
+    r = await cli.post(f"{PROD}/v2/schedules", json={
+        "work_order_id": wo["id"], "scheduled_start": str(date.today()),
+        "scheduled_end": str(date.today()),
+    })
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    assert (await cli.patch(f"{PROD}/v2/schedules/{sid}", json={"status": "nope"})).status_code == 422
+    assert (await cli.patch(f"{PROD}/v2/schedules/{sid}/complete")).status_code == 200
+    assert (await cli.patch(f"{PROD}/v2/schedules/{sid}/start")).status_code == 400
+    assert (await cli.patch(f"{PROD}/v2/schedules/{sid}/complete")).status_code == 400
+    # a customer order outside the current tenant -> 404 (no leaking of other tenants' links)
+    assert (await cli.get(f"{PROD}/v2/link-order/999999")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_duplicate_bin_code_and_negative_team_values(cli):
+    assert (await cli.post(f"{PROD}/bins", json={"code": "DUP-1"})).status_code == 201
+    r = await cli.post(f"{PROD}/bins", json={"code": "DUP-1"})
+    assert r.status_code == 400, r.text
+    eq_id = await _make_equipment(cli)
+    wo = await _make_work_order_qty(cli, eq_id, qty=1)
+    r = await cli.post(f"{PROD}/work-orders/{wo['id']}/team", json={"worker_id": 999999, "hourly_rate": 10})
+    assert r.status_code == 404, r.text
+    wid = (await cli.post("/api/v1/workers", json={"name": "tech", "daily_wage": 100})).json()["id"]
+    r = await cli.post(f"{PROD}/work-orders/{wo['id']}/team", json={"worker_id": wid, "hourly_rate": -5})
+    assert r.status_code == 422, r.text
+    add = await cli.post(f"{PROD}/work-orders/{wo['id']}/team", json={"worker_id": wid, "hourly_rate": 5})
+    assert add.status_code == 201, add.text
+    r = await cli.patch(f"{PROD}/work-orders/{wo['id']}/team/{add.json()['id']}/hours", params={"actual_hours": -3})
+    assert r.status_code == 400, r.text
+
+
+@pytest.mark.asyncio
+async def test_scrap_sale_rejects_negative_price(cli):
+    r = await cli.post(f"{PROD}/scrap-sales", json={
+        "sale_date": str(date.today()), "treasury_id": 1,
+        "lines": [{"material_id": 1, "qty": 1, "unit_price": -10}],
+    })
+    assert r.status_code == 422, r.text
+    r = await cli.post(f"{PROD}/scrap-sales", json={
+        "sale_date": str(date.today()), "treasury_id": 1, "lines": [],
+    })
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.asyncio
+async def test_cad_download_arabic_filename(cli):
+    eq_id = await _make_equipment(cli)
+    files = {"file": ("رسم.pdf", b"%PDF-1.4 test", "application/pdf")}
+    r = await cli.post(f"{CAD}/upload/{eq_id}", files=files)
+    assert r.status_code == 200, r.text
+    fid = r.json()["id"]
+    d = await cli.get(f"{CAD}/download/{fid}")
+    assert d.status_code == 200, d.text
+    assert d.content == b"%PDF-1.4 test"
+    assert (await cli.delete(f"{CAD}/{fid}")).status_code == 200

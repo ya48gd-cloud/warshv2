@@ -49,6 +49,9 @@ export default function CreditNotes() {
   const [confirmDel, setConfirmDel] = useState(null)
   const [saving, setSaving]       = useState(false)
   const [filterStatus, setFilter] = useState('')
+  const [busyId, setBusyId]       = useState(null)   // منع الضغط المزدوج على إصدار/إلغاء/مرتجع
+  const [confirmAct, setConfirmAct] = useState(null) // { kind: 'issue'|'cancel'|'fromInvoice', id, label }
+  const [fromInvSel, setFromInvSel] = useState('')
 
   // data for create form
   const { data: customers = [] } = useApi(() => api.customers.list())
@@ -68,7 +71,7 @@ export default function CreditNotes() {
       const p = filterStatus ? { status: filterStatus } : {}
       const data = await api.creditNotes.list(p)
       setNotes(Array.isArray(data) ? data : [])
-    } catch { addToast('خطأ في تحميل الإشعارات', 'error') }
+    } catch (e) { addToast(e?.message ? `خطأ في تحميل الإشعارات: ${e.message}` : 'خطأ في تحميل الإشعارات', 'error') }
     finally { setLoading(false) }
   }, [filterStatus])
 
@@ -113,6 +116,9 @@ export default function CreditNotes() {
         discount_amt: detail.discount_amt || 0,
         notes:        detail.notes || '',
         lines: (detail.lines || []).map(l => ({
+          // الحفاظ على ربط البند ببند الفاتورة الأصلي — من غيره التعديل كان
+          // بيقطع الربط وإصدار "مرتجع بضاعة فعلي" ما يرجّعش المخزون
+          invoice_line_id: l.invoice_line_id ?? null,
           description: l.description,
           qty:         l.qty,
           unit:        l.unit || 'قطعة',
@@ -121,7 +127,7 @@ export default function CreditNotes() {
       })
       setEditingId(cn.id)
       setShowCreate(true)
-    } catch { addToast('خطأ في تحميل الإشعار', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في تحميل الإشعار', 'error') }
   }
 
   /* ── create / update ── */
@@ -129,6 +135,21 @@ export default function CreditNotes() {
     if (!form.customer_id) return addToast('اختر العميل', 'error')
     if (!form.lines.length) return addToast('أضف بنداً واحداً على الأقل', 'error')
     if (form.lines.some(l => !l.description?.trim())) return addToast('أدخل وصف لكل البنود', 'error')
+    if (!form.date) return addToast('أدخل تاريخ الإشعار', 'error')
+    if (form.lines.some(l => !(parseFloat(l.qty) > 0))) return addToast('كمية كل بند يجب أن تكون أكبر من صفر', 'error')
+    if (form.lines.some(l => l.unit_price === '' || l.unit_price == null || isNaN(parseFloat(l.unit_price)) || parseFloat(l.unit_price) < 0))
+      return addToast('أدخل سعر وحدة صحيح (صفر أو أكثر) لكل البنود', 'error')
+    const taxN = parseFloat(form.tax_pct) || 0
+    if (taxN < 0 || taxN > 100) return addToast('نسبة الضريبة يجب أن تكون بين 0 و 100', 'error')
+    const discN = parseFloat(form.discount_amt) || 0
+    if (discN < 0) return addToast('الخصم لا يمكن أن يكون سالباً', 'error')
+    if (discN > formSubtotal) return addToast('الخصم أكبر من إجمالي البنود', 'error')
+    if (form.invoice_id) {
+      const inv = (Array.isArray(invoices) ? invoices : []).find(x => String(x.id) === String(form.invoice_id))
+      if (inv && inv.customer_id != null && String(inv.customer_id) !== String(form.customer_id))
+        return addToast('الفاتورة المرجعية لا تخص هذا العميل', 'error')
+    }
+    if (saving) return
     setSaving(true)
     try {
       const payload = {
@@ -142,7 +163,8 @@ export default function CreditNotes() {
         discount_amt: parseFloat(form.discount_amt) || 0,
         notes:        form.notes,
         lines: form.lines.map((l, i) => ({
-          description: l.description,
+          invoice_line_id: l.invoice_line_id ?? null,
+          description: l.description.trim(),
           qty:         parseFloat(l.qty) || 1,
           unit:        l.unit || 'قطعة',
           unit_price:  parseFloat(l.unit_price) || 0,
@@ -174,26 +196,33 @@ export default function CreditNotes() {
 
   /* ── issue ── */
   const handleIssue = async (id) => {
+    if (busyId) return
+    setBusyId(id)
     try {
       await api.creditNotes.issue(id)
       addToast('تم إصدار الإشعار وخصم المبلغ من رصيد العميل', 'success')
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في إصدار الإشعار', 'error') }
+    finally { setBusyId(null) }
   }
 
   /* ── cancel ── */
   const handleCancel = async (id) => {
+    if (busyId) return
+    setBusyId(id)
     try {
       await api.creditNotes.cancel(id)
       addToast('تم إلغاء الإشعار', 'info')
       setShowDetail(false)
       load()
-    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في إلغاء الإشعار', 'error') }
+    finally { setBusyId(null) }
   }
 
   /* ── delete ── */
   const handleDelete = async (id) => {
+    if (!id) return
     try {
       await api.creditNotes.delete(id)
       addToast('تم الحذف', 'success')
@@ -205,12 +234,14 @@ export default function CreditNotes() {
 
   /* ── from invoice ── */
   const handleFromInvoice = async (invId) => {
-    if (!invId) return
+    if (!invId || busyId) return
+    setBusyId(`inv-${invId}`)
     try {
       await api.creditNotes.fromInvoice(invId)
-      addToast('تم إنشاء إشعار مرتجع كامل من الفاتورة', 'success')
+      addToast('تم إنشاء إشعار مرتجع كامل من الفاتورة (مسودة)', 'success')
       load()
-    } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في إنشاء المرتجع', 'error') }
+    finally { setBusyId(null); setFromInvSel('') }
   }
 
   /* ── print ── */
@@ -219,6 +250,16 @@ export default function CreditNotes() {
 
   /* ── open detail ── */
   const openDetail = (n) => { setSelected(n); setShowDetail(true) }
+
+  /* ── تنفيذ الإجراء بعد التأكيد ── */
+  const runConfirmed = () => {
+    const a = confirmAct
+    setConfirmAct(null)
+    if (!a) return
+    if (a.kind === 'issue') handleIssue(a.id)
+    else if (a.kind === 'cancel') handleCancel(a.id)
+    else if (a.kind === 'fromInvoice') handleFromInvoice(a.id)
+  }
 
   /* ════════════════════════════════════════════════════════ */
   return (
@@ -272,8 +313,15 @@ export default function CreditNotes() {
         </select>
 
         <select
-          onChange={e => handleFromInvoice(e.target.value)}
-          defaultValue=""
+          value={fromInvSel}
+          disabled={!!busyId}
+          onChange={e => {
+            const v = e.target.value
+            setFromInvSel(v)
+            if (!v) return
+            const inv = (Array.isArray(invoices) ? invoices : []).find(x => String(x.id) === String(v))
+            setConfirmAct({ kind: 'fromInvoice', id: v, label: inv?.code || v })
+          }}
           style={{ border: '1px solid #E5E7EB', borderRadius: 8, padding: '7px 12px',
             fontSize: 13, fontFamily: 'inherit', background: '#fff' }}>
           <option value="">← مرتجع كامل من فاتورة</option>
@@ -425,10 +473,11 @@ export default function CreditNotes() {
               🖨️ طباعة
             </button>
             {selected.status === 'draft' && (
-              <button onClick={() => handleIssue(selected.id)}
+              <button onClick={() => setConfirmAct({ kind: 'issue', id: selected.id, label: selected.code })}
+                disabled={busyId === selected.id}
                 style={{ background: '#15803D', color: '#fff', border: 'none', borderRadius: 8,
                   padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
-                ✅ إصدار الإشعار
+                {busyId === selected.id ? 'جاري التنفيذ…' : '✅ إصدار الإشعار'}
               </button>
             )}
             {selected.status === 'draft' && (
@@ -439,7 +488,8 @@ export default function CreditNotes() {
               </button>
             )}
             {selected.status === 'issued' && (
-              <button onClick={() => handleCancel(selected.id)}
+              <button onClick={() => setConfirmAct({ kind: 'cancel', id: selected.id, label: selected.code })}
+                disabled={busyId === selected.id}
                 style={{ background: '#FEF3C7', color: '#92400E', border: 'none', borderRadius: 8,
                   padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
                 ❌ إلغاء
@@ -479,11 +529,18 @@ export default function CreditNotes() {
                 الفاتورة المرجعية (اختياري)
               </label>
               <select value={form.invoice_id}
-                onChange={e => setForm(f => ({ ...f, invoice_id: e.target.value }))}
+                onChange={e => {
+                  const v = e.target.value
+                  const inv = (Array.isArray(invoices) ? invoices : []).find(x => String(x.id) === String(v))
+                  // اختيار فاتورة يحدد عميلها تلقائياً (الباك إند يرفض فاتورة لعميل مختلف)
+                  setForm(f => ({ ...f, invoice_id: v, customer_id: inv?.customer_id ? String(inv.customer_id) : f.customer_id }))
+                }}
                 style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                   padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}>
                 <option value="">بدون فاتورة</option>
-                {(Array.isArray(invoices) ? invoices : []).map(inv => (
+                {(Array.isArray(invoices) ? invoices : [])
+                  .filter(inv => !form.customer_id || inv.customer_id == null || String(inv.customer_id) === String(form.customer_id) || String(inv.id) === String(form.invoice_id))
+                  .map(inv => (
                   <option key={inv.id} value={inv.id}>{inv.code} — {inv.customer_name}</option>
                 ))}
               </select>
@@ -653,6 +710,22 @@ export default function CreditNotes() {
       )}
 
       {/* ═══ Confirm Delete ═══ */}
+      <ConfirmDialog
+        open={!!confirmAct}
+        title={confirmAct?.kind === 'issue' ? 'إصدار الإشعار' : confirmAct?.kind === 'cancel' ? 'إلغاء الإشعار' : 'مرتجع كامل من فاتورة'}
+        message={
+          confirmAct?.kind === 'issue'
+            ? `سيتم إصدار الإشعار ${confirmAct?.label} وخصم قيمته من رصيد العميل${selected?.is_return ? ' وإرجاع البضاعة للمخزون' : ''}. متابعة؟`
+            : confirmAct?.kind === 'cancel'
+              ? `سيتم إلغاء الإشعار ${confirmAct?.label} وعكس أثره على رصيد العميل. متابعة؟`
+              : `سيتم إنشاء إشعار مرتجع كامل (مسودة) من الفاتورة ${confirmAct?.label || ''}. متابعة؟`
+        }
+        confirmLabel="تأكيد"
+        confirmVariant={confirmAct?.kind === 'cancel' ? 'danger' : undefined}
+        onConfirm={runConfirmed}
+        onCancel={() => { setConfirmAct(null); if (!busyId) setFromInvSel('') }}
+      />
+
       <ConfirmDialog
         open={!!confirmDel}
         title="حذف الإشعار"

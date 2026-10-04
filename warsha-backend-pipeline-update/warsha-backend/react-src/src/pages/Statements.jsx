@@ -6,6 +6,16 @@ import { egp, fmtDate, today } from '../utils/fmt'
 import { Select, Input } from '../components/ui/Field'
 import { PageSpinner } from '../components/ui/Spinner'
 
+// تهريب HTML لبيانات المستخدم في نافذة الطباعة (document.write)
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+))
+
+// نوع الحركة — الكشف بيرجّع كمان إشعارات دائنة (credit_note) اللي كانت بتظهر "دفعة" غلط
+const ROW_TYPE_AR = { invoice: 'فاتورة', payment: 'دفعة', credit_note: 'إشعار دائن' }
+const ROW_TYPE_ICON = { invoice: '🧾', payment: '💵', credit_note: '📋' }
+const rowTypeAr = (t) => ROW_TYPE_AR[t] || 'دفعة'
+
 export default function Statements() {
   const toast = useToast()
   const [tab, setTab] = useState('suppliers')   // suppliers | customers
@@ -38,6 +48,7 @@ export default function Statements() {
 
   const run = async () => {
     if (!entityId) { toast('اختر الجهة', 'error'); return }
+    if (dateFrom && dateTo && dateFrom > dateTo) { toast('تاريخ البداية لازم يكون قبل تاريخ النهاية', 'error'); return }
     setLoading(true)
     try {
       const params = {}
@@ -49,7 +60,7 @@ export default function Statements() {
         : await api.customers.ledger(entityId, params)
       setReport(data)
     } catch (e) {
-      toast('تعذّر إنشاء التقرير', 'error')
+      toast(e?.message ? `تعذّر إنشاء التقرير: ${e.message}` : 'تعذّر إنشاء التقرير', 'error')
     } finally { setLoading(false) }
   }
 
@@ -81,8 +92,8 @@ export default function Statements() {
 </style></head><body>
   <h2>كشف حساب ${tab === 'suppliers' ? 'مورّد' : 'عميل'}</h2>
   <div class="meta">
-    ${who?.name || ''} ${who?.code ? '— ' + who.code : ''}<br>
-    الفترة: ${report.date_from || 'البداية'} إلى ${report.date_to || 'النهاية'}
+    ${esc(who?.name || '')} ${who?.code ? '— ' + esc(who.code) : ''}<br>
+    الفترة: ${esc(report.date_from || 'البداية')} إلى ${esc(report.date_to || 'النهاية')}
   </div>
   <table>
     <thead><tr><th>التاريخ</th><th>النوع</th><th>المرجع</th><th>البيان</th><th>مدين</th><th>دائن</th><th>الرصيد</th></tr></thead>
@@ -90,9 +101,9 @@ export default function Statements() {
       ${report.date_from ? `<tr class="tot"><td colspan="6">رصيد افتتاحي (قبل ${fmtDate(report.date_from)})</td><td>${egp(report.opening_balance || 0)}</td></tr>` : ''}
       ${rows.map(r => `<tr>
         <td>${fmtDate(r.date)}</td>
-        <td>${r.type === 'invoice' ? 'فاتورة' : 'دفعة'}</td>
-        <td>${r.ref}</td>
-        <td>${r.description}</td>
+        <td>${esc(rowTypeAr(r.type))}</td>
+        <td>${esc(r.ref)}</td>
+        <td>${esc(r.description)}</td>
         <td class="debit">${r.debit ? egp(r.debit) : ''}</td>
         <td class="credit">${r.credit ? egp(r.credit) : ''}</td>
         <td>${egp(r.balance)}</td>
@@ -102,6 +113,7 @@ export default function Statements() {
   </table>
 </body></html>`
     const w = window.open('', '_blank')
+    if (!w) { toast('فعّل النوافذ المنبثقة (popup) في المتصفح عشان تقدر تطبع', 'error'); return }
     w.document.write(html); w.document.close()
     setTimeout(() => w.print(), 500)
   }
@@ -179,7 +191,7 @@ export default function Statements() {
                 {(report.rows || []).map((r, i) => (
                   <tr key={i} className="border-b" style={{ borderColor: 'var(--border-lt)' }}>
                     <td className="py-2 px-2 whitespace-nowrap">{fmtDate(r.date)}</td>
-                    <td className="py-2 px-2">{r.type === 'invoice' ? '🧾 فاتورة' : '💵 دفعة'}</td>
+                    <td className="py-2 px-2">{`${ROW_TYPE_ICON[r.type] || '💵'} ${rowTypeAr(r.type)}`}</td>
                     <td className="py-2 px-2">{r.ref}</td>
                     <td className="py-2 px-2 text-erp-muted">{r.description}</td>
                     <td className="py-2 px-2" style={{ color: 'var(--red)' }}>{r.debit ? egp(r.debit) : ''}</td>

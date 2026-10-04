@@ -91,7 +91,8 @@ async def test_cannot_dispose_asset_twice(cli):
 async def test_depreciation_cannot_double_post_same_period(cli):
     await _seed(cli)
     r = await cli.post(BASE, json={
-        "name": "أصل إهلاك", "purchase_date": str(date.today()),
+        # تاريخ شراء قبل فترة الإهلاك (2025/01) — الإهلاك قبل الشراء بقى مرفوض
+        "name": "أصل إهلاك", "purchase_date": "2024-12-01",
         "cost": 12000.0, "salvage_value": 0.0, "useful_life_years": 1,
     })
     aid = r.json()["id"]
@@ -148,3 +149,100 @@ async def test_update_asset_cost_reposts_journal_entry(cli):
         "بعد تعديل التكلفة، رصيد 1400 لازم يعكس القيمة الجديدة فقط (6000)، "
         "مش القديمة (4000) ولا مجموعهما"
     )
+
+
+
+# ══ جولة 3 — gap/validation analysis ═══════════════════════════════════
+@pytest.mark.asyncio
+async def test_viewer_cannot_create_fixed_asset():
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.api.auth import create_token
+    tok = create_token(user_id=990201, username="viewer_fa", role="viewer", tenant_id=1)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {tok}"}) as v:
+        r = await v.post(BASE, json={
+            "name": "x", "purchase_date": str(date.today()), "cost": 100.0, "useful_life_years": 5,
+        })
+        assert r.status_code == 403
+        assert (await v.get(BASE)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_fixed_asset_cross_tenant_access_blocked(cli, cli2):
+    await _seed(cli)
+    r = await cli.post(BASE, json={
+        "name": "أصل ورشة 1", "purchase_date": str(date.today()), "cost": 1000.0, "useful_life_years": 5,
+    })
+    aid = r.json()["id"]
+    assert (await cli2.get(f"{BASE}/{aid}")).status_code == 404
+    assert (await cli2.delete(f"{BASE}/{aid}")).status_code == 404
+    assert (await cli2.patch(f"{BASE}/{aid}/dispose")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_fixed_asset_duplicate_code_and_invalid_type_rejected(cli):
+    await _seed(cli)
+    body = {"code": "FA-X1", "name": "أصل", "purchase_date": str(date.today()),
+            "cost": 1000.0, "useful_life_years": 5}
+    assert (await cli.post(BASE, json=body)).status_code == 200
+    dup = await cli.post(BASE, json=body)
+    assert dup.status_code == 400
+    bad = await cli.post(BASE, json={**body, "code": "FA-X2", "asset_type": "spaceship"})
+    assert bad.status_code == 422
+    # حساب دفع غير نقدي (إيراد) مرفوض
+    bad_acc = await cli.post(BASE, json={**body, "code": "FA-X3", "payment_account_code": "4100"})
+    assert bad_acc.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_depreciation_before_purchase_or_future_rejected(cli):
+    await _seed(cli)
+    r = await cli.post(BASE, json={
+        "name": "أصل", "purchase_date": "2025-06-15", "cost": 1200.0, "useful_life_years": 1,
+    })
+    aid = r.json()["id"]
+    before = await cli.post(f"{BASE}/{aid}/depreciate", json={"period_year": 2025, "period_month": 5})
+    assert before.status_code == 400
+    future = await cli.post(f"{BASE}/{aid}/depreciate", json={"period_year": 2099, "period_month": 1})
+    assert future.status_code == 400
+    ok = await cli.post(f"{BASE}/{aid}/depreciate", json={"period_year": 2025, "period_month": 6})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["accumulated_depreciation"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_disposed_asset_cannot_be_deleted_or_cost_edited(cli):
+    await _seed(cli)
+    r = await cli.post(BASE, json={
+        "name": "أصل مستبعد", "purchase_date": str(date.today()), "cost": 2000.0, "useful_life_years": 5,
+    })
+    aid = r.json()["id"]
+    assert (await cli.patch(f"{BASE}/{aid}/dispose")).status_code == 200
+    assert (await cli.delete(f"{BASE}/{aid}")).status_code == 400
+    upd = await cli.patch(f"{BASE}/{aid}", json={
+        "name": "أصل مستبعد", "purchase_date": str(date.today()), "cost": 5000.0, "useful_life_years": 5,
+    })
+    assert upd.status_code == 400
+    # تعديل البيانات الوصفية فقط مسموح
+    upd2 = await cli.patch(f"{BASE}/{aid}", json={
+        "name": "اسم جديد", "purchase_date": str(date.today()), "cost": 2000.0, "useful_life_years": 5,
+    })
+    assert upd2.status_code == 200, upd2.text
+    assert await _acc_balance(cli, "1400") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_update_cost_keeps_original_payment_account(cli):
+    await _seed(cli)
+    r = await cli.post(BASE, json={
+        "name": "أصل بنكي", "purchase_date": str(date.today()), "cost": 1000.0,
+        "useful_life_years": 5, "payment_account_code": "1120",
+    })
+    aid = r.json()["id"]
+    upd = await cli.patch(f"{BASE}/{aid}", json={
+        "name": "أصل بنكي", "purchase_date": str(date.today()), "cost": 1500.0, "useful_life_years": 5,
+    })
+    assert upd.status_code == 200, upd.text
+    assert await _acc_balance(cli, "1120") == -1500.0
+    assert await _acc_balance(cli, "1110") == 0.0

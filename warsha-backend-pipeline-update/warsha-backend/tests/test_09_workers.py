@@ -383,3 +383,81 @@ async def test_cannot_delete_settled_advance_directly(cli):
     await cli.delete(f"{BASE}/payroll/{run_id}")
     r2 = await cli.delete(f"{BASE}/advances/{aid}")
     assert r2.status_code in (200, 204)
+
+
+
+# ════════════════ HR HARDENING: ROLES / VALIDATION ═══════════════════
+@pytest.mark.asyncio
+async def test_non_writer_roles_cannot_modify_workers_or_payroll(cli):
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.api.auth import create_token
+    wid = (await cli.post(BASE, json=_worker("عامل صلاحيات"))).json()["id"]
+    ra = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 50, "advance_type": "bonus", "date": str(date.today())})
+    assert ra.status_code == 201
+    aid = ra.json()["id"]
+    for role in ("viewer", "production"):
+        tok = create_token(user_id=993, username=f"{role}_hr", role=role, tenant_id=1)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                               headers={"Authorization": f"Bearer {tok}"}) as rc:
+            assert (await rc.delete(f"{BASE}/advances/{aid}")).status_code == 403
+            assert (await rc.post(f"{BASE}/advances", json={
+                "worker_id": wid, "amount": 50, "advance_type": "advance",
+                "date": str(date.today())})).status_code == 403
+            assert (await rc.post(BASE, json=_worker("x"))).status_code == 403
+            assert (await rc.put(f"{BASE}/{wid}", json=_worker("y"))).status_code == 403
+            assert (await rc.post(f"{BASE}/payroll", json={
+                "week_start": "2019-01-05", "week_end": "2019-01-11"})).status_code == 403
+            # القراءة مسموحة
+            assert (await rc.get(BASE)).status_code == 200
+            assert (await rc.get(f"{BASE}/payroll")).status_code == 200
+    # accountant يقدر
+    tok = create_token(user_id=994, username="acc_hr", role="accountant", tenant_id=1)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {tok}"}) as ac:
+        assert (await ac.delete(f"{BASE}/advances/{aid}")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_payroll_rejects_bad_ranges_and_overlap(cli):
+    r = await cli.post(f"{BASE}/payroll", json={"week_start": "2019-02-10", "week_end": "2019-02-01"})
+    assert r.status_code == 400
+    r = await cli.post(f"{BASE}/payroll", json={"week_start": "2019-02-01", "week_end": "2019-04-01"})
+    assert r.status_code == 400
+    r = await cli.post(f"{BASE}/payroll", json={"week_start": "2019-02-02", "week_end": "2019-02-08"})
+    assert r.status_code == 201
+    r = await cli.post(f"{BASE}/payroll", json={"week_start": "2019-02-05", "week_end": "2019-02-11"})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_payroll_cannot_be_paid_twice(cli):
+    wid = (await cli.post(BASE, json=_worker("عامل صرف مزدوج"))).json()["id"]
+    ws = date(2019, 3, 2)
+    await cli.post("/api/v1/attendance", json={"worker_id": wid, "attendance_date": str(ws), "status": "present"})
+    run_id = (await cli.post(f"{BASE}/payroll", json={
+        "week_start": str(ws), "week_end": str(ws + timedelta(days=6))})).json()["id"]
+    assert (await cli.post(f"{BASE}/payroll/{run_id}/generate")).status_code == 200
+    assert (await cli.post(f"{BASE}/payroll/{run_id}/pay")).status_code == 200
+    assert (await cli.post(f"{BASE}/payroll/{run_id}/pay")).status_code == 400
+    assert (await cli.post(f"{BASE}/payroll/{run_id}/generate")).status_code == 400
+    assert (await cli.delete(f"{BASE}/payroll/{run_id}")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_worker_and_advance_amounts_are_validated(cli):
+    assert (await cli.post(BASE, json={"name": "   ", "daily_wage": 100})).status_code in (400, 422)
+    assert (await cli.post(BASE, json={"name": "x" * 201, "daily_wage": 100})).status_code in (400, 422)
+    r = await cli.post(BASE, json={"name": "أجر كسري", "daily_wage": "150.006"})
+    assert r.status_code == 201
+    assert r.json()["daily_wage"] == 150.01
+    wid = r.json()["id"]
+    r = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": "NaN", "advance_type": "bonus", "date": str(date.today())})
+    assert r.status_code in (400, 422)
+    # عامل معطَّل لا يأخذ سلفة
+    assert (await cli.delete(f"{BASE}/{wid}")).status_code == 200
+    r = await cli.post(f"{BASE}/advances", json={
+        "worker_id": wid, "amount": 10, "advance_type": "bonus", "date": str(date.today())})
+    assert r.status_code == 400

@@ -2,8 +2,9 @@
 Super Admin API — يُستخدم فقط من لوحة إدارة النظام
 """
 import os, secrets, hmac, time
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional
@@ -48,6 +49,24 @@ def _prune_expired_tokens() -> None:
         _active_tokens.pop(t, None)
 
 
+def is_super_token_valid(token: Optional[str]) -> bool:
+    """فحص موحّد لصلاحية توكن Super Admin (موجود + غير منتهي). تستخدمه موديولات
+    تانية (مثل catalog) بدل ما تفحص وجود التوكن في القاموس بس وتتجاهل الانتهاء."""
+    if not token:
+        return False
+    exp = _active_tokens.get(token)
+    return exp is not None and exp >= time.time()
+
+
+# SECURITY (fixed): مفيش حد لمحاولات دخول Super Admin الفاشلة → brute-force
+# على أقوى حساب في النظام. دلوقتي 10 محاولات فاشلة / 15 دقيقة لكل IP.
+_SA_MAX_FAILS = 10
+_SA_WINDOW_SECONDS = 15 * 60
+_sa_failures: dict = {}  # client ip -> [timestamps]
+
+VALID_PLANS = {"trial", "basic", "pro", "free", "enterprise"}
+
+
 def _verify_token(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "غير مصرح")
@@ -74,18 +93,30 @@ class CreateWorkshopIn(BaseModel):
 
 
 @router.post("/login")
-async def super_login(data: SuperLoginIn):
+async def super_login(data: SuperLoginIn, request: Request):
     if not _super_admin_password_is_safe():
         raise HTTPException(
             503,
             "Super Admin معطّل: يجب ضبط SUPER_ADMIN_PASSWORD (قيمة غير افتراضية) "
             "قبل تشغيل النظام خارج بيئة development.",
         )
+    now = time.time()
+    _ip = request.client.host if request.client else ""
+    _recent = [t for t in _sa_failures.get(_ip, []) if now - t < _SA_WINDOW_SECONDS]
+    _sa_failures[_ip] = _recent
+    if len(_recent) >= _SA_MAX_FAILS:
+        raise HTTPException(429, "محاولات دخول فاشلة كثيرة — حاول مرة أخرى بعد 15 دقيقة")
     # مقارنة بزمن ثابت (constant-time) لتجنّب هجمات قياس التوقيت على كلمة المرور
-    user_ok = hmac.compare_digest(data.username, SUPER_ADMIN_USERNAME)
-    pass_ok = hmac.compare_digest(data.password, SUPER_ADMIN_PASSWORD)
+    # (bytes: compare_digest بيرمي TypeError على نص غير ASCII → كان بيرجّع 500)
+    user_ok = hmac.compare_digest(data.username.encode("utf-8"), SUPER_ADMIN_USERNAME.encode("utf-8"))
+    pass_ok = hmac.compare_digest(data.password.encode("utf-8"), SUPER_ADMIN_PASSWORD.encode("utf-8"))
     if not (user_ok and pass_ok):
+        _recent.append(now)
+        if len(_sa_failures) > 10000:
+            _sa_failures.pop(_ip, None)
+            _sa_failures[_ip] = _recent
         raise HTTPException(401, "بيانات الدخول غير صحيحة")
+    _sa_failures.clear()
     _prune_expired_tokens()
     token = secrets.token_hex(32)
     _active_tokens[token] = time.time() + SUPER_TOKEN_TTL_SECONDS
@@ -126,11 +157,16 @@ async def create_workshop(
     db: AsyncSession = Depends(get_db),
     _token: str = Depends(_verify_token),
 ):
-    from app.api.auth import hash_password
+    from app.api.auth import hash_password, validate_new_workshop
 
     slug = data.workshop_slug.strip().lower()
     if not slug or not slug.replace("-", "").replace("_", "").isalnum():
         raise HTTPException(400, "معرّف الورشة غير صالح")
+    # نفس تحقّق signup: اسم/مستخدم غير فاضي، كلمة مرور ≥ 6، حدود الأطوال
+    validate_new_workshop(data.workshop_name, slug, data.admin_username,
+                          data.admin_password, data.admin_full_name)
+    if data.plan and data.plan not in VALID_PLANS:
+        raise HTTPException(400, f"باقة غير صالحة. الخيارات: {sorted(VALID_PLANS)}")
 
     existing = await db.execute(select(Tenant).where(Tenant.slug == slug))
     if existing.scalar_one_or_none():
@@ -146,19 +182,26 @@ async def create_workshop(
         tenant_id=tenant.id,
         username=data.admin_username.strip(),
         password_hash=hash_password(data.admin_password),
-        full_name=data.admin_full_name or data.admin_username,
+        full_name=(data.admin_full_name or "").strip() or data.admin_username.strip(),
         role="admin",
         is_active=True,
     )
     db.add(user)
+    await db.flush()
+
+    # GAP (fixed): الورشة المُنشأة من Super Admin كانت بتتزرع دليل حسابات فقط (وأي
+    # خطأ كان بيتبلع بصمت) ومن غير المخازن الافتراضية — عكس signup-internal.
+    # من غير المخازن/الحسابات، القيود التلقائية وحركات المخزون بتفشل أو تتخطى بصمت.
+    from app.api.chart_of_accounts import seed_default_accounts
+    await seed_default_accounts(db, tenant.id)
+    from app.api.warehouses import seed_default_warehouses
+    await seed_default_warehouses(db, tenant.id)
 
     try:
-        from app.api.chart_of_accounts import seed_default_accounts
-        await seed_default_accounts(db, tenant.id)
-    except Exception:
-        pass
-
-    await db.commit()
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "هذا المعرّف مستخدم بالفعل")
     return {
         "message": "تم إنشاء الورشة بنجاح",
         "tenant": {"id": tenant.id, "name": tenant.name, "slug": slug},

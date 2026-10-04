@@ -16,7 +16,7 @@ function SupplierProfile({ supplier, onBack }) {
   const toast = useToast()
   const { canWrite } = useAuth()
   const write = canWrite('inventory')
-  const { data: statement, loading, reload } = useApi(
+  const { data: statement, loading, error: statementError, reload } = useApi(
     () => api.get(`/purchases/suppliers/${supplier.id}/statement`),
     [supplier.id]
   )
@@ -26,9 +26,12 @@ function SupplierProfile({ supplier, onBack }) {
 
   const [recordPay, paying] = useAction(async () => {
     if (!payForm.amount || Number(payForm.amount) <= 0) { toast('أدخل مبلغ الدفعة', 'error'); return }
+    const whtN = Number(payForm.wht_amount) || 0
+    if (whtN < 0 || whtN > Number(payForm.amount)) { toast('ضريبة الخصم تحت الحساب غير صحيحة (لا تتجاوز مبلغ الدفعة)', 'error'); return }
+    if ((payForm.reference || '').length > 100) { toast('المرجع طويل جداً (الحد 100 حرف)', 'error'); return }
     const inv = statement?.invoices?.find(i => i.remaining > 0)
     const result = await api.purchases.recordSupplierPayment({
-      supplier_id:    sup.id,
+      supplier_id:    (statement?.supplier || supplier).id,
       invoice_id:     inv ? inv.id : null,
       amount:         Number(payForm.amount),
       payment_date:   payForm.payment_date || today(),
@@ -40,7 +43,7 @@ function SupplierProfile({ supplier, onBack }) {
     // رفع إثبات الدفع إن وُجد
     if (payFile && result?.supplier_payment_id) {
       try { await api.uploadAttachment('supplier_payment', result.supplier_payment_id, payFile, 'إثبات دفعة') }
-      catch (_) {}
+      catch (e) { toast(`تم تسجيل الدفعة، لكن فشل رفع إثبات الدفع: ${e.message}`, 'error') }
     }
     if (result?.excess_onaccount > 0) {
       toast(`تم تسجيل الدفعة — ${egp(result.excess_onaccount)} زيادة عن الفاتورة تم ترحيلها كرصيد تحت الحساب`)
@@ -53,7 +56,18 @@ function SupplierProfile({ supplier, onBack }) {
   })
 
   if (loading) return <PageSpinner />
-  if (!statement) return null
+  if (!statement) {
+    // كان بيرجع null — صفحة فاضية بدون زر رجوع لو فشل تحميل كشف الحساب
+    return (
+      <div className="card flex flex-col items-center gap-3 py-10 text-sm">
+        <div className="text-erp-muted">{statementError || 'تعذر تحميل كشف حساب المورد'}</div>
+        <div className="flex gap-2">
+          <button className="btn btn-sm" onClick={onBack}>← العودة</button>
+          <button className="btn btn-primary btn-sm" onClick={reload}>إعادة المحاولة</button>
+        </div>
+      </div>
+    )
+  }
 
   const sup = statement.supplier || supplier
   const invoices = statement.invoices || []
@@ -219,7 +233,7 @@ function SupplierProfile({ supplier, onBack }) {
               </div>
               <div>
                 <label className="field-label">المبلغ (ج) *</label>
-                <input className="field-input w-full" type="number" step="0.01" min="0.01"
+                <input className="field-input w-full" type="number" step="0.01" min="0.01" autoFocus
                   value={payForm.amount} onChange={e => setPayForm(f => ({ ...f, amount: e.target.value }))} />
               </div>
               <div>
@@ -250,7 +264,7 @@ function SupplierProfile({ supplier, onBack }) {
                 onChange={e => setPayForm(f => ({ ...f, reference: e.target.value }))}
                 placeholder="اختياري" />
               <Input label="ضريبة الخصم تحت الحساب (WHT)"
-                type="number" step="0.01"
+                type="number" step="0.01" min="0"
                 value={payForm.wht_amount}
                 onChange={e => setPayForm(f => ({ ...f, wht_amount: e.target.value }))}
                 placeholder="اختياري" />
@@ -268,7 +282,7 @@ function SupplierProfile({ supplier, onBack }) {
               </div>
             </div>
             <div className="flex gap-2 justify-end mt-5 pt-4 border-t border-erp-border">
-              <button className="btn" onClick={() => setPayModal(false)}>إلغاء</button>
+              <button className="btn" onClick={() => setPayModal(false)} disabled={paying}>إلغاء</button>
               <button className="btn btn-primary" onClick={recordPay} disabled={paying}>{paying ? '…' : 'حفظ'}</button>
             </div>
           </div>
@@ -311,9 +325,20 @@ export default function Suppliers() {
   }
 
   const [save, saving] = useAction(async () => {
-    if (!form.name || !form.code) { toast('اسم ورمز المورد مطلوبان', 'error'); return }
-    if (modal?.mode === 'edit') await api.purchases.updateSupplier(form.id, form)
-    else await api.purchases.createSupplier(form)
+    // الرمز اختياري فعلياً — الباك-إند بيولّده تلقائياً لو فاضي (زي ما مكتوب في الحقل)
+    const name = (form.name || '').trim()
+    if (!name) { toast('اسم المورد مطلوب', 'error'); return }
+    if (name.length > 200) { toast('اسم المورد طويل جداً (الحد 200 حرف)', 'error'); return }
+    if ((form.code || '').trim().length > 30) { toast('كود المورد طويل جداً (الحد 30 حرف)', 'error'); return }
+    if (form.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) { toast('البريد الإلكتروني غير صحيح', 'error'); return }
+    const limits = { phone: 30, email: 200, contact_person: 200, tax_id: 50, bank_account: 200, iban: 50 }
+    const labels = { phone: 'الهاتف', email: 'البريد الإلكتروني', contact_person: 'جهة الاتصال', tax_id: 'الرقم الضريبي', bank_account: 'الحساب البنكي', iban: 'IBAN' }
+    for (const [k, max] of Object.entries(limits)) {
+      if (form[k] && String(form[k]).length > max) { toast(`${labels[k]} أطول من المسموح (${max} حرف)`, 'error'); return }
+    }
+    const payload = { ...form, name, code: (form.code || '').trim() || null }
+    if (modal?.mode === 'edit') await api.purchases.updateSupplier(form.id, payload)
+    else await api.purchases.createSupplier(payload)
     toast('تم الحفظ'); setModal(null); reload()
   })
 
@@ -330,8 +355,8 @@ export default function Suppliers() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="card flex items-center gap-3 py-3">
-        <div className="flex-1"><SearchInput value={q} onChange={setQ} placeholder="بحث بالاسم أو الرمز أو الهاتف…" /></div>
+      <div className="card flex items-center gap-3 py-3 flex-wrap">
+        <div className="flex-1 min-w-48"><SearchInput value={q} onChange={setQ} placeholder="بحث بالاسم أو الرمز أو الهاتف…" /></div>
         {write && <button className="btn btn-primary btn-sm" onClick={openAdd}>+ مورد جديد</button>}
       </div>
 
@@ -418,8 +443,8 @@ export default function Suppliers() {
                       </button>
                       {write && (
                         <>
-                          <button className="btn btn-sm text-xs" onClick={() => openEdit(s)}>✏️</button>
-                          <button className="btn btn-sm text-xs" style={{ color: 'var(--red)' }} onClick={() => setDelTarget(s)}>🗑️</button>
+                          <button className="btn btn-sm text-xs" title="تعديل" onClick={() => openEdit(s)}>✏️</button>
+                          <button className="btn btn-sm text-xs" style={{ color: 'var(--red)' }} disabled={deleting} title="حذف (أرشفة)" onClick={() => setDelTarget(s)}>🗑️</button>
                         </>
                       )}
                     </div>
@@ -440,7 +465,7 @@ export default function Suppliers() {
               : <Input label="الرمز (اختياري — يُولَّد تلقائياً)" value={form.code || ''}
                   onChange={e => setForm(f => ({ ...f, code: e.target.value }))} placeholder="SUP-0001" />
             }
-            <Input label="الاسم *" value={form.name || ''} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
+            <Input label="الاسم *" maxLength={200} value={form.name || ''} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} />
           </FormGrid>
           <FormGrid cols={2}>
             <Input label="الهاتف" value={form.phone || ''} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} />
@@ -495,7 +520,7 @@ export default function Suppliers() {
           <Textarea label="ملاحظات" value={form.notes || ''} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} rows={2} />
         </div>
         <ModalFooter>
-          <button className="btn" onClick={() => setModal(null)}>إلغاء</button>
+          <button className="btn" onClick={() => setModal(null)} disabled={saving}>إلغاء</button>
           <button className="btn btn-primary" onClick={save} disabled={saving}>{saving ? '…' : 'حفظ'}</button>
         </ModalFooter>
       </Modal>
@@ -505,7 +530,7 @@ export default function Suppliers() {
         onClose={() => setDelTarget(null)}
         onConfirm={del}
         title="حذف المورد"
-        message={`حذف "${delTarget?.name}"?`}
+        message={`حذف (أرشفة) المورد "${delTarget?.name || ''}"؟ سيختفي من قائمة الموردين وتبقى فواتيره ودفعاته محفوظة.`}
         danger
       />
     </div>

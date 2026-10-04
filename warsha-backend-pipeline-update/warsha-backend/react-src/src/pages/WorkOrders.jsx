@@ -17,6 +17,36 @@ const STATUS_OPTS = [
   { value: 'cancelled',   label: 'ملغي',   color: '#EF4444' },
 ]
 
+/* تحقق مشترك لنموذج إنشاء/تعديل أمر الإنتاج (نفس قواعد الباك-إند + قيود منطقية مفقودة هناك).
+   يرجّع رسالة خطأ عربية أو null. */
+function validateWoForm(form, allEqs, fallbackEqId) {
+  if (form.planned_cost !== '' && form.planned_cost != null && Number(form.planned_cost) < 0) {
+    return 'التكلفة المخططة لا يمكن أن تكون سالبة'
+  }
+  if (form.quantity != null && form.quantity !== '' && !(Number(form.quantity) > 0)) {
+    return 'الكمية المنتَجة يجب أن تكون أكبر من صفر'
+  }
+  if (form.start_date && form.planned_end_date && form.planned_end_date < form.start_date) {
+    return 'تاريخ الانتهاء المخطط لازم يكون بعد تاريخ البدء'
+  }
+  const eq = (allEqs || []).find(e => e.id === Number(form.equipment_id || fallbackEqId))
+  if (eq?.length_min != null && form.planned_length != null && form.planned_length !== '') {
+    const L = Number(form.planned_length)
+    if (!(L > 0)) return 'طول التصنيع يجب أن يكون أكبر من صفر'
+    if (L < Number(eq.length_min) || (eq.length_max != null && L > Number(eq.length_max))) {
+      return `طول التصنيع خارج النطاق المسموح (${eq.length_min} — ${eq.length_max})`
+    }
+  }
+  return null
+}
+
+/* تواريخ فاضية ('') كانت بتتبعت كما هي → Optional[date] يرفضها بخطأ 422 خام */
+function normalizeWoDates(payload) {
+  const out = { ...payload }
+  ;['start_date', 'end_date', 'planned_end_date'].forEach(k => { if (out[k] === '') out[k] = null })
+  return out
+}
+
 function StatusPill({ value }) {
   const s = STATUS_OPTS.find(o => o.value === value) || STATUS_OPTS[0]
   return (
@@ -102,6 +132,14 @@ function CutIssueModal({ res, mat, wo, onClose, onDone }) {
 
   const [calc, calculating] = useAction(async () => {
     setCalcError('')
+    // نفس قيود الباك-إند (أبعاد > 0، العدد 1..10000) — بدل رسالة pydantic خام
+    const badPiece = pieces.find(p => !String(p.label || '').trim() ||
+      (isPlate ? !(Number(p.width) > 0 && Number(p.height) > 0) : !(Number(p.length) > 0)) ||
+      !(Number.isInteger(Number(p.qty)) && Number(p.qty) >= 1 && Number(p.qty) <= 10000))
+    if (badPiece) {
+      setCalcError('تأكد من إدخال كود لكل قطعة وأبعاد أكبر من صفر وعدد صحيح بين 1 و 10000')
+      return
+    }
     try {
       if (isPlate) {
         const r = await api.inventory.cuttingPlan({
@@ -124,6 +162,12 @@ function CutIssueModal({ res, mat, wo, onClose, onDone }) {
   })
 
   const [addStock, addingStock] = useAction(async () => {
+    if (!(Number(newStock.length_cm) > 0) || (isPlate && !(Number(newStock.width_cm) > 0))) {
+      toast('الأبعاد يجب أن تكون أكبر من صفر', 'error'); return
+    }
+    if (!(Number.isInteger(Number(newStock.qty || 1)) && Number(newStock.qty || 1) >= 1)) {
+      toast('العدد يجب أن يكون رقماً صحيحاً 1 على الأقل', 'error'); return
+    }
     if (isPlate) {
       await api.inventory.createSheetStock({ material_id: mat.id, ...newStock })
     } else {
@@ -139,6 +183,7 @@ function CutIssueModal({ res, mat, wo, onClose, onDone }) {
   const hasShortage = result?.shortage?.length > 0
 
   const [confirm, confirming] = useAction(async () => {
+    if (hasShortage && !window.confirm('المخزون المتاح لا يغطي كل القطع المطلوبة — هل تريد الصرف الجزئي للقطع المتاحة فقط؟')) return
     const wasteItems = []
     let consumedFromMainStock = 0
     if (isPlate) {
@@ -263,11 +308,11 @@ function CutIssueModal({ res, mat, wo, onClose, onDone }) {
                 </div>
                 {isPlate ? (
                   <div style={{ fontSize: 11, color: '#475569' }}>
-                    المقاس: {it.sheet_width}×{it.sheet_height} سم — القطع: {it.placements.map(p => `${p.label}(${p.width}×${p.height})`).join('، ')}
+                    المقاس: {it.sheet_width}×{it.sheet_height} سم — القطع: {(it.placements || []).map(p => `${p.label}(${p.width}×${p.height})`).join('، ')}
                   </div>
                 ) : (
                   <div style={{ fontSize: 11, color: '#475569' }}>
-                    الطول: {it.bar_length} سم — القطع: {it.cuts.map(c => `${c.label}(${c.length})`).join('، ')}
+                    الطول: {it.bar_length} سم — القطع: {(it.cuts || []).map(c => `${c.label}(${c.length})`).join('، ')}
                   </div>
                 )}
                 {isPlate && (it.waste_rects || []).filter(r => Math.min(r.width, r.height) >= 15).map((r, ri) => (
@@ -357,6 +402,8 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
   const { data: materials, loading: materialsLoading } = useApi(() => api.inventory.materials())
   const [showInvModal, setShowInvModal] = useState(false)
   const [invCustId, setInvCustId]       = useState('')
+  // سعر البيع — كان بيتحط تلقائي = التكلفة المخططة (ربح صفر) من غير ما المستخدم يختار
+  const [invPrice, setInvPrice]         = useState('')
   const [creatingInv, setCreatingInv]   = useState(false)
   const [shortages, setShortages] = useState(null)
   const [cutRes, setCutRes] = useState(null)
@@ -367,7 +414,10 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
   const variance = planned > 0 ? ((actual - planned) / planned * 100) : null
 
   /* ── Actions ── */
-  const [changeStatus] = useAction(async (status) => {
+  const [changeStatus, changingStatus] = useAction(async (status) => {
+    if (!status || status === wo.status) return
+    if (status === 'cancelled' && !window.confirm(`إلغاء أمر الإنتاج ${wo.code}؟ سيتم إلغاء كل حجوزات المواد المفتوحة له.`)) return
+    if (status === 'done' && !window.confirm(`تأكيد إنهاء أمر الإنتاج ${wo.code}؟`)) return
     await api.accounting.updateWOStatus(wo.id, status)
     toast('تم تغيير الحالة')
     if (status === 'in_progress') {
@@ -384,7 +434,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
   const [doReserve, reserving] = useAction(async () => {
     if (!formRes.material_id || !formRes.qty || Number(formRes.qty) <= 0) { toast('اختر المادة وأدخل كمية أكبر من صفر', 'error'); return }
     await api.production.reserve({ work_order_id: wo.id, material_id: +formRes.material_id, qty: +formRes.qty })
-    toast('تم حجز المادة'); setModalRes(null); reloadRes()
+    toast('تم حجز المادة'); setModalRes(null); setFormRes({ qty: '' }); reloadRes()
   })
 
   const [autoReserve, autoReserving] = useAction(async () => {
@@ -395,7 +445,9 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
   })
 
   const [doEditSave, editSaving] = useAction(async () => {
-    await api.accounting.updateWO(wo.id, form)
+    const err = validateWoForm(form, allEqs, wo.equipment_id)
+    if (err) { toast(err, 'error'); return }
+    await api.accounting.updateWO(wo.id, normalizeWoDates(form))
     toast('تم التحديث'); setShowEditModal(false); onRefresh()
   })
 
@@ -407,9 +459,9 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
     onBack()
   })
 
-  const [doIssue] = useAction(async (resId) => {
+  const [doIssue, issuing] = useAction(async (resId) => {
     await api.production.issue({ reservation_id: resId })
-    toast('✅ تم صرف المادة'); reloadRes()
+    toast('✅ تم صرف المادة'); reloadRes(); reloadCost(); onRefresh()
   })
 
   const [doCancelRes] = useAction(async (resId) => {
@@ -419,16 +471,19 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
 
   const [execResult, setExecResult] = useState(null)
   const [execBom, execBomRunning] = useAction(async () => {
+    if (!window.confirm(`تنفيذ BOM كامل لأمر ${wo.code}؟ سيتم صرف كل المواد من المخزون وتسجيل تكلفتها.`)) return
     const res = await api.post(`/accounting/work-orders/${wo.id}/execute-bom`)
     setExecResult(res)
-    reloadRes(); reloadCost(); reloadWoBom()
-    const shorts = res.shortages?.length || 0
+    reloadRes(); reloadCost(); reloadWoBom(); onRefresh()
+    const shorts = res?.shortages?.length || 0
     if (shorts > 0) toast(`⚠️ تم التنفيذ مع نقص في ${shorts} مادة`, 'warn')
-    else toast(`✅ تم تنفيذ BOM كامل — تكلفة ${(res.total_cost || 0).toLocaleString()} ج.م`)
+    else toast(`✅ تم تنفيذ BOM كامل — تكلفة ${Number(res?.total_cost || 0).toLocaleString()} ج.م`)
   })
 
   const doCreateInvoice = async () => {
     if (!invCustId) { toast('اختر العميل', 'error'); return }
+    const salePrice = Number(invPrice === '' ? (wo.actual_cost || wo.planned_cost || 0) : invPrice)
+    if (!Number.isFinite(salePrice) || salePrice <= 0) { toast('سعر البيع يجب أن يكون أكبر من صفر', 'error'); return }
     if (creatingInv) return
     setCreatingInv(true)
     try {
@@ -444,7 +499,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
           description: wo.equipment_name_ar || wo.equipment_name || wo.equipment || 'عمل إنتاجي',
           qty: 1,
           unit: 'وحدة',
-          unit_price: wo.planned_cost || 0,
+          unit_price: salePrice,
           sort_order: 0,
         }],
       })
@@ -529,6 +584,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
                 <select
                   className="wo-status-select"
                   value={wo.status}
+                  disabled={changingStatus}
                   onChange={e => changeStatus(e.target.value)}
                 >
                   {STATUS_OPTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -802,13 +858,14 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
                                 <button
                                   className="wo-btn-sm green"
                                   style={{ fontSize: 12, padding: '4px 10px', opacity: materialsLoading ? 0.5 : 1 }}
-                                  disabled={materialsLoading}
+                                  disabled={materialsLoading || issuing}
                                   title={materialsLoading ? 'جارٍ تحميل بيانات المواد...' : undefined}
                                   onClick={() => {
                                     if (!materials) { toast('جارٍ تحميل بيانات المواد، حاول مرة أخرى', 'error'); return }
                                     const m = materials.find(x => x.id === r.material_id)
                                     const needsCutting = m && (m.is_plate || m.material_kind === 'plate' || m.material_kind === 'bar')
-                                    if (needsCutting) setCutRes(r); else doIssue(r.id)
+                                    if (needsCutting) setCutRes(r)
+                                    else if (window.confirm(`صرف المتبقي من "${r.material_name}" من المخزون لأمر الإنتاج؟`)) doIssue(r.id)
                                   }}
                                 >
                                   {materialsLoading ? '⏳ ...' : '📤 صرف'}
@@ -999,7 +1056,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
       </Modal>
 
       {/* ── Create Invoice Modal ── */}
-      <Modal open={showInvModal} onClose={() => { setShowInvModal(false); setInvCustId('') }} title="إنشاء فاتورة بيع من أمر الإنتاج" size="sm">
+      <Modal open={showInvModal} onClose={() => { setShowInvModal(false); setInvCustId(''); setInvPrice('') }} title="إنشاء فاتورة بيع من أمر الإنتاج" size="sm">
         <div className="flex flex-col gap-3">
           <div style={{ padding: '8px 12px', background: 'var(--surface)', borderRadius: 8, fontSize: 13 }}>
             <b>أمر الإنتاج:</b> {wo.code} — {wo.equipment_name_ar || wo.equipment_name || ''}
@@ -1012,8 +1069,11 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
             <option value="">— اختر العميل —</option>
             {(customers || []).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
           </Select>
+          <Input label="سعر البيع (ج.م)" type="number" min="0" step="0.01" value={invPrice}
+            placeholder={String(wo.actual_cost || wo.planned_cost || '')}
+            onChange={e => setInvPrice(e.target.value)} />
           <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-            سيتم إنشاء الفاتورة بسعر التكلفة المخططة ({egp(wo.planned_cost)}) كبند أولي ويمكن تعديلها لاحقاً.
+            تكلفة المعدة الفعلية: {egp(wo.actual_cost || wo.planned_cost)} — سعر البيع الافتراضي = التكلفة (بدون ربح) لو سبت الخانة فاضية. المعدة هتتخصم من مخزون تام الصنع.
           </div>
         </div>
         <ModalFooter>
@@ -1042,7 +1102,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
                   {execResult.issued_bulk.map((m, i) => (
                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 8px', background: '#f0fdf4', borderRadius: 4 }}>
                       <span>{m.material_name}</span>
-                      <span style={{ color: '#059669', fontWeight: 600 }}>{m.issued?.toFixed(2)} {m.unit} — {egp(m.cost)}</span>
+                      <span style={{ color: '#059669', fontWeight: 600 }}>{Number(m.issued || 0).toFixed(2)} {m.unit} — {egp(m.cost)}</span>
                     </div>
                   ))}
                 </div>
@@ -1057,7 +1117,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
                   {execResult.cut_sheet.map((m, i) => (
                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 8px', background: '#eff6ff', borderRadius: 4 }}>
                       <span>{m.material_name}</span>
-                      <span style={{ color: '#2563eb', fontWeight: 600 }}>{m.issued_m2?.toFixed(3)} م² — {egp(m.cost)}</span>
+                      <span style={{ color: '#2563eb', fontWeight: 600 }}>{Number(m.issued_m2 || 0).toFixed(3)} م² — {egp(m.cost)}</span>
                     </div>
                   ))}
                 </div>
@@ -1072,7 +1132,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
                   {execResult.cut_bar.map((m, i) => (
                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 8px', background: '#faf5ff', borderRadius: 4 }}>
                       <span>{m.material_name}</span>
-                      <span style={{ color: '#7c3aed', fontWeight: 600 }}>{m.issued_kg?.toFixed(2)} كج — {egp(m.cost)}</span>
+                      <span style={{ color: '#7c3aed', fontWeight: 600 }}>{Number(m.issued_kg || 0).toFixed(2)} كج — {egp(m.cost)}</span>
                     </div>
                   ))}
                 </div>
@@ -1096,7 +1156,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
                     <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, padding: '4px 8px', background: '#fef2f2', borderRadius: 4, border: '1px solid #fecaca' }}>
                       <span style={{ color: '#dc2626' }}>{s.material_name}</span>
                       <span style={{ color: '#dc2626', fontWeight: 600 }}>
-                        نقص {(s.shortage || s.shortage_m2 || s.shortage_kg || 0).toFixed(2)}
+                        نقص {Number(s.shortage || s.shortage_m2 || s.shortage_kg || 0).toFixed(2)}
                       </span>
                     </div>
                   ))}
@@ -1118,7 +1178,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
             <Select label="الحالة" value={form.status || 'draft'} onChange={e => setForm(f => ({...f, status: e.target.value}))} options={STATUS_OPTS} />
           </FormGrid>
           <FormGrid cols={2}>
-            <Input label="التكلفة المخططة" type="number" value={form.planned_cost || ''} onChange={e => setForm(f => ({...f, planned_cost: +e.target.value}))} />
+            <Input label="التكلفة المخططة" type="number" min="0" value={form.planned_cost || ''} onChange={e => setForm(f => ({...f, planned_cost: +e.target.value}))} />
             <Input label="تاريخ البدء" type="date" value={form.start_date || today()} onChange={e => setForm(f => ({...f, start_date: e.target.value}))} />
           </FormGrid>
           <FormGrid cols={2}>
@@ -1201,7 +1261,7 @@ function WorkOrderProfile({ wo, onBack, write, onRefresh }) {
         mat={cutRes ? (materials || []).find(m => m.id === cutRes.material_id) : null}
         wo={wo}
         onClose={() => setCutRes(null)}
-        onDone={() => { setCutRes(null); reloadRes() }}
+        onDone={() => { setCutRes(null); reloadRes(); reloadCost(); onRefresh() }}
       />
     </div>
   )
@@ -1261,6 +1321,7 @@ export default function WorkOrders({ onNavigate }) {
 
   const openAdd = async () => {
     setForm({ status: 'draft', start_date: today(), planned_cost: 0, quantity: 1, quantity_unit: 'قطعة' })
+    setCustLocations([])
     setModal({ mode: 'add' })
     try { const r = await api.accounting.nextWoCode(); setForm(f => ({ ...f, code: r.code })) } catch (_) {}
   }
@@ -1305,12 +1366,24 @@ export default function WorkOrders({ onNavigate }) {
     }
   }
 
+  // فتح التعديل من الكارت: الموقع المحفوظ كان بيظهر "بدون موقع" لأن مواقع العميل ما كانتش بتتحمّل
+  const openEdit = async (wo) => {
+    setForm({ ...wo })
+    setCustLocations([])
+    setModal({ mode: 'edit', item: wo })
+    if (wo.customer_id) {
+      try {
+        const locs = await api.get(`/customers/${wo.customer_id}/locations`)
+        setCustLocations(Array.isArray(locs) ? locs : [])
+      } catch (_) {}
+    }
+  }
+
   const [save, saving] = useAction(async () => {
     if (modal?.mode !== 'edit' && !form.equipment_id) { toast('اختر المعدة', 'error'); return }
-    if (form.start_date && form.planned_end_date && form.planned_end_date < form.start_date) {
-      toast('تاريخ الانتهاء المخطط لازم يكون بعد تاريخ البدء', 'error'); return
-    }
-    const payload = {
+    const err = validateWoForm(form, allEqs)
+    if (err) { toast(err, 'error'); return }
+    const payload = normalizeWoDates({
       ...form,
       quantity:          Number(form.quantity || 1),
       quantity_unit:     form.quantity_unit || 'قطعة',
@@ -1318,7 +1391,7 @@ export default function WorkOrders({ onNavigate }) {
       customer_id:       form.customer_id ? Number(form.customer_id) : null,
       location_id:       form.location_id ? Number(form.location_id) : null,
       planned_length:    form.planned_length ? Number(form.planned_length) : null,
-    }
+    })
     if (modal?.mode === 'edit') await api.accounting.updateWO(form.id, payload)
     else await api.accounting.createWO(payload)
     toast('تم الحفظ'); setModal(null); reload()
@@ -1374,7 +1447,7 @@ export default function WorkOrders({ onNavigate }) {
         <div className="flex-1 min-w-48">
           <SearchInput value={q} onChange={setQ} placeholder="بحث بالكود أو المعدة…" />
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           {['all','draft','in_progress','done','cancelled'].map(s => (
             <button
               key={s}
@@ -1498,7 +1571,8 @@ export default function WorkOrders({ onNavigate }) {
                     <button
                       className="wo-btn-sm"
                       style={{ fontSize: 11, padding: '3px 8px' }}
-                      onClick={e => { e.stopPropagation(); setForm({...wo}); setModal({ mode: 'edit', item: wo }) }}
+                      title="تعديل"
+                      onClick={e => { e.stopPropagation(); openEdit(wo) }}
                     >
                       ✏️
                     </button>
@@ -1621,7 +1695,7 @@ export default function WorkOrders({ onNavigate }) {
                 التكلفة المخططة
                 <span className="text-[10px] text-erp-muted mr-1">(تُحسب تلقائياً من BOM × الكمية)</span>
               </label>
-              <input className="field-input font-semibold" type="number" step="0.01"
+              <input className="field-input font-semibold" type="number" step="0.01" min="0"
                 style={{ color: form.planned_cost > 0 ? '#FF8A00' : undefined }}
                 value={form.planned_cost || ''}
                 onChange={e => setForm(f => ({ ...f, planned_cost: +e.target.value }))}

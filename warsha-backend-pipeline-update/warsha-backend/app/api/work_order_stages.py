@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 
 from app.core.database import get_db
 from app.api.auth import require_any, require_admin_production
@@ -27,21 +27,41 @@ DEFAULT_STAGES = [
 ]
 
 
+STAGE_STATUSES = ("pending", "in_progress", "done", "skipped")
+
+
 class StageIn(BaseModel):
-    stage_name: str
-    stage_order: int = 0
+    stage_name: str = Field(..., min_length=1, max_length=100)
+    stage_order: int = Field(0, ge=0)
     assigned_worker_id: Optional[int] = None
-    planned_hours: Optional[Decimal] = None
+    planned_hours: Optional[Decimal] = Field(None, ge=0, le=9999)
     notes: Optional[str] = None
 
 
 class StageUpdateIn(BaseModel):
-    stage_name: Optional[str] = None
+    stage_name: Optional[str] = Field(None, min_length=1, max_length=100)
     status: Optional[str] = None
     assigned_worker_id: Optional[int] = None
-    planned_hours: Optional[Decimal] = None
-    actual_hours: Optional[Decimal] = None
+    planned_hours: Optional[Decimal] = Field(None, ge=0, le=9999)
+    actual_hours: Optional[Decimal] = Field(None, ge=0, le=9999)
     notes: Optional[str] = None
+
+    @validator("status")
+    def _status_valid(cls, v):
+        if v is not None and v not in STAGE_STATUSES:
+            raise ValueError(f"حالة المرحلة غير صالحة — المسموح: {', '.join(STAGE_STATUSES)}")
+        return v
+
+
+async def _check_worker(db: AsyncSession, worker_id: Optional[int]) -> None:
+    """العامل المعيَّن لازم يكون موجود وتابع لنفس الورشة (db.get بيمر بفلتر الـtenant)."""
+    if worker_id is not None and not await db.get(Worker, worker_id):
+        raise HTTPException(404, "العامل غير موجود")
+
+
+def _check_wo_open(wo: WorkOrder) -> None:
+    if wo.status == "cancelled":
+        raise HTTPException(400, f"أمر الإنتاج {wo.code} ملغي — لا يمكن تعديل مراحله")
 
 
 async def _maybe_finalize_work_order(db: AsyncSession, work_order_id: int) -> None:
@@ -135,6 +155,9 @@ async def seed_default_stages(work_order_id: int, db: AsyncSession = Depends(get
     wo = await db.get(WorkOrder, work_order_id)
     if not wo:
         raise HTTPException(404)
+    _check_wo_open(wo)
+    if wo.status == "done":
+        raise HTTPException(400, f"أمر الإنتاج {wo.code} مكتمل بالفعل — لا يمكن إضافة مراحل له")
 
     existing = await db.scalar(
         select(func.count()).select_from(WorkOrderStage).where(
@@ -160,6 +183,10 @@ async def create_stage(work_order_id: int, data: StageIn, db: AsyncSession = Dep
     wo = await db.get(WorkOrder, work_order_id)
     if not wo:
         raise HTTPException(404)
+    _check_wo_open(wo)
+    if wo.status == "done":
+        raise HTTPException(400, f"أمر الإنتاج {wo.code} مكتمل بالفعل — لا يمكن إضافة مراحل له")
+    await _check_worker(db, data.assigned_worker_id)
     stage = WorkOrderStage(
         tenant_id=tid, work_order_id=work_order_id,
         **data.model_dump()
@@ -181,6 +208,9 @@ async def start_stage(stage_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404)
     if s.status not in ("pending",):
         raise HTTPException(400, f"لا يمكن بدء مرحلة بحالة '{s.status}'")
+    _wo_st = await db.get(WorkOrder, s.work_order_id)
+    if _wo_st:
+        _check_wo_open(_wo_st)
 
     # تحقّق من ترتيب المراحل — لا يمكن بدء مرحلة قبل انتهاء (أو تخطّي) كل ما يسبقها
     earlier_pending = (await db.execute(
@@ -211,6 +241,8 @@ async def complete_stage(stage_id: int, actual_hours: Optional[float] = None, db
         raise HTTPException(404)
     if s.status != "in_progress":
         raise HTTPException(400, f"لا يمكن إنهاء مرحلة لم تُبدَأ بعد (الحالة الحالية: '{s.status}')")
+    if actual_hours is not None and (actual_hours < 0 or actual_hours > 9999):
+        raise HTTPException(400, "ساعات العمل الفعلية غير صالحة")
     s.status = "done"
     s.completed_at = datetime.utcnow()
     if actual_hours is not None:
@@ -232,6 +264,12 @@ async def skip_stage(stage_id: int, reason: Optional[str] = None, db: AsyncSessi
     s = await db.get(WorkOrderStage, stage_id)
     if not s:
         raise HTTPException(404)
+    if s.status not in ("pending", "in_progress"):
+        # تخطّي مرحلة منتهية كان بيمسح حالتها "done" (والإحصائيات/نسبة الإنجاز)
+        raise HTTPException(400, f"لا يمكن تخطّي مرحلة بحالة '{s.status}'")
+    _wo_sk = await db.get(WorkOrder, s.work_order_id)
+    if _wo_sk:
+        _check_wo_open(_wo_sk)
     s.status = "skipped"
     if reason:
         s.notes = reason
@@ -250,8 +288,22 @@ async def update_stage(stage_id: int, data: StageUpdateIn, db: AsyncSession = De
     s = await db.get(WorkOrderStage, stage_id)
     if not s:
         raise HTTPException(404)
+    await _check_worker(db, data.assigned_worker_id)
+    if data.status is not None and data.status != s.status:
+        _wo_up = await db.get(WorkOrder, s.work_order_id)
+        if _wo_up:
+            _check_wo_open(_wo_up)
+            if _wo_up.status == "done":
+                raise HTTPException(400, f"أمر الإنتاج {_wo_up.code} مكتمل بالفعل — لا يمكن تغيير حالة مراحله")
+    _prev_status = s.status
     for k, v in data.model_dump(exclude_none=True).items():
         setattr(s, k, v)
+    # حافظ على اتساق الطوابع الزمنية مع الحالة الجديدة
+    if data.status is not None and data.status != _prev_status:
+        if data.status == "in_progress" and not s.started_at:
+            s.started_at = datetime.utcnow()
+        if data.status == "done" and not s.completed_at:
+            s.completed_at = datetime.utcnow()
 
     # محطة 29: PUT العام ده بيسمح بتغيير status مباشرة (بلا أي من فحوصات
     # /start أو /complete أو /skip) — لو التعديل خلّى كل المراحل منتهية/

@@ -112,6 +112,22 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ── تعارض قيود قاعدة البيانات (UNIQUE / FK / NOT NULL) ─────────────────
+# أي IntegrityError مش ممسوك داخل الـ endpoint (كود مكرر، سباق على ترقيم،
+# حذف سجل عليه سجلات مرتبطة...) كان بيطلع 500 "خطأ داخلي" غامض. نرجّعه 409
+# برسالة عربية واضحة ومن غير ما نسرّب نص الخطأ الخام (أسماء جداول/قيود).
+from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+
+@app.exception_handler(_IntegrityError)
+async def integrity_error_handler(request: Request, exc: _IntegrityError):
+    logger.warning("IntegrityError on %s %s: %s", request.method, request.url.path, exc.orig)
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "تعارض في البيانات — القيمة مستخدمة بالفعل أو السجل مرتبط بسجلات أخرى"},
+    )
+
+
 # ── Core Modules ──────────────────────────────────────────────
 app.include_router(inventory_router,      prefix="/api/v1")
 app.include_router(warehouses_router,     prefix="/api/v1")
@@ -187,7 +203,15 @@ if static_dir and Path(static_dir).exists():
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="API endpoint not found")
         candidate = static_path / full_path
-        if candidate.is_file():
+        # SECURITY (fixed): full_path بعد فك الترميز ممكن يحتوي "../" (مثلاً
+        # /..%2F..%2Fjwt_secret.key) فيخرج برّه مجلد الواجهة ويقرأ أي ملف
+        # (مفتاح JWT، قاعدة البيانات...). نسمح فقط بملفات جوه static_path.
+        try:
+            candidate.resolve().relative_to(static_path.resolve())
+            _inside = True
+        except (ValueError, OSError):
+            _inside = False
+        if _inside and candidate.is_file():
             return FileResponse(candidate)
         return FileResponse(static_path / "index.html")
 else:

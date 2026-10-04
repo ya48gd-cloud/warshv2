@@ -9,6 +9,7 @@ GET    /users/permissions → permissions matrix
 """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional
@@ -138,23 +139,38 @@ async def create_user(
         raise HTTPException(400, f"دور غير صالح. الخيارات: {list(VALID_ROLES)}")
     if len(body.password) < 6:
         raise HTTPException(400, "كلمة المرور قصيرة (6 أحرف على الأقل)")
+    if len(body.password) > 128:
+        raise HTTPException(400, "كلمة المرور طويلة جداً (128 حرف كحد أقصى)")
+    # الـ login بيعمل strip لاسم المستخدم — لو خزّناه بمسافات عمره ما هيعرف يدخل
+    username = (body.username or "").strip()
+    if not username:
+        raise HTTPException(400, "اسم المستخدم مطلوب")
+    if len(username) > 50:
+        raise HTTPException(400, "اسم المستخدم طويل جداً (50 حرف كحد أقصى)")
+    full_name = (body.full_name or "").strip() or username
+    if len(full_name) > 200:
+        raise HTTPException(400, "الاسم الكامل طويل جداً (200 حرف كحد أقصى)")
 
     existing = await db.execute(
-        select(User).where(User.username == body.username, User.tenant_id == _tid())
+        select(User).where(User.username == username, User.tenant_id == _tid())
     )
     if existing.scalar_one_or_none():
         raise HTTPException(409, "اسم المستخدم موجود بالفعل")
 
     user = User(
         tenant_id=_tid(),
-        username=body.username,
+        username=username,
         password_hash=hash_password(body.password),
-        full_name=body.full_name or body.username,
+        full_name=full_name,
         role=body.role,
         is_active=True,
     )
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "اسم المستخدم موجود بالفعل")
     await db.refresh(user)
     return _serialize(user)
 
@@ -177,18 +193,20 @@ async def update_user(
         if body.role not in VALID_ROLES:
             raise HTTPException(400, f"دور غير صالح: {body.role}")
         # Prevent demoting last admin
-        if user.role == "admin" and body.role != "admin":
+        if user.role == "admin" and body.role != "admin" and user.is_active:
             if await _count_active_admins(db) <= 1:
                 raise HTTPException(400, "لا يمكن تغيير دور آخر مدير متبقي")
         user.role = body.role
 
     if body.full_name is not None:
-        user.full_name = body.full_name
+        if len(body.full_name) > 200:
+            raise HTTPException(400, "الاسم الكامل طويل جداً (200 حرف كحد أقصى)")
+        user.full_name = body.full_name.strip() or user.username
 
     if body.is_active is not None:
         if user.id == int(current_admin["sub"]) and not body.is_active:
             raise HTTPException(400, "لا يمكنك تعطيل حسابك الخاص")
-        if user.role == "admin" and not body.is_active:
+        if user.role == "admin" and not body.is_active and user.is_active:
             if await _count_active_admins(db) <= 1:
                 raise HTTPException(400, "لا يمكن تعطيل آخر مدير متبقي")
         user.is_active = body.is_active
@@ -212,6 +230,8 @@ async def reset_password(
         raise HTTPException(404, "المستخدم غير موجود")
     if len(body.new_password) < 6:
         raise HTTPException(400, "كلمة المرور قصيرة (6 أحرف على الأقل)")
+    if len(body.new_password) > 128:
+        raise HTTPException(400, "كلمة المرور طويلة جداً (128 حرف كحد أقصى)")
     user.password_hash = hash_password(body.new_password)
     await db.commit()
     return {"message": f"تم إعادة تعيين كلمة مرور {user.username}"}
@@ -233,8 +253,32 @@ async def delete_user(
     if not user:
         raise HTTPException(404, "المستخدم غير موجود")
 
-    if user.role == "admin" and await _count_active_admins(db) <= 1:
+    if user.role == "admin" and user.is_active and await _count_active_admins(db) <= 1:
         raise HTTPException(400, "لا يمكن حذف آخر مدير متبقي")
+
+    # GAP (fixed): المستخدم مربوط بـ FK (created_by/approved_by) في دفعات العملاء
+    # والموردين والقيود والخزينة وأوامر الشراء وحركات الأصول. الحذف المباشر كان
+    # بيرمي IntegrityError (500) على Postgres أو يسيب مراجع يتيمة ويضيّع أثر
+    # المراجعة (audit trail). في الحالة دي نمنع الحذف ونوجّه للتعطيل بدله.
+    from sqlalchemy import func as _func
+    from app.models.models import (
+        CustomerPayment, SupplierPayment, AssetMovement, PurchaseOrder,
+        AccountingEntry, TreasuryTransaction,
+    )
+    for _model, _col in (
+        (CustomerPayment, "created_by"), (SupplierPayment, "created_by"),
+        (AssetMovement, "created_by"), (PurchaseOrder, "approved_by"),
+        (AccountingEntry, "created_by"), (TreasuryTransaction, "created_by"),
+    ):
+        _n = await db.scalar(
+            select(_func.count()).select_from(_model).where(getattr(_model, _col) == user.id)
+        )
+        if _n:
+            raise HTTPException(
+                409,
+                "لا يمكن حذف المستخدم لأنه مرتبط بعمليات مسجّلة (دفعات/قيود/خزينة...). "
+                "قم بتعطيل الحساب بدلاً من حذفه.",
+            )
 
     await db.delete(user)
     await db.commit()

@@ -9,13 +9,39 @@ import { egp, fmtDate } from '../utils/fmt'
 import { fetchWorkshopProfile } from './WorkshopProfile'
 import { PageSpinner } from '../components/ui/Spinner'
 
+// ── Helpers ─────────────────────────────────────────────────────
+// تهريب HTML لأي بيانات مستخدم بتتكتب في نافذة الطباعة (document.write) —
+// النافذة المفتوحة بـ window.open('') بتورث نفس الـ origin، فاسم عميل/وصف بند
+// فيه <img onerror=...> كان بيتنفّذ كـ XSS بصلاحيات الجلسة.
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+))
+
+// إشعار خطأ موحّد (نفس آلية bgErr في client.js) — كانت الأخطاء بتتبلع بـ try/finally بدون catch
+function notifyErr(e, fallback = 'تعذّر تحميل التقرير') {
+  window.dispatchEvent(new CustomEvent('erp:toast', {
+    detail: { msg: (e && e.message) || fallback, type: 'error' },
+  }))
+}
+
+// التحقق من ترتيب التواريخ قبل الطلب (الباك إند مش بيرفض من > إلى وبيرجع نتيجة فاضية بصمت)
+function badRange(from, to) {
+  if (from && to && from > to) {
+    notifyErr(null, 'تاريخ البداية يجب أن يكون قبل أو يساوي تاريخ النهاية')
+    return true
+  }
+  return false
+}
+
 // ── PDF generation via print ────────────────────────────────────
 function buildInvoiceHTML(inv, lines, ws) {
-  const logo = (ws.logo_data || ws.logo_url) ? `<img src="${ws.logo_data || ws.logo_url}" style="max-height:70px;max-width:160px;object-fit:contain">` : ''
+  const logo = (ws.logo_data || ws.logo_url) ? `<img src="${esc(ws.logo_data || ws.logo_url)}" style="max-height:70px;max-width:160px;object-fit:contain">` : ''
   const subtotal = lines.reduce((s,l) => s + Number(l.qty||1)*Number(l.unit_price||0), 0)
-  const tax      = subtotal * Number(inv.tax_pct||0) / 100
-  const disc     = subtotal * Number(inv.discount_pct||0) / 100
-  const total    = subtotal + tax - disc
+  // نفس ترتيب الباك إند (calc_totals): الخصم على الإجمالي، ثم الضريبة على (الإجمالي - الخصم).
+  // الكود القديم كان بيحسب الضريبة قبل الخصم فالإجمالي المطبوع كان مختلف عن الفاتورة الفعلية.
+  const disc     = inv.discount_amt != null ? Number(inv.discount_amt) : subtotal * Number(inv.discount_pct||0) / 100
+  const tax      = inv.tax_amount   != null ? Number(inv.tax_amount)   : (subtotal - disc) * Number(inv.tax_pct||0) / 100
+  const total    = inv.total        != null ? Number(inv.total)        : subtotal - disc + tax
 
   return `<!DOCTYPE html><html dir="rtl" lang="ar">
 <head><meta charset="UTF-8">
@@ -39,21 +65,21 @@ function buildInvoiceHTML(inv, lines, ws) {
   @media print { body { padding:16px } }
 </style>
 </head><body>
-<div class="watermark">${ws.name}</div>
+<div class="watermark">${esc(ws.name)}</div>
 <div class="header">
   <div>
     ${logo}
-    <div class="ws-name">${ws.name}</div>
+    <div class="ws-name">${esc(ws.name)}</div>
     <div class="ws-info">
-      ${ws.address ? ws.address + '<br>' : ''}
-      ${ws.phone ? 'ت: ' + ws.phone : ''} ${ws.mobile ? '| م: ' + ws.mobile : ''}<br>
-      ${ws.tax_id ? 'بطاقة ضريبية: ' + ws.tax_id : ''} ${ws.commercial_reg ? '| سجل تجاري: ' + ws.commercial_reg : ''}
+      ${ws.address ? esc(ws.address) + '<br>' : ''}
+      ${ws.phone ? 'ت: ' + esc(ws.phone) : ''} ${ws.mobile ? '| م: ' + esc(ws.mobile) : ''}<br>
+      ${ws.tax_id ? 'بطاقة ضريبية: ' + esc(ws.tax_id) : ''} ${ws.commercial_reg ? '| سجل تجاري: ' + esc(ws.commercial_reg) : ''}
     </div>
   </div>
   <div>
     <div class="inv-title">فاتورة ضريبية</div>
     <div class="inv-meta">
-      رقم: <strong>${inv.code}</strong><br>
+      رقم: <strong>${esc(inv.code)}</strong><br>
       التاريخ: ${fmtDate(inv.issue_date || inv.date)}<br>
       الاستحقاق: ${inv.due_date ? fmtDate(inv.due_date) : '—'}
     </div>
@@ -62,7 +88,7 @@ function buildInvoiceHTML(inv, lines, ws) {
 
 <div class="section">
   <div class="section-title">بيانات العميل</div>
-  <strong>${inv.customer_name || inv.customer?.name || '—'}</strong>
+  <strong>${esc(inv.customer_name || inv.customer?.name || '—')}</strong>
 </div>
 
 <div class="section">
@@ -73,9 +99,9 @@ function buildInvoiceHTML(inv, lines, ws) {
       ${lines.map((l,i) => `
         <tr>
           <td>${i+1}</td>
-          <td>${l.description}</td>
+          <td>${esc(l.description)}</td>
           <td>${Number(l.qty||1).toFixed(2)}</td>
-          <td>${l.unit||'قطعة'}</td>
+          <td>${esc(l.unit||'قطعة')}</td>
           <td>${egp(l.unit_price)}</td>
           <td>${egp(Number(l.qty||1)*Number(l.unit_price||0))}</td>
         </tr>`).join('')}
@@ -87,21 +113,21 @@ function buildInvoiceHTML(inv, lines, ws) {
   <table style="width:280px">
     <tbody>
       <tr><td>الإجمالي قبل الضريبة</td><td style="text-align:left">${egp(subtotal)}</td></tr>
-      ${inv.tax_pct > 0 ? `<tr><td>ضريبة ${inv.tax_pct}%</td><td style="text-align:left">${egp(tax)}</td></tr>` : ''}
-      ${inv.discount_pct > 0 ? `<tr><td>خصم ${inv.discount_pct}%</td><td style="text-align:left">- ${egp(disc)}</td></tr>` : ''}
+      ${inv.discount_pct > 0 ? `<tr><td>خصم ${Number(inv.discount_pct)}%</td><td style="text-align:left">- ${egp(disc)}</td></tr>` : ''}
+      ${inv.tax_pct > 0 ? `<tr><td>ضريبة ${Number(inv.tax_pct)}%</td><td style="text-align:left">${egp(tax)}</td></tr>` : ''}
       <tr class="total-row"><td>الإجمالي النهائي</td><td style="text-align:left">${egp(total)}</td></tr>
     </tbody>
   </table>
 </div>
 
-${inv.terms || inv.payment_terms ? `<div style="margin-top:16px;font-size:11px;color:#6b7280">شروط الدفع: ${inv.terms || inv.payment_terms}</div>` : ''}
+${inv.terms || inv.payment_terms ? `<div style="margin-top:16px;font-size:11px;color:#6b7280">شروط الدفع: ${esc(inv.terms || inv.payment_terms)}</div>` : ''}
 
-<div class="footer">${ws.report_footer}</div>
+<div class="footer">${esc(ws.report_footer)}</div>
 </body></html>`
 }
 
 function buildBOMHTML(eq, lines, totalCost, ws, allEqs = []) {
-  const logo = (ws.logo_data || ws.logo_url) ? `<img src="${ws.logo_data || ws.logo_url}" style="max-height:60px;object-fit:contain">` : ''
+  const logo = (ws.logo_data || ws.logo_url) ? `<img src="${esc(ws.logo_data || ws.logo_url)}" style="max-height:60px;object-fit:contain">` : ''
   const LEVEL_COLORS = { 0:'#1D9E75',1:'#185FA5',2:'#854F0B',3:'#A32D2D',4:'#6b7280' }
   const LEVEL_BG     = { 0:'#E8F8F2',1:'#EBF3FC',2:'#FDF5E8',3:'#FDEEEE',4:'#F5F5F5' }
 
@@ -125,20 +151,20 @@ function buildBOMHTML(eq, lines, totalCost, ws, allEqs = []) {
       <tr style="background:${bg}">
         <td colspan="7" style="padding-right:${8+indent}px;font-weight:600;font-size:11px">
           <span class="lv-badge" style="background:${col}">L${lv}</span>
-          &nbsp;${eqItem.name_ar||'معدة #'+eid}
-          <span style="font-family:monospace;font-size:10px;color:#6b7280;margin-right:6px">${eqItem.code||''}</span>
+          &nbsp;${esc(eqItem.name_ar||'معدة #'+eid)}
+          <span style="font-family:monospace;font-size:10px;color:#6b7280;margin-right:6px">${esc(eqItem.code||'')}</span>
           ${eqCost>0 ? `<span style="float:left;color:#0F6E56;font-weight:700">${egp(eqCost)}</span>` : ''}
         </td>
       </tr>
       ${eqLines.map(l => `<tr>
-        <td style="padding-right:${20+indent}px;font-size:11px">${l.material?.name_ar||'—'}</td>
-        <td style="font-family:monospace;font-size:10px">${l.material?.code||'—'}</td>
+        <td style="padding-right:${20+indent}px;font-size:11px">${esc(l.material?.name_ar||'—')}</td>
+        <td style="font-family:monospace;font-size:10px">${esc(l.material?.code||'—')}</td>
         <td style="color:#6b7280;font-size:10px">—</td>
-        <td>${Number(l.qty).toFixed(3)} ${l.material?.unit||''}</td>
+        <td>${Number(l.qty||0).toFixed(3)} ${esc(l.material?.unit||'')}</td>
         <td style="color:#6b7280">${
           l.dim_length_cm && l.dim_width_cm
-            ? `${l.dim_count||1}×${l.dim_length_cm}×${l.dim_width_cm} سم`
-            : l.bar_length_cm ? `${l.dim_count||1}×${l.bar_length_cm} سم` : '—'
+            ? `${Number(l.dim_count||1)}×${Number(l.dim_length_cm)}×${Number(l.dim_width_cm)} سم`
+            : l.bar_length_cm ? `${Number(l.dim_count||1)}×${Number(l.bar_length_cm)} سم` : '—'
         }</td>
         <td>${egp(l.unit_cost)}</td>
         <td style="color:#0F6E56;font-weight:600">${Number(l.total_cost)>0 ? egp(l.total_cost) : '—'}</td>
@@ -164,10 +190,10 @@ function buildBOMHTML(eq, lines, totalCost, ws, allEqs = []) {
   @media print { body { padding:12px } }
 </style>
 </head><body>
-<div class="watermark">${ws.name}</div>
+<div class="watermark">${esc(ws.name)}</div>
 <div class="header">
-  <div>${logo}<div class="ws-name">${ws.name}</div><div style="font-size:10px;color:#6b7280">${ws.address||''}</div></div>
-  <div><h2>تفكيك BOM — ${eq.name_ar}</h2><div style="font-size:11px;color:#6b7280;margin-top:4px">${eq.code}</div></div>
+  <div>${logo}<div class="ws-name">${esc(ws.name)}</div><div style="font-size:10px;color:#6b7280">${esc(ws.address||'')}</div></div>
+  <div><h2>تفكيك BOM — ${esc(eq.name_ar)}</h2><div style="font-size:11px;color:#6b7280;margin-top:4px">${esc(eq.code)}</div></div>
 </div>
 <table>
   <thead><tr><th>الاسم</th><th>الكود</th><th>الوزن</th><th>الكمية</th><th>الأبعاد</th><th>سعر الوحدة</th><th>تكلفة BOM</th></tr></thead>
@@ -179,16 +205,33 @@ function buildBOMHTML(eq, lines, totalCost, ws, allEqs = []) {
     </tr>
   </tbody>
 </table>
-<div class="footer">${ws.report_footer} — تاريخ الطباعة: ${fmtDate(new Date().toISOString())}</div>
+<div class="footer">${esc(ws.report_footer)} — تاريخ الطباعة: ${fmtDate(new Date().toISOString())}</div>
 </body></html>`
 }
 
-function printHTML(html) {
+// نفتح النافذة داخل حدث الضغط نفسه (قبل أي await) عشان مانع النوافذ المنبثقة ما يحجبهاش
+function openPrintWindow() {
   const w = window.open('', '_blank')
+  if (w) {
+    try { w.document.write('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;direction:rtl;padding:24px;color:#6b7280">جاري تجهيز التقرير…</body>') } catch (_) {}
+  }
+  return w
+}
+
+function printHTML(html, win = null) {
+  const w = win || window.open('', '_blank')
+  if (!w) {
+    // كان بيكرش بـ TypeError لو المتصفح حجب النافذة
+    notifyErr(null, 'تعذّر فتح نافذة الطباعة — فعّل النوافذ المنبثقة (popups) لهذا الموقع')
+    return
+  }
+  w.document.open()
   w.document.write(html)
   w.document.close()
-  setTimeout(() => { w.print() }, 600)
+  setTimeout(() => { try { w.print() } catch (_) {} }, 600)
 }
+
+function closeWin(w) { try { if (w && !w.closed) w.close() } catch (_) {} }
 
 // ── Report card ─────────────────────────────────────────────────
 function ReportCard({ icon, title, desc, children }) {
@@ -217,14 +260,16 @@ function InvoiceReport() {
   const [loading, setLoading] = useState(false)
 
   const print = async () => {
-    if (!invId) return
+    if (!invId || loading) return
+    const win = openPrintWindow()
     setLoading(true)
     try {
       const inv   = await api.get(`/sales/invoices/${invId}`)
       const lines = inv.lines || []
       const ws    = await fetchWorkshopProfile()
-      printHTML(buildInvoiceHTML(inv, lines, ws))
-    } finally { setLoading(false) }
+      printHTML(buildInvoiceHTML(inv, lines, ws), win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تحميل الفاتورة') }
+    finally { setLoading(false) }
   }
 
   return (
@@ -252,7 +297,8 @@ function QuotationReport() {
   const [loading, setLoading] = useState(false)
 
   const print = async () => {
-    if (!qtId) return
+    if (!qtId || loading) return
+    const win = openPrintWindow()
     setLoading(true)
     try {
       const qt    = await api.get(`/sales/quotations/${qtId}`)
@@ -262,8 +308,9 @@ function QuotationReport() {
       const html  = buildInvoiceHTML({...qt, issue_date: qt.date}, lines, ws)
         .replace('>فاتورة ضريبية<', '>عرض سعر<')
         .replace('رقم:', 'رقم عرض السعر:')
-      printHTML(html)
-    } finally { setLoading(false) }
+      printHTML(html, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تحميل عرض السعر') }
+    finally { setLoading(false) }
   }
 
   return (
@@ -294,15 +341,17 @@ function BOMReport() {
   const roots = allEqs?.filter(e => !e.parent_id) || []
 
   const print = async () => {
-    if (!eqId) return
+    if (!eqId || loading) return
+    const win = openPrintWindow()
     setLoading(true)
     try {
       const bom  = await api.get(`/equipment/${eqId}/bom/cost`)
         .catch(() => api.equipment.bom(eqId).then(lines => ({ lines, total_cost: lines.reduce((s,l)=>s+Number(l.total_cost||0),0) })))
       const eq   = allEqs?.find(e => e.id == eqId) || { code:'—', name_ar:'—' }
       const ws   = await fetchWorkshopProfile()
-      printHTML(buildBOMHTML(eq, bom.lines || [], bom.total_cost || 0, ws, allEqs || []))
-    } finally { setLoading(false) }
+      printHTML(buildBOMHTML(eq, bom.lines || [], bom.total_cost || 0, ws, allEqs || []), win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تحميل قائمة المواد') }
+    finally { setLoading(false) }
   }
 
   return (
@@ -330,11 +379,13 @@ function WorkOrderReport() {
   const [loading, setLoading] = useState(false)
 
   const print = async () => {
-    if (!woId) return
+    if (!woId || loading) return
+    const win = openPrintWindow()
     setLoading(true)
     try {
-      const lines = await api.get(`/accounting/work-orders/${woId}/cost-lines`).catch(bgErr('بنود تكلفة أمر الإنتاج', []))
-      const wo    = wos.find(w => w.id == woId) || {}
+      const linesRaw = await api.get(`/accounting/work-orders/${woId}/cost-lines`).catch(bgErr('بنود تكلفة أمر الإنتاج', []))
+      const lines = Array.isArray(linesRaw) ? linesRaw : []
+      const wo    = (wos || []).find(w => w.id == woId) || {}
       const ws    = await fetchWorkshopProfile()
       const total = lines.reduce((s,l) => s+Number(l.total_cost||0), 0)
       const html  = `<!DOCTYPE html><html dir="rtl" lang="ar">
@@ -351,12 +402,12 @@ function WorkOrderReport() {
 </style></head><body>
 <div class="header">
   <div>
-    ${(ws.logo_data || ws.logo_url) ? `<img src="${ws.logo_data || ws.logo_url}" style="max-height:60px">` : ''}
-    <div class="ws-name">${ws.name}</div>
+    ${(ws.logo_data || ws.logo_url) ? `<img src="${esc(ws.logo_data || ws.logo_url)}" style="max-height:60px">` : ''}
+    <div class="ws-name">${esc(ws.name)}</div>
   </div>
   <div>
     <div style="font-size:16px;font-weight:700;color:#0F6E56">تقرير تكاليف أمر إنتاج</div>
-    <div style="font-size:11px;color:#6b7280;margin-top:4px">كود: ${wo.code || '—'}</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:4px">كود: ${esc(wo.code || '—')}</div>
   </div>
 </div>
 <table>
@@ -364,7 +415,7 @@ function WorkOrderReport() {
   <tbody>
     ${lines.map(l => `<tr>
       <td><span style="padding:2px 8px;border-radius:4px;font-size:10px;background:${l.cost_type==='material'?'#E6F1FB':l.cost_type==='labor'?'#FAEEDA':'#f3f4f6'};color:${l.cost_type==='material'?'#185FA5':l.cost_type==='labor'?'#854F0B':'#6b7280'}">${l.cost_type==='material'?'مواد':l.cost_type==='labor'?'عمالة':'أخرى'}</span></td>
-      <td>${l.description||'—'}</td>
+      <td>${esc(l.description||'—')}</td>
       <td>${Number(l.qty||0).toFixed(2)}</td>
       <td>${egp(l.unit_cost)}</td>
       <td>${egp(l.total_cost)}</td>
@@ -372,10 +423,11 @@ function WorkOrderReport() {
     <tr class="total-row"><td colspan="4" style="text-align:right">الإجمالي</td><td>${egp(total)}</td></tr>
   </tbody>
 </table>
-<div class="footer">${ws.report_footer}</div>
+<div class="footer">${esc(ws.report_footer)}</div>
 </body></html>`
-      printHTML(html)
-    } finally { setLoading(false) }
+      printHTML(html, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تحميل تكاليف أمر الإنتاج') }
+    finally { setLoading(false) }
   }
 
   return (
@@ -419,19 +471,21 @@ function InventorySummaryReport() {
 
   const load = async () => {
     setLoading(true)
-    try { setData(await api.reports.inventorySummary()) } finally { setLoading(false) }
+    try { setData(await api.reports.inventorySummary()) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const printReport = async () => {
     if (!data) return
+    const win = openPrintWindow()
+    try {
     const ws = await fetchWorkshopProfile()
     const rows = data.top_value_materials.map((m, i) => `
       <tr>
         <td>${i + 1}</td>
-        <td>${m.code}</td>
-        <td>${m.name_ar}</td>
-        <td>${m.category || '—'}</td>
-        <td>${Number(m.stock_qty).toFixed(2)} ${m.unit}</td>
+        <td>${esc(m.code)}</td>
+        <td>${esc(m.name_ar)}</td>
+        <td>${esc(m.category || '—')}</td>
+        <td>${Number(m.stock_qty).toFixed(2)} ${esc(m.unit)}</td>
         <td>${egp(m.unit_cost)}</td>
         <td style="font-weight:600;color:#0F6E56">${egp(m.stock_value)}</td>
       </tr>`).join('')
@@ -447,7 +501,7 @@ th{background:#f5f4f0;padding:7px 8px;text-align:right;font-size:10px;font-weigh
 td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 .footer{margin-top:24px;font-size:10px;color:#6b7280;text-align:center;border-top:1px solid #e2e0d8;padding-top:12px}
 </style></head><body>
-<div class="header"><div><div class="ws-name">${ws.name}</div><div style="font-size:10px;color:#6b7280">${ws.address || ''}</div></div>
+<div class="header"><div><div class="ws-name">${esc(ws.name)}</div><div style="font-size:10px;color:#6b7280">${esc(ws.address || '')}</div></div>
 <div><div style="font-size:16px;font-weight:700;color:#0F6E56">تقرير ملخص المخزون</div>
 <div style="font-size:11px;color:#6b7280">تاريخ الطباعة: ${fmtDate(new Date().toISOString())}</div></div></div>
 <div class="kpi-grid">
@@ -459,7 +513,8 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 <div style="font-size:12px;font-weight:600;margin-bottom:8px">أعلى 10 مواد بالقيمة</div>
 <table><thead><tr><th>#</th><th>الكود</th><th>المادة</th><th>الفئة</th><th>الكمية</th><th>سعر الوحدة</th><th>القيمة</th></tr></thead>
 <tbody>${rows}</tbody></table>
-<div class="footer">${ws.report_footer}</div></body></html>`)
+<div class="footer">${esc(ws.report_footer)}</div></body></html>`, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تجهيز الطباعة') }
   }
 
   return (
@@ -512,23 +567,26 @@ function InventoryMovementReport() {
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.inventoryMovement({ date_from: from, date_to: to })) } finally { setLoading(false) }
+    try { setData(await api.reports.inventoryMovement({ date_from: from, date_to: to })) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const printReport = async () => {
     if (!data) return
+    const win = openPrintWindow()
+    try {
     const ws = await fetchWorkshopProfile()
     const rows = data.movements.map((m, i) => `
       <tr>
         <td>${m.date}</td>
-        <td><span style="padding:2px 6px;border-radius:4px;font-size:10px;background:${m.type==='in'?'#E8F8F2':'#FDEEEE'};color:${m.type==='in'?'#0F6E56':'#c0392b'}">${m.type_ar}</span></td>
-        <td>${m.material_code}</td>
-        <td>${m.material_name}</td>
+        <td><span style="padding:2px 6px;border-radius:4px;font-size:10px;background:${m.type==='in'?'#E8F8F2':'#FDEEEE'};color:${m.type==='in'?'#0F6E56':'#c0392b'}">${esc(m.type_ar)}</span></td>
+        <td>${esc(m.material_code)}</td>
+        <td>${esc(m.material_name)}</td>
         <td>${Number(m.qty).toFixed(2)}</td>
         <td>${egp(m.unit_cost)}</td>
         <td style="font-weight:600">${egp(m.total_cost)}</td>
-        <td style="font-size:10px;color:#6b7280">${m.reference || '—'}</td>
+        <td style="font-size:10px;color:#6b7280">${esc(m.reference || '—')}</td>
       </tr>`).join('')
     printHTML(`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8">
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Tajawal',Arial,sans-serif;font-size:12px;padding:24px}
@@ -541,9 +599,9 @@ th{background:#f5f4f0;padding:7px 8px;text-align:right;font-size:10px;font-weigh
 td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 .footer{margin-top:24px;font-size:10px;color:#6b7280;text-align:center;border-top:1px solid #e2e0d8;padding-top:12px}
 </style></head><body>
-<div class="header"><div><div class="ws-name">${ws.name}</div></div>
+<div class="header"><div><div class="ws-name">${esc(ws.name)}</div></div>
 <div><div style="font-size:16px;font-weight:700;color:#0F6E56">تقرير حركة المخزون</div>
-<div style="font-size:11px;color:#6b7280">من ${from} إلى ${to}</div></div></div>
+<div style="font-size:11px;color:#6b7280">من ${esc(from)} إلى ${esc(to)}</div></div></div>
 <div class="summary">
   <div class="sum-box"><div style="font-size:16px;font-weight:700;color:#0F6E56">${egp(data.total_in)}</div><div style="font-size:10px;color:#6b7280">إجمالي الوارد</div></div>
   <div class="sum-box"><div style="font-size:16px;font-weight:700;color:#c0392b">${egp(data.total_out)}</div><div style="font-size:10px;color:#6b7280">إجمالي الصادر</div></div>
@@ -551,7 +609,8 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 </div>
 <table><thead><tr><th>التاريخ</th><th>النوع</th><th>الكود</th><th>المادة</th><th>الكمية</th><th>سعر الوحدة</th><th>الإجمالي</th><th>المرجع</th></tr></thead>
 <tbody>${rows}</tbody></table>
-<div class="footer">${ws.report_footer}</div></body></html>`)
+<div class="footer">${esc(ws.report_footer)}</div></body></html>`, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تجهيز الطباعة') }
   }
 
   return (
@@ -583,7 +642,7 @@ function SlowMovingReport() {
 
   const load = async () => {
     setLoading(true)
-    try { setData(await api.reports.inventorySlowMoving(days)) } finally { setLoading(false) }
+    try { setData(await api.reports.inventorySlowMoving(days)) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   return (
@@ -633,7 +692,7 @@ function AgingReport() {
 
   const load = async () => {
     setLoading(true)
-    try { setData(await api.reports.salesAging()) } finally { setLoading(false) }
+    try { setData(await api.reports.salesAging()) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const BUCKETS = [
@@ -646,16 +705,18 @@ function AgingReport() {
 
   const printReport = async () => {
     if (!data) return
+    const win = openPrintWindow()
+    try {
     const ws = await fetchWorkshopProfile()
     const bucketRows = BUCKETS.map(b => {
       const entries = data.buckets[b.key] || []
       if (!entries.length) return ''
       const rows = entries.map(e => `
         <tr>
-          <td>${e.code}</td>
-          <td>${e.customer_name}</td>
-          <td>${e.date}</td>
-          <td>${e.due_date}</td>
+          <td>${esc(e.code)}</td>
+          <td>${esc(e.customer_name)}</td>
+          <td>${esc(e.date)}</td>
+          <td>${esc(e.due_date)}</td>
           <td>${e.days_overdue > 0 ? e.days_overdue + ' يوم' : 'لم يستحق'}</td>
           <td style="font-weight:600;color:${b.color}">${egp(e.remaining)}</td>
         </tr>`).join('')
@@ -670,12 +731,13 @@ th{background:#f5f4f0;padding:7px 8px;text-align:right;font-size:10px;font-weigh
 td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 .footer{margin-top:24px;font-size:10px;color:#6b7280;text-align:center;border-top:1px solid #e2e0d8;padding-top:12px}
 </style></head><body>
-<div class="header"><div><div class="ws-name">${ws.name}</div></div>
+<div class="header"><div><div class="ws-name">${esc(ws.name)}</div></div>
 <div><div style="font-size:16px;font-weight:700;color:#0F6E56">تقرير Aging التحصيل</div>
 <div style="font-size:11px;color:#6b7280">إجمالي المديونيات: ${egp(data.grand_total)}</div></div></div>
 <table><thead><tr><th>رقم الفاتورة</th><th>العميل</th><th>تاريخ الفاتورة</th><th>تاريخ الاستحقاق</th><th>التأخر</th><th>المتبقي</th></tr></thead>
 <tbody>${bucketRows}</tbody></table>
-<div class="footer">${ws.report_footer}</div></body></html>`)
+<div class="footer">${esc(ws.report_footer)}</div></body></html>`, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تجهيز الطباعة') }
   }
 
   return (
@@ -745,18 +807,21 @@ function SalesByCustomerReport() {
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.salesByCustomer({ date_from: from, date_to: to })) } finally { setLoading(false) }
+    try { setData(await api.reports.salesByCustomer({ date_from: from, date_to: to })) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const printReport = async () => {
     if (!data) return
+    const win = openPrintWindow()
+    try {
     const ws = await fetchWorkshopProfile()
     const total = data.reduce((s, r) => s + r.total, 0)
     const rows = data.map((r, i) => `
       <tr>
         <td>${i + 1}</td>
-        <td>${r.customer_name}</td>
+        <td>${esc(r.customer_name)}</td>
         <td style="text-align:center">${r.invoice_count}</td>
         <td style="font-weight:600">${egp(r.total)}</td>
         <td style="color:#0F6E56">${egp(r.paid)}</td>
@@ -773,14 +838,15 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 .total-row td{background:#E1F5EE;font-weight:700;color:#0F6E56}
 .footer{margin-top:24px;font-size:10px;color:#6b7280;text-align:center;border-top:1px solid #e2e0d8;padding-top:12px}
 </style></head><body>
-<div class="header"><div><div class="ws-name">${ws.name}</div></div>
+<div class="header"><div><div class="ws-name">${esc(ws.name)}</div></div>
 <div><div style="font-size:16px;font-weight:700;color:#0F6E56">مبيعات حسب العميل</div>
-<div style="font-size:11px;color:#6b7280">من ${from} إلى ${to}</div></div></div>
+<div style="font-size:11px;color:#6b7280">من ${esc(from)} إلى ${esc(to)}</div></div></div>
 <table><thead><tr><th>#</th><th>العميل</th><th>عدد الفواتير</th><th>الإجمالي</th><th>المحصّل</th><th>المتبقي</th><th>نسبة المبيعات</th></tr></thead>
 <tbody>${rows}
 <tr class="total-row"><td colspan="3" style="text-align:right">الإجمالي</td><td>${egp(total)}</td><td>${egp(data.reduce((s,r)=>s+r.paid,0))}</td><td>${egp(data.reduce((s,r)=>s+r.unpaid,0))}</td><td>100%</td></tr>
 </tbody></table>
-<div class="footer">${ws.report_footer}</div></body></html>`)
+<div class="footer">${esc(ws.report_footer)}</div></body></html>`, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تجهيز الطباعة') }
   }
 
   return (
@@ -823,17 +889,20 @@ function PurchasesBySupplierReport() {
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.purchasesBySupplier({ date_from: from, date_to: to })) } finally { setLoading(false) }
+    try { setData(await api.reports.purchasesBySupplier({ date_from: from, date_to: to })) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const printReport = async () => {
     if (!data) return
+    const win = openPrintWindow()
+    try {
     const ws = await fetchWorkshopProfile()
     const total = data.reduce((s, r) => s + r.total, 0)
     const rows = data.map((r, i) => `
       <tr>
-        <td>${i + 1}</td><td>${r.supplier_name}</td>
+        <td>${i + 1}</td><td>${esc(r.supplier_name)}</td>
         <td style="text-align:center">${r.invoice_count}</td>
         <td style="font-weight:600">${egp(r.total)}</td>
         <td style="color:#0F6E56">${egp(r.paid)}</td>
@@ -849,14 +918,15 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 .total-row td{background:#E1F5EE;font-weight:700;color:#0F6E56}
 .footer{margin-top:24px;font-size:10px;color:#6b7280;text-align:center;border-top:1px solid #e2e0d8;padding-top:12px}
 </style></head><body>
-<div class="header"><div><div class="ws-name">${ws.name}</div></div>
+<div class="header"><div><div class="ws-name">${esc(ws.name)}</div></div>
 <div><div style="font-size:16px;font-weight:700;color:#0F6E56">مشتريات حسب المورد</div>
-<div style="font-size:11px;color:#6b7280">من ${from} إلى ${to}</div></div></div>
+<div style="font-size:11px;color:#6b7280">من ${esc(from)} إلى ${esc(to)}</div></div></div>
 <table><thead><tr><th>#</th><th>المورد</th><th>عدد الفواتير</th><th>الإجمالي</th><th>المدفوع</th><th>المتبقي</th></tr></thead>
 <tbody>${rows}
 <tr class="total-row"><td colspan="3" style="text-align:right">الإجمالي</td><td>${egp(total)}</td><td>${egp(data.reduce((s,r)=>s+r.paid,0))}</td><td>${egp(data.reduce((s,r)=>s+r.unpaid,0))}</td></tr>
 </tbody></table>
-<div class="footer">${ws.report_footer}</div></body></html>`)
+<div class="footer">${esc(ws.report_footer)}</div></body></html>`, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تجهيز الطباعة') }
   }
 
   return (
@@ -899,8 +969,9 @@ function ProductionSummaryReport() {
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.productionSummary({ date_from: from, date_to: to })) } finally { setLoading(false) }
+    try { setData(await api.reports.productionSummary({ date_from: from, date_to: to })) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const STATUS_AR = { draft: 'مسودة', in_progress: 'جاري', done: 'منجز', cancelled: 'ملغي' }
@@ -943,24 +1014,40 @@ function ProfitabilityReport() {
   const [groupBy, setGroupBy] = useState('work_order')
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  // التجميع اللي اتحمّلت بيه البيانات فعلاً — لو المستخدم غيّر القائمة بعد التحميل
+  // كان الجدول بيتبدّل لعرض grouped غير موجود فيختفي بدون رسالة
+  const [loadedGroupBy, setLoadedGroupBy] = useState('work_order')
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.profitability({ date_from: from, date_to: to, group_by: groupBy })) } finally { setLoading(false) }
+    try {
+      const gb = groupBy
+      setData(await api.reports.profitability({ date_from: from, date_to: to, group_by: gb }))
+      setLoadedGroupBy(gb)
+    } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
-  const exportCsv = () => api.export.profitability({ date_from: from, date_to: to })
+  const exportCsv = async () => {
+    if (exporting) return
+    setExporting(true)
+    try { await api.export.profitability({ date_from: from, date_to: to }) }
+    catch (e) { notifyErr(e, 'تعذّر تصدير الملف') } finally { setExporting(false) }
+  }
 
   const STATUS_AR = { draft: 'مسودة', in_progress: 'جاري', done: 'منجز', cancelled: 'ملغي' }
 
   const printReport = async () => {
     if (!data) return
+    const win = openPrintWindow()
+    try {
     const ws = await fetchWorkshopProfile()
     const rows = (data.rows || []).map(r => `
       <tr>
-        <td>${r.code}</td>
-        <td>${r.customer || '—'}</td>
-        <td>${r.equipment || '—'}</td>
+        <td>${esc(r.code)}</td>
+        <td>${esc(r.customer || '—')}</td>
+        <td>${esc(r.equipment || '—')}</td>
         <td>${egp(r.revenue)}</td>
         <td>${egp(r.cost)}</td>
         <td style="font-weight:600;color:${r.profit >= 0 ? '#0F6E56' : '#c0392b'}">${egp(r.profit)}</td>
@@ -976,14 +1063,15 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
 .total-row td{background:#E1F5EE;font-weight:700;color:#0F6E56}
 .footer{margin-top:24px;font-size:10px;color:#6b7280;text-align:center;border-top:1px solid #e2e0d8;padding-top:12px}
 </style></head><body>
-<div class="header"><div><div class="ws-name">${ws.name}</div></div>
+<div class="header"><div><div class="ws-name">${esc(ws.name)}</div></div>
 <div><div style="font-size:16px;font-weight:700;color:#0F6E56">تقرير الربحية التفصيلي</div>
-<div style="font-size:11px;color:#6b7280">من ${from} إلى ${to}</div></div></div>
+<div style="font-size:11px;color:#6b7280">من ${esc(from)} إلى ${esc(to)}</div></div></div>
 <table><thead><tr><th>الكود</th><th>العميل</th><th>المعدة</th><th>الإيراد</th><th>التكلفة</th><th>الربح</th><th>الهامش %</th></tr></thead>
 <tbody>${rows}
 <tr class="total-row"><td colspan="3" style="text-align:right">الإجمالي</td><td>${egp(data.total_revenue)}</td><td>${egp(data.total_cost)}</td><td>${egp(data.total_profit)}</td><td>${data.total_margin_pct}%</td></tr>
 </tbody></table>
-<div class="footer">${ws.report_footer}</div></body></html>`)
+<div class="footer">${esc(ws.report_footer)}</div></body></html>`, win)
+    } catch (e) { closeWin(win); notifyErr(e, 'تعذّر تجهيز الطباعة') }
   }
 
   return (
@@ -1016,7 +1104,7 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
         </div>
       )}
 
-      {data?.rows?.length > 0 && groupBy === 'work_order' && (
+      {data?.rows?.length > 0 && loadedGroupBy === 'work_order' && (
         <table className="erp-table text-xs">
           <thead><tr><th>الكود</th><th>الحالة</th><th>العميل</th><th>المعدة</th><th>الإيراد</th><th>التكلفة</th><th>الربح</th><th>الهامش %</th></tr></thead>
           <tbody>
@@ -1036,9 +1124,9 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
         </table>
       )}
 
-      {data?.grouped?.length > 0 && groupBy !== 'work_order' && (
+      {data?.grouped?.length > 0 && loadedGroupBy !== 'work_order' && (
         <table className="erp-table text-xs">
-          <thead><tr><th>{groupBy === 'customer' ? 'العميل' : 'المعدة'}</th><th>عدد الأوامر</th><th>الإيراد</th><th>التكلفة</th><th>الربح</th><th>الهامش %</th></tr></thead>
+          <thead><tr><th>{loadedGroupBy === 'customer' ? 'العميل' : 'المعدة'}</th><th>عدد الأوامر</th><th>الإيراد</th><th>التكلفة</th><th>الربح</th><th>الهامش %</th></tr></thead>
           <tbody>
             {data.grouped.map((g, i) => (
               <tr key={i}>
@@ -1061,7 +1149,7 @@ td{padding:6px 8px;border-bottom:1px solid #f3f4f6;font-size:11px}
       <div className="flex gap-2">
         <button className="btn btn-primary btn-sm" onClick={load} disabled={loading}>{loading ? '…' : '📊 تحميل'}</button>
         {data?.rows?.length > 0 && <button className="btn btn-sm" onClick={printReport}>🖨 طباعة / PDF</button>}
-        {data?.rows?.length > 0 && <button className="btn btn-sm" onClick={exportCsv}>⬇️ تصدير CSV</button>}
+        {data?.rows?.length > 0 && <button className="btn btn-sm" onClick={exportCsv} disabled={exporting}>{exporting ? '…' : '⬇️ تصدير CSV'}</button>}
       </div>
     </div>
   )
@@ -1077,11 +1165,16 @@ function CashflowReport() {
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.cashflow({ date_from: from, date_to: to, group_by: groupBy })) } finally { setLoading(false) }
+    try { setData(await api.reports.cashflow({ date_from: from, date_to: to, group_by: groupBy })) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
-  const exportCsv = () => api.export.cashflow({ date_from: from, date_to: to, group_by: groupBy })
+  const exportCsv = () => {
+    if (badRange(from, to)) return
+    return Promise.resolve(api.export.cashflow({ date_from: from, date_to: to, group_by: groupBy }))
+      .catch(e => notifyErr(e, 'تعذّر تصدير الملف'))
+  }
 
   return (
     <div className="flex flex-col gap-3">
@@ -1178,11 +1271,16 @@ function LaborPerformanceReport() {
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
+    if (badRange(from, to)) return
     setLoading(true)
-    try { setData(await api.reports.laborPerformance({ date_from: from, date_to: to })) } finally { setLoading(false) }
+    try { setData(await api.reports.laborPerformance({ date_from: from, date_to: to })) } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
-  const exportCsv = () => api.export.laborPerformance({ date_from: from, date_to: to })
+  const exportCsv = () => {
+    if (badRange(from, to)) return
+    return Promise.resolve(api.export.laborPerformance({ date_from: from, date_to: to }))
+      .catch(e => notifyErr(e, 'تعذّر تصدير الملف'))
+  }
 
   return (
     <div className="flex flex-col gap-3">
@@ -1265,21 +1363,34 @@ function PeriodComparisonReport() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
 
+  // فترة المقارنة: الباك إند بيتجاهلها لو ناقص طرف منها ويحسب الفترة السابقة تلقائيًا
+  const checkCompare = () => {
+    if (badRange(from, to)) return false
+    if ((compareFrom && !compareTo) || (!compareFrom && compareTo)) {
+      notifyErr(null, 'حدد بداية ونهاية فترة المقارنة معًا أو اتركهما فارغين')
+      return false
+    }
+    if (badRange(compareFrom, compareTo)) return false
+    return true
+  }
+
   const load = async () => {
+    if (!checkCompare()) return
     setLoading(true)
     try {
       const params = { date_from: from, date_to: to }
       if (compareFrom) params.compare_from = compareFrom
       if (compareTo) params.compare_to = compareTo
       setData(await api.reports.periodComparison(params))
-    } finally { setLoading(false) }
+    } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const exportCsv = () => {
     const params = { date_from: from, date_to: to }
     if (compareFrom) params.compare_from = compareFrom
     if (compareTo) params.compare_to = compareTo
-    api.export.periodComparison(params)
+    if (!checkCompare()) return
+    Promise.resolve(api.export.periodComparison(params)).catch(e => notifyErr(e, 'تعذّر تصدير الملف'))
   }
 
   return (
@@ -1307,7 +1418,7 @@ function PeriodComparisonReport() {
               </tr>
             </thead>
             <tbody>
-              {data.comparison.map(c => (
+              {(data.comparison || []).map(c => (
                 <tr key={c.key}>
                   <td className="font-medium">{c.label}</td>
                   <td>{c.current}</td>
@@ -1350,7 +1461,7 @@ function InstallmentAlertsReport() {
         api.reports.installmentsOverdue(),
       ])
       setUpcoming(u); setOverdue(o)
-    } finally { setLoading(false) }
+    } catch (e) { notifyErr(e) } finally { setLoading(false) }
   }
 
   const Row = ({ x, kind }) => (
@@ -1370,8 +1481,8 @@ function InstallmentAlertsReport() {
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-2">
         <label className="text-xs text-erp-muted">نافذة التنبيه (أيام)</label>
-        <input type="number" min="1" className="input input-sm" style={{ width: 70 }}
-          value={days} onChange={e => setDays(Number(e.target.value) || 7)} />
+        <input type="number" min="1" max="365" className="input input-sm" style={{ width: 70 }}
+          value={days} onChange={e => setDays(Math.min(365, Math.max(1, Math.floor(Number(e.target.value)) || 7)))} />
         <button className="btn btn-primary btn-sm" onClick={load} disabled={loading}>{loading ? '…' : '📊 تحميل'}</button>
       </div>
 
@@ -1380,7 +1491,7 @@ function InstallmentAlertsReport() {
           <div className="text-sm font-semibold mb-1" style={{ color: 'var(--red)' }}>
             🔴 أقساط متأخرة ({overdue.count}) — إجمالي {egp(overdue.total_overdue)}
           </div>
-          {overdue.items.length === 0 ? (
+          {(overdue.items || []).length === 0 ? (
             <div className="text-xs text-erp-muted">لا يوجد أقساط متأخرة 🎉</div>
           ) : (
             <table className="erp-table text-xs">
@@ -1396,7 +1507,7 @@ function InstallmentAlertsReport() {
           <div className="text-sm font-semibold mb-1" style={{ color: 'var(--amber)' }}>
             🟡 أقساط قادمة خلال {upcoming.days} يوم ({upcoming.count}) — إجمالي {egp(upcoming.total_due)}
           </div>
-          {upcoming.items.length === 0 ? (
+          {(upcoming.items || []).length === 0 ? (
             <div className="text-xs text-erp-muted">لا يوجد أقساط مستحقة قريبًا</div>
           ) : (
             <table className="erp-table text-xs">

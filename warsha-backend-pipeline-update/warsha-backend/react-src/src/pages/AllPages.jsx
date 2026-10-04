@@ -710,7 +710,8 @@ export function Payroll() {
     const day = d.getDay() // 0=Sun,6=Sat
     const diff = day === 6 ? 0 : (day + 1)
     d.setDate(d.getDate() - diff)
-    return d.toISOString().slice(0,10)
+    // تاريخ محلي (toISOString كان بيرجّع يوم الجمعة بعد منتصف الليل بتوقيت مصر)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   }
 
   const [form, setForm] = useState({ week_start: lastSaturday() })
@@ -732,7 +733,13 @@ export function Payroll() {
     // 1) إنشاء الكشف
     const created = await api.workers.createPayroll({ week_start, week_end })
     // 2) توليد بنود الرواتب من الحضور تلقائياً
-    await api.post(`/workers/payroll/${created.id}/generate`)
+    try {
+      await api.post(`/workers/payroll/${created.id}/generate`)
+    } catch (err) {
+      // الكشف اتعمل فعلاً — لازم القائمة تتحدث ويتقال للمستخدم إن البنود ماتولدتش
+      setModal(false); reload()
+      throw Object.assign(new Error(`تم إنشاء الكشف لكن تعذّر حساب البنود: ${err?.message || ''}`), { status: err?.status })
+    }
     toast('تم إنشاء كشف الرواتب وحساب البنود'); setModal(false); reload()
   })
 
@@ -860,7 +867,8 @@ export function Attendance() {
     const day = d.getDay() // 0=Sun,6=Sat
     const diff = day === 6 ? 0 : (day + 1)
     d.setDate(d.getDate() - diff)
-    return d.toISOString().slice(0,10)
+    // تاريخ محلي (toISOString كان بيرجّع يوم الجمعة بعد منتصف الليل بتوقيت مصر)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   }
   const [date, setDate] = useState(lastSat())
   const { data: recs, loading, reload } = useApi(() => api.attendance.list(date), [date])
@@ -876,8 +884,10 @@ export function Attendance() {
 
   const [saveBulk, saving] = useAction(async () => {
     const records = Object.entries(bulk).map(([worker_id, status]) => ({ worker_id: +worker_id, status }))
+    if (!records.length) { toast('لا يوجد عمال لتسجيل حضورهم', 'error'); return }
     await api.attendance.bulk({ work_date: date, date, records })
-    toast('تم حفظ الحضور'); setBulkMode(false); reload()
+    // تصفير bulk: كان بيفضل محفوظ ويتعرض كحالة الحضور لأي تاريخ تاني تختاره بعد الحفظ
+    toast('تم حفظ الحضور'); setBulkMode(false); setBulk({}); reload()
   })
 
   const STATUS = {
@@ -900,7 +910,7 @@ export function Attendance() {
       <div className="card flex items-center gap-3 py-3 flex-wrap">
         <div>
           <label className="field-label">تاريخ الحضور</label>
-          <input className="field-input" type="date" value={date} onChange={e => { setDate(e.target.value); setBulkMode(false) }} />
+          <input className="field-input" type="date" value={date} onChange={e => { setDate(e.target.value); setBulkMode(false); setBulk({}) }} />
         </div>
         {write && !bulkMode && (
           <button className="btn btn-primary btn-sm mt-4" onClick={initBulk}>📝 تسجيل حضور اليوم</button>
@@ -913,7 +923,7 @@ export function Attendance() {
             <button className="btn btn-primary btn-sm mt-4" onClick={saveBulk} disabled={saving}>
               {saving ? '…' : '💾 حفظ'}
             </button>
-            <button className="btn btn-sm mt-4" onClick={() => setBulkMode(false)}>إلغاء</button>
+            <button className="btn btn-sm mt-4" onClick={() => { setBulkMode(false); setBulk({}) }}>إلغاء</button>
           </>
         )}
       </div>
@@ -941,7 +951,7 @@ export function Attendance() {
               )}
               {workers?.map((w, idx) => {
                 const rec = recs?.find(r => r.worker_id === w.id)
-                const cur = bulk[w.id] || rec?.status
+                const cur = (bulkMode ? bulk[w.id] : undefined) || rec?.status
                 const st  = STATUS[cur]
                 return (
                   <tr key={w.id}>
@@ -1465,8 +1475,11 @@ export function MRP() {
             <thead><tr><th>المادة</th><th>الكمية الحالية</th><th>النقص</th><th>الكمية المقترحة</th><th>التاريخ المتوقع</th><th>الأولوية</th></tr></thead>
             <tbody>
               {!suggestions?.length && <tr><td colSpan={6} className="text-center text-erp-muted py-10">لا توجد اقتراحات — المخزون كافٍ أو شغّل MRP أولاً</td></tr>}
-              {suggestions?.map((s, i) => (
-                <tr key={i}>
+              {(Array.isArray(suggestions) ? suggestions : []).map((s0, i) => {
+                // الباك (run_mrp) مش بيرجّع priority — نشتقها: رصيد صفر/سالب = عاجل، غير كده متوسط
+                const s = s0.priority ? s0 : { ...s0, priority: Number(s0.current_stock ?? s0.stock_qty ?? 0) <= 0 ? 'high' : 'medium' }
+                return (
+                <tr key={s.material_id ?? i}>
                   <td className="font-medium">{s.material_name}</td>
                   <td className="text-sm">{Number(s.current_stock ?? s.stock_qty ?? 0).toFixed(1)}</td>
                   <td className="font-semibold" style={{ color: 'var(--red)' }}>{Number(s.shortage ?? s.required_qty ?? 0).toFixed(1)}</td>
@@ -1476,7 +1489,8 @@ export function MRP() {
                     {s.priority === 'high' ? 'عاجل' : s.priority === 'medium' ? 'متوسط' : 'منخفض'}
                   </span></td>
                 </tr>
-              ))}
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -1488,106 +1502,8 @@ export function MRP() {
 // ══════════════════════════════════════════════════════════════
 // STOCK COUNT
 // ══════════════════════════════════════════════════════════════
-export function StockCount() {
-  const { canWrite } = useAuth()
-  const write = canWrite('inventory')
-  const toast = useToast()
-  const { data: counts, loading, reload } = useApi(() => api.production.stockCounts())
-  const [active, setActive] = useState(null)
-  const [scanForm, setScanForm] = useState({ material_id: '', actual_qty: '' })
-  const { data: materials } = useApi(() => api.inventory.materials())
-
-  const openCount = counts?.find(c => c.status === 'open')
-
-  const [startCount, starting] = useAction(async () => {
-    await api.production.startCount()
-    toast('تم بدء الجرد'); reload()
-  })
-
-  const [scan, scanning] = useAction(async () => {
-    if (!scanForm.material_id || scanForm.actual_qty === '') { toast('اختر المادة وأدخل الكمية', 'error'); return }
-    await api.production.scanLine(openCount.id, { material_id: +scanForm.material_id, actual_qty: +scanForm.actual_qty })
-    toast('تم تسجيل السطر'); setScanForm({ material_id: '', actual_qty: '' }); reload()
-  })
-
-  const [closeCount, closing] = useAction(async () => {
-    await api.production.closeCount(openCount.id)
-    toast('تم إغلاق الجرد وتعديل المخزون'); reload()
-  })
-
-  if (loading) return <PageSpinner />
-  return (
-    <div className="flex flex-col gap-4">
-      {/* Active count banner */}
-      {openCount ? (
-        <div className="flex items-center justify-between px-4 py-3 rounded-erp"
-             style={{ background: 'var(--amber-lt)', border: '1px solid var(--amber-md)' }}>
-          <div>
-            <span className="font-semibold text-sm" style={{ color: 'var(--amber)' }}>🔴 جرد مفتوح</span>
-            <span className="text-xs text-erp-muted mr-2">بدأ: {fmtDate(openCount.started_at)}</span>
-          </div>
-          {write && (
-            <button className="btn btn-sm" style={{ color: 'var(--red)', borderColor: 'var(--red-lt)' }}
-                    onClick={closeCount} disabled={closing}>
-              {closing ? '…' : '✓ إغلاق الجرد'}
-            </button>
-          )}
-        </div>
-      ) : (
-        write && (
-          <div className="flex justify-end">
-            <button className="btn btn-primary btn-sm" onClick={startCount} disabled={starting}>
-              {starting ? '…' : '+ بدء جرد جديد'}
-            </button>
-          </div>
-        )
-      )}
-
-      {/* Scan line */}
-      {openCount && write && (
-        <div className="card">
-          <div className="text-sm font-semibold mb-3">تسجيل كمية فعلية</div>
-          <div className="flex items-end gap-3">
-            <div className="flex-1">
-              <Select label="المادة" value={scanForm.material_id} onChange={e => setScanForm(f => ({ ...f, material_id: e.target.value }))}>
-                <option value="">— اختر —</option>
-                {materials?.map(m => <option key={m.id} value={m.id}>{m.name_ar} (دفتري: {Number(m.stock_qty || 0).toFixed(1)})</option>)}
-              </Select>
-            </div>
-            <div style={{ width: 120 }}>
-              <Input label="الكمية الفعلية" type="number" step="0.1" value={scanForm.actual_qty}
-                     onChange={e => setScanForm(f => ({ ...f, actual_qty: e.target.value }))} />
-            </div>
-            <button className="btn btn-primary btn-sm mb-0.5" onClick={scan} disabled={scanning}>
-              {scanning ? '…' : '📥 تسجيل'}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* History */}
-      <div className="card p-0 overflow-hidden">
-        <div className="px-4 py-3 border-b border-erp-border text-sm font-semibold">سجل عمليات الجرد</div>
-        <table className="erp-table">
-          <thead><tr><th>التاريخ</th><th>الحالة</th><th>الخطوط</th><th>المعدّل</th></tr></thead>
-          <tbody>
-            {!counts?.length && <tr><td colSpan={4} className="text-center text-erp-muted py-10">لا توجد عمليات جرد</td></tr>}
-            {counts?.map(c => (
-              <tr key={c.id}>
-                <td className="text-xs text-erp-muted">{fmtDate(c.started_at)}</td>
-                <td><span className={`badge ${c.status === 'open' ? 'badge-amber' : 'badge-green'}`}>
-                  {c.status === 'open' ? 'مفتوح' : 'مغلق'}
-                </span></td>
-                <td>{c.line_count || 0}</td>
-                <td className="font-medium">{c.adjusted_lines || 0}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
-}
+// جرد المخزون — اتنقل لصفحة مستقلة بجرد لكل مخزن (pages/StockCount.jsx)
+export { default as StockCount } from './StockCount'
 
 
 // ══════════════════════════════════════════════════════════════

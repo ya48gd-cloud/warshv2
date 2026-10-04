@@ -267,3 +267,14 @@ async def test_scheduler_returns_stats(cli):
     assert "updated_invoices" in result
     assert "run_date" in result
     assert result["run_date"] == str(date.today())
+
+
+@pytest.mark.asyncio
+async def test_scheduler_triggered_by_tenant_does_not_touch_other_tenants(cli, cli2):
+    """أدمن ورشة 1 يشغّل الـ scheduler ← أقساط ورشة 2 ماتتلمسش (UPDATE جماعي بدون فلتر tenant)"""
+    cid2 = await _cust(cli2)
+    await _inv_with_overdue_installment(cli2, cid2)
+    r1 = await _trigger_scheduler(cli)
+    assert r1["updated_installments"] == 0
+    r2 = await _trigger_scheduler(cli2)
+    assert r2["updated_installments"] >= 1

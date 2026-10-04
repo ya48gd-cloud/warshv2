@@ -41,6 +41,43 @@ DEFAULT_TREASURY_CATEGORIES = [
 ]
 
 
+def _sqlite_add_missing_columns(sync_conn) -> None:
+    """ADD COLUMN for every model column absent from an existing SQLite table.
+
+    SQLite can't add PRIMARY KEY/UNIQUE columns or NOT NULL ones without a
+    default, so columns are added nullable, carrying the model's scalar
+    default (if any) so existing rows get a sensible value.
+    """
+    import logging
+    from sqlalchemy import text
+
+    log = logging.getLogger("erp.desktop")
+    dialect = sync_conn.dialect
+    for table in Base.metadata.sorted_tables:
+        existing = {
+            r[1] for r in sync_conn.execute(text(f'PRAGMA table_info("{table.name}")'))
+        }
+        if not existing:  # table itself is new — create_all already made it
+            continue
+        for col in table.columns:
+            if col.name in existing or col.primary_key:
+                continue
+            ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col.type.compile(dialect)}'
+            default = col.default.arg if col.default is not None else None
+            if default is not None and not callable(default):
+                if isinstance(default, bool):
+                    ddl += f" DEFAULT {int(default)}"
+                elif isinstance(default, (int, float)):
+                    ddl += f" DEFAULT {default}"
+                elif isinstance(default, str):
+                    ddl += " DEFAULT '" + default.replace("'", "''") + "'"
+            try:
+                sync_conn.execute(text(ddl))
+                log.warning("schema sync: added %s.%s", table.name, col.name)
+            except Exception as e:  # never block startup on one column
+                log.error("schema sync failed for %s.%s: %s", table.name, col.name, e)
+
+
 async def init_db(seed_demo: bool = False) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -162,6 +199,13 @@ async def init_db(seed_demo: bool = False) -> None:
                 except Exception:
                     pass  # column already exists
 
+            # ── Auto-sync: add any model column still missing from the DB ──
+            # The hand-written list above drifts behind the models (alembic
+            # only runs on Postgres), and a single missing column makes every
+            # query on that table fail with 500. Compare each table against
+            # PRAGMA table_info and ADD COLUMN whatever is absent.
+            await conn.run_sync(_sqlite_add_missing_columns)
+
     if seed_demo:
         from seed import seed, wipe_all
         await wipe_all()
@@ -225,6 +269,12 @@ async def init_db(seed_demo: bool = False) -> None:
         # ── 5) أضف المخازن الافتراضية الـ8 (محطة 10 — بس لو ناقصة) ──
         from app.api.warehouses import seed_default_warehouses
         await seed_default_warehouses(db, tenant.id)
+        await db.flush()
+
+        # ── 6) المخزون القديم اللي ملوش موقع → مخزنه الطبيعي (عادةً RAW) ──
+        # من غيره الحجز لأوامر الإنتاج والتحويل بين المخازن بيشوفوا الرصيد صفر
+        from app.services.inventory_ledger import reconcile_unlocated_stock
+        await reconcile_unlocated_stock(db)
 
         await db.commit()
         print(f"تم تجهيز قاعدة البيانات — admin جاهز، وتمت إضافة {added} صنف جديد")

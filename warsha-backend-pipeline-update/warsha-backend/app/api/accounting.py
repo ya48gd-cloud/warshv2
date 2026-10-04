@@ -1,22 +1,73 @@
 from datetime import date
 from decimal import Decimal
+from html import escape as _esc
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, validator
 
-from app.core.database import get_db
+from app.core.database import get_db, current_tenant_id as _ctid_mod
 from app.api.auth import require_any
 from app.models.models import (
     WorkOrder, CostLine, JournalEntry, Equipment, MaterialReservation, WorkOrderMember,
     CustomerOrder, CustomerAsset,
 )
 
-router = APIRouter(prefix="/accounting", tags=["accounting"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر ينشئ/يعدّل/يحذف
+    أوامر إنتاج وبنود تكلفة (بقيود محاسبية حقيقية) بطلب API مباشر رغم إن
+    الواجهة مخبية الأزرار (ROLE_WRITE['viewer'] = []). نفس نمط customers/sales."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
+router = APIRouter(prefix="/accounting", tags=["accounting"],
+                   dependencies=[Depends(require_any), Depends(_block_viewer_writes)])
 print_router = APIRouter(prefix="/accounting", tags=["accounting-print"], dependencies=[Depends(require_any)])
+
+
+_VALID_WO_STATUSES = ("draft", "in_progress", "done", "cancelled")
+_VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
+_VALID_COST_TYPES = {"material", "labor", "overhead", "other"}   # "other" مستخدمة فعلياً (تبقى متاحة)
+
+
+async def _validate_wo_refs(db: AsyncSession, data) -> None:
+    """إصلاح ثغرة عزل/تحقق: equipment_id/customer_order_id/customer_id/location_id
+    كانت بتتخزن من غير أي تحقق — أمر إنتاج ممكن يشاور على معدة أو عميل أو طلب
+    من ورشة تانية أو مش موجود أصلاً (FK يتيم / تسريب اسم عميل ورشة تانية في الطباعة)."""
+    from app.models.models import Customer, CustomerLocation
+    tid = _ctid_mod.get() or 1
+
+    async def _owned(model, obj_id):
+        obj = await db.get(model, obj_id)
+        return obj if (obj is not None and getattr(obj, "tenant_id", tid) == tid) else None
+
+    if not await _owned(Equipment, data.equipment_id):
+        raise HTTPException(400, "المعدة/المنتج غير موجود")
+    co = None
+    if data.customer_order_id is not None:
+        co = await _owned(CustomerOrder, data.customer_order_id)
+        if not co:
+            raise HTTPException(400, "طلب العميل غير موجود")
+    if data.customer_id is not None:
+        if not await _owned(Customer, data.customer_id):
+            raise HTTPException(400, "العميل غير موجود")
+        if co is not None and co.customer_id and co.customer_id != data.customer_id:
+            raise HTTPException(400, "العميل المحدد لا يطابق عميل الطلب المرتبط")
+    if data.location_id is not None:
+        loc = await _owned(CustomerLocation, data.location_id)
+        if not loc:
+            raise HTTPException(400, "الموقع غير موجود")
+        owner = data.customer_id or (co.customer_id if co is not None else None)
+        if owner and getattr(loc, "customer_id", owner) != owner:
+            raise HTTPException(400, "الموقع المحدد لا يخص هذا العميل")
 
 
 class WorkOrderCreate(BaseModel):
@@ -36,6 +87,32 @@ class WorkOrderCreate(BaseModel):
     location_id: Optional[int] = None
     planned_length: Optional[Decimal] = None
 
+    @validator("quantity")
+    def _positive_quantity(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("الكمية يجب أن تكون أكبر من صفر")
+        return v
+
+    @validator("planned_cost")
+    def _non_negative_cost(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("التكلفة المخططة لا يمكن أن تكون سالبة")
+        return v
+
+    @validator("planned_length")
+    def _positive_length(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("الطول يجب أن يكون أكبر من صفر")
+        return v
+
+    @validator("priority")
+    def _valid_priority(cls, v):
+        if v is None or v == "":
+            return "normal"
+        if v not in _VALID_PRIORITIES:
+            raise ValueError(f"priority يجب أن يكون أحد: {sorted(_VALID_PRIORITIES)}")
+        return v
+
 class WorkOrderUpdate(BaseModel):
     code: Optional[str] = None
     equipment_id: int
@@ -54,6 +131,40 @@ class WorkOrderUpdate(BaseModel):
     description: Optional[str] = None
     planned_length: Optional[Decimal] = None
 
+    @validator("status")
+    def _valid_status(cls, v):
+        # إصلاح ثغرة تحقق: PUT كان بيقبل أي قيمة status (مثلاً "xyz" أو "Done")
+        # فيختفي الأمر من كل الفلاتر/التقارير اللي بتفلتر على القيم المعروفة
+        if v not in _VALID_WO_STATUSES:
+            raise ValueError(f"status يجب أن يكون أحد: {list(_VALID_WO_STATUSES)}")
+        return v
+
+    @validator("quantity")
+    def _positive_quantity(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("الكمية يجب أن تكون أكبر من صفر")
+        return v
+
+    @validator("planned_cost")
+    def _non_negative_cost(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("التكلفة المخططة لا يمكن أن تكون سالبة")
+        return v
+
+    @validator("planned_length")
+    def _positive_length(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("الطول يجب أن يكون أكبر من صفر")
+        return v
+
+    @validator("priority")
+    def _valid_priority(cls, v):
+        if v is None or v == "":
+            return "normal"
+        if v not in _VALID_PRIORITIES:
+            raise ValueError(f"priority يجب أن يكون أحد: {sorted(_VALID_PRIORITIES)}")
+        return v
+
 class CostLineCreate(BaseModel):
     work_order_id: int
     cost_type: str
@@ -61,6 +172,14 @@ class CostLineCreate(BaseModel):
     qty: Decimal = Decimal("1")
     unit_cost: Decimal
     material_id: Optional[int] = None
+
+    @validator("cost_type")
+    def _valid_cost_type(cls, v):
+        # إصلاح ثغرة تحقق: cost_type حر — نوع غير معروف كان يترحّل دائن على
+        # مخزون الخام (1310) افتراضياً فيقلل رصيد المخزون من غير صرف فعلي
+        if v not in _VALID_COST_TYPES:
+            raise ValueError(f"cost_type يجب أن يكون أحد: {sorted(_VALID_COST_TYPES)}")
+        return v
 
     @validator("qty")
     def _positive_qty(cls, v):
@@ -167,6 +286,9 @@ async def get_next_wo_code(db: AsyncSession = Depends(get_db)):
 async def create_work_order(data: WorkOrderCreate, db: AsyncSession = Depends(get_db)):
     if data.start_date and data.planned_end_date and data.planned_end_date < data.start_date:
         raise HTTPException(400, "تاريخ الانتهاء المخطط يجب أن يكون بعد تاريخ البدء")
+    if data.start_date and data.end_date and data.end_date < data.start_date:
+        raise HTTPException(400, "تاريخ الانتهاء يجب أن يكون بعد تاريخ البدء")
+    await _validate_wo_refs(db, data)
     from app.core.database import current_tenant_id as _ctid_wo
     d = data.model_dump()
     d['tenant_id'] = _ctid_wo.get() or 1
@@ -292,9 +414,12 @@ async def get_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
 @router.put("/work-orders/{wo_id}")
 async def update_work_order(wo_id: int, data: WorkOrderUpdate, db: AsyncSession = Depends(get_db)):
     wo = await db.get(WorkOrder, wo_id)
-    if not wo: raise HTTPException(404)
+    if not wo or wo.tenant_id != (_ctid_mod.get() or 1): raise HTTPException(404)
     if data.start_date and data.planned_end_date and data.planned_end_date < data.start_date:
         raise HTTPException(400, "تاريخ الانتهاء المخطط يجب أن يكون بعد تاريخ البدء")
+    if data.start_date and data.end_date and data.end_date < data.start_date:
+        raise HTTPException(400, "تاريخ الانتهاء يجب أن يكون بعد تاريخ البدء")
+    await _validate_wo_refs(db, data)
     d = data.model_dump()
     if not d.get("code") or not str(d["code"]).strip():
         d.pop("code", None)
@@ -367,10 +492,26 @@ async def update_work_order(wo_id: int, data: WorkOrderUpdate, db: AsyncSession 
 @router.patch("/work-orders/{wo_id}/status")
 async def change_status(wo_id: int, status: str, db: AsyncSession = Depends(get_db)):
     wo = await db.get(WorkOrder, wo_id)
-    if not wo: raise HTTPException(404)
+    if not wo or wo.tenant_id != (_ctid_mod.get() or 1): raise HTTPException(404)
     valid = ["draft", "in_progress", "done", "cancelled"]
     if status not in valid:
         raise HTTPException(400, f"Status must be one of {valid}")
+
+    # "منتهي" من قائمة الحالة كان بيغيّر النص بس: المعدة تفضل في WIP ومفيش
+    # استلام FG ولا قيد إقفال ولا إرجاع الزائد من الحجوزات. الإنهاء الحقيقي
+    # لازم يمر بنفس مسار /production/complete.
+    # أمر مكتمل اتعمله استلام FG وقيد إقفال — إرجاعه لـ"جاري" وإنهاؤه تاني
+    # كان بيستلم المعدة في FG مرتين ويسجل قيد الإقفال مرتين.
+    if wo.status == "done" and status != "done":
+        raise HTTPException(400, f"أمر الإنتاج {wo.code} مكتمل — لا يمكن تغيير حالته بعد الإقفال")
+
+    if status == "done" and wo.status != "done":
+        from app.services.production import complete_work_order
+        result = await complete_work_order(db, wo_id)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return {"id": wo_id, "status": "done", **result}
+
     wo.status = status
 
     # عند إلغاء الأمر: إلغاء الحجوزات المفتوحة حتى لا تؤثر على المخزون أو MRP
@@ -396,7 +537,7 @@ async def delete_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
         Invoice, ScrapRecord, CustomerAsset, QualityInspection,
     )
     wo = await db.get(WorkOrder, wo_id)
-    if not wo: raise HTTPException(404)
+    if not wo or wo.tenant_id != (_ctid_mod.get() or 1): raise HTTPException(404)
 
     # إصلاح ثغرة تكامل: حذف أمر إنتاج كان يحذف بنود التكلفة (CostLine) وغيرها
     # مباشرة من غير ما يعكس أي قيد محاسبي (AccountingEntry) مرتبط بيها — فيفضل
@@ -433,14 +574,26 @@ async def delete_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
 async def add_cost_line(data: CostLineCreate, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_cl
     _tid_cl = _ctid_cl.get() or 1
-    total = data.qty * data.unit_cost
+    # إصلاح ثغرة تحقق/عزل: بند التكلفة كان يتسجّل (بقيد WIP حقيقي) حتى لو
+    # أمر الإنتاج مش موجود أو تابع لورشة تانية — قيد يتيم بلا أمر إنتاج
+    wo = await db.get(WorkOrder, data.work_order_id)
+    if not wo or wo.tenant_id != _tid_cl:
+        raise HTTPException(404, "أمر الإنتاج غير موجود")
+    if wo.status == "cancelled":
+        raise HTTPException(400, "أمر الإنتاج ملغي — لا يمكن إضافة بنود تكلفة")
+    if data.material_id is not None:
+        from app.models.models import Material
+        _mat = await db.get(Material, data.material_id)
+        if not _mat or _mat.tenant_id != _tid_cl:
+            raise HTTPException(400, "المادة غير موجودة")
+    total = (data.qty * data.unit_cost).quantize(Decimal("0.01"))
+    if total <= 0:
+        raise HTTPException(400, "إجمالي بند التكلفة يجب أن يكون أكبر من صفر")
     cl_payload = data.model_dump()
     cl_payload['tenant_id'] = _tid_cl
     line = CostLine(**cl_payload, total_cost=total)
     db.add(line)
-    wo = await db.get(WorkOrder, data.work_order_id)
-    if wo:
-        wo.actual_cost += total
+    wo.actual_cost = (wo.actual_cost or 0) + total
 
     # محطة 22: قيد محاسبي حقيقي عبر AccountingEntry (مش JournalEntry القديم
     # اللي مش ظاهر في ميزان المراجعة/قوائم الدخل خالص)
@@ -465,7 +618,7 @@ async def delete_cost_line(line_id: int, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_dcl
     _tid_dcl = _ctid_dcl.get() or 1
     line = await db.get(CostLine, line_id)
-    if not line: raise HTTPException(404)
+    if not line or line.tenant_id != _tid_dcl: raise HTTPException(404)
     wo = await db.get(WorkOrder, line.work_order_id)
     if wo:
         wo.actual_cost -= line.total_cost
@@ -620,7 +773,8 @@ async def apply_parametric_bom(wo_id: int, db: AsyncSession = Depends(get_db)):
 async def get_wo_bom_lines(wo_id: int, db: AsyncSession = Depends(get_db)):
     """جلب سطور BOM المجمّدة لأمر الإنتاج (work_order_bom_lines)."""
     from app.models.models import WorkOrderBOMLine, Material
-    tid = 1
+    # إصلاح: tid كان مثبّت = 1 — أي ورشة غير الأولى كانت بتشوف BOM فاضية دايماً
+    tid = _ctid_mod.get() or 1
     rows = (await db.execute(
         select(WorkOrderBOMLine)
         .where(WorkOrderBOMLine.work_order_id == wo_id, WorkOrderBOMLine.tenant_id == tid)
@@ -662,9 +816,9 @@ async def print_wo_bom(wo_id: int, db: AsyncSession = Depends(get_db)):
         mat = await db.get(Material, r.material_id) if r.material_id else None
         rows_html += f"""<tr>
           <td style="text-align:center">{i}</td>
-          <td class="font-mono">{mat.code if mat else '—'}</td>
-          <td>{mat.name_ar if mat else '—'}</td>
-          <td style="text-align:center">{mat.unit if mat else '—'}</td>
+          <td class="font-mono">{_esc(str(mat.code)) if mat else '—'}</td>
+          <td>{_esc(str(mat.name_ar or '')) if mat else '—'}</td>
+          <td style="text-align:center">{_esc(str(mat.unit or '')) if mat else '—'}</td>
           <td style="text-align:center">{float(r.required_qty or 0):.3f}</td>
           <td>{_egp(r.unit_cost)}</td>
           <td class="font-bold">{_egp(r.total_cost)}</td>
@@ -672,10 +826,11 @@ async def print_wo_bom(wo_id: int, db: AsyncSession = Depends(get_db)):
     if not rows_html:
         rows_html = '<tr><td colspan="7" style="text-align:center;color:#9ca3af;padding:20px">لا توجد بنود BOM</td></tr>'
 
-    eq_name = (eq.name_ar if eq else '') or ''
+    eq_name = _esc((eq.name_ar if eq else '') or '')
+    wo_code_safe = _esc(str(wo.code or ''))
     length_badge = f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 10px;border-radius:20px;font-size:13px">📐 {float(wo.planned_length)}م</span>' if wo.planned_length else ''
     html = f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head>
-<meta charset="UTF-8"><title>BOM — {wo.code}</title>
+<meta charset="UTF-8"><title>BOM — {wo_code_safe}</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   @page {{size:A4 landscape;margin:12mm}} *{{box-sizing:border-box;margin:0;padding:0}}
@@ -692,7 +847,7 @@ async def print_wo_bom(wo_id: int, db: AsyncSession = Depends(get_db)):
   @media print{{*{{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}}}}
 </style></head><body>
 <div class="header">
-  <div><h1>قائمة المواد (BOM) — {wo.code} {length_badge}</h1>
+  <div><h1>قائمة المواد (BOM) — {wo_code_safe} {length_badge}</h1>
   <div class="sub">{eq_name} | التكلفة المخططة: {_egp(wo.planned_cost)}</div></div>
   <div style="font-size:11px;opacity:.85">{date.today().strftime('%Y/%m/%d')}</div>
 </div>
@@ -737,8 +892,10 @@ async def dashboard_stats(db: AsyncSession = Depends(get_db)):
     low_stock  = await db.scalar(select(func.count()).select_from(Material).where(Material.stock_qty <= Material.reorder_level))
     open_wos   = await db.scalar(select(func.count()).select_from(WorkOrder).where(WorkOrder.status == "in_progress"))
     total_eq   = await db.scalar(select(func.count()).select_from(Equipment))
-    mtd_mat    = await db.scalar(select(func.coalesce(func.sum(CostLine.total_cost), 0)).where(CostLine.cost_type == "material", extract("month", CostLine.created_at) == today.month))
-    mtd_labor  = await db.scalar(select(func.coalesce(func.sum(CostLine.total_cost), 0)).where(CostLine.cost_type == "labor", extract("month", CostLine.created_at) == today.month))
+    # إصلاح: "الشهر الحالي" كان بيفلتر بالشهر بس من غير السنة — فيجمع نفس
+    # الشهر من كل السنين السابقة
+    mtd_mat    = await db.scalar(select(func.coalesce(func.sum(CostLine.total_cost), 0)).where(CostLine.cost_type == "material", extract("month", CostLine.created_at) == today.month, extract("year", CostLine.created_at) == today.year))
+    mtd_labor  = await db.scalar(select(func.coalesce(func.sum(CostLine.total_cost), 0)).where(CostLine.cost_type == "labor", extract("month", CostLine.created_at) == today.month, extract("year", CostLine.created_at) == today.year))
 
     return {
         "total_materials": total_mats or 0,
@@ -772,7 +929,10 @@ async def print_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404)
 
     eq = getattr(wo, "equipment", None)
-    eq_name = eq.name_ar if eq else "—"
+    # إصلاح ثغرة XSS: كل النصوص اللي بيدخلها المستخدم (كود/ملاحظات/وصف/أسماء)
+    # كانت بتتحقن في HTML الطباعة من غير escape
+    eq_name = _esc(str(eq.name_ar or "—")) if eq else "—"
+    wo_code_safe = _esc(str(wo.code or ""))
     lines = wo.cost_lines or []
 
     # جلب العميل والموقع
@@ -803,7 +963,9 @@ async def print_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
     status_labels = {"draft": "مسودة", "in_progress": "جارٍ", "done": "منتهي", "cancelled": "ملغي"}
     status_colors = {"draft": "#6b7280", "in_progress": "#d97706", "done": "#059669", "cancelled": "#dc2626"}
     status_color = status_colors.get(wo.status, "#6b7280")
-    status_label = status_labels.get(wo.status, wo.status)
+    status_label = _esc(str(status_labels.get(wo.status, wo.status) or ""))
+    customer_name = _esc(customer_name) if customer_name else customer_name
+    location_name = _esc(location_name) if location_name else location_name
 
     planned = float(wo.planned_cost or 0)
     actual  = float(wo.actual_cost or 0)
@@ -814,8 +976,8 @@ async def print_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
     for l in lines:
         rows_html += f"""
         <tr>
-          <td>{type_labels.get(l.cost_type, l.cost_type)}</td>
-          <td>{l.description or "—"}</td>
+          <td>{_esc(str(type_labels.get(l.cost_type, l.cost_type) or ""))}</td>
+          <td>{_esc(l.description) if l.description else "—"}</td>
           <td style="text-align:center">{float(l.qty)}</td>
           <td>{_egp(l.unit_cost)}</td>
           <td class="font-bold">{_egp(l.total_cost)}</td>
@@ -827,7 +989,7 @@ async def print_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
 <html dir="rtl" lang="ar">
 <head>
 <meta charset="UTF-8">
-<title>أمر إنتاج — {wo.code}</title>
+<title>أمر إنتاج — {wo_code_safe}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -862,7 +1024,7 @@ async def print_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
 <body>
 <div class="header">
   <div>
-    <h1>أمر الإنتاج — {wo.code}</h1>
+    <h1>أمر الإنتاج — {wo_code_safe}</h1>
     <div class="meta">{eq_name}</div>
   </div>
   <div style="text-align:left">
@@ -887,7 +1049,7 @@ async def print_work_order(wo_id: int, db: AsyncSession = Depends(get_db)):
   <div class="info-item"><div class="label">تاريخ الانتهاء</div><div class="value">{wo.end_date or '—'}</div></div>
 </div>
 
-{'<div class="info-item" style="margin:10px 0"><div class="label">ملاحظات</div><div class="value" style="font-weight:400">' + wo.notes + '</div></div>' if wo.notes else ''}
+{'<div class="info-item" style="margin:10px 0"><div class="label">ملاحظات</div><div class="value" style="font-weight:400">' + _esc(wo.notes) + '</div></div>' if wo.notes else ''}
 
 <div class="section">
   <div class="section-title">بنود التكلفة</div>

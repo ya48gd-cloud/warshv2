@@ -889,3 +889,184 @@ async def test_catalog_import_rejects_negative_opening_qty(cli):
 
     r = await cli.post(f"/api/v1/catalog/{item_id}/import", json={"stock_qty": -1})
     assert r.status_code == 400
+
+
+# ════════════ Round 3: gap/validation hardening (inventory backend) ═════════
+@pytest.mark.asyncio
+async def test_reverse_transfer_restores_locations_without_phantom_stock(cli):
+    """قبل الإصلاح: عكس حركة transfer كان بيتعامل معاها كصادر فيزوّد
+    stock_qty بكمية التحويل (رصيد وهمي) بدل ما يرجّع الكمية لموقعها الأصلي."""
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 20, "unit_cost": 10.0,
+    })
+    mvs = (await cli.get(f"{BASE}/movements/{mid}")).json()
+    default_loc = mvs[0]["destination_location_id"]
+    loc_a = await _make_location(cli, "REV-TR-A")
+    tr = await cli.post(f"{BASE}/movements/transfer", json={
+        "material_id": mid, "source_location_id": default_loc,
+        "destination_location_id": loc_a, "qty": 8,
+    })
+    assert tr.status_code == 201, tr.text
+
+    # الرصيد التراكمي في سجل الحركات مايتأثرش بالتحويل
+    mvs = (await cli.get(f"{BASE}/movements/{mid}")).json()
+    assert mvs[0]["balance_after"] == 20.0
+
+    rev = await cli.delete(f"{BASE}/movements/{tr.json()['id']}")
+    assert rev.status_code == 200, rev.text
+    assert rev.json()["stock_qty"] == 20.0
+
+    check = (await cli.get(f"{BASE}/materials/{mid}/stock-check")).json()
+    assert check["stock_qty"] == 20.0 and check["matches"] is True
+    quants = (await cli.get(f"{BASE}/materials/{mid}/quants")).json()
+    assert next((q["qty"] for q in quants if q["location_id"] == loc_a), 0) == 0
+    assert next((q["qty"] for q in quants if q["location_id"] == default_loc), 0) == 20.0
+
+
+@pytest.mark.asyncio
+async def test_reverse_receipt_rejected_when_stock_already_issued(cli):
+    """عكس وارد اتصرف منه بالفعل كان بيودّي الرصيد للسالب."""
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    mv_in = (await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 10, "unit_cost": 10.0,
+    })).json()["id"]
+    await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "out", "qty": 7, "unit_cost": 10.0,
+    })
+    r = await cli.delete(f"{BASE}/movements/{mv_in}")
+    assert r.status_code == 400
+    check = (await cli.get(f"{BASE}/materials/{mid}/stock-check")).json()
+    assert check["stock_qty"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_reversal_movement_itself_cannot_be_reversed(cli):
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    mv_in = (await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 10, "unit_cost": 10.0,
+    })).json()["id"]
+    rev_id = (await cli.delete(f"{BASE}/movements/{mv_in}")).json()["reversal_movement_id"]
+    r = await cli.delete(f"{BASE}/movements/{rev_id}")
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_negative_waste_rejected_on_issue(cli):
+    """waste_g سالب كان بيتطرح من كمية الصادر فيصرف أقل من الحقيقي."""
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 10, "unit_cost": 10.0,
+    })
+    r = await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "out", "qty": 1, "unit_cost": 10.0,
+        "withdrawal_unit": "weight", "waste_g": -500,
+    })
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_movement_rejects_unknown_work_order(cli):
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    r = await cli.post(f"{BASE}/movements", json={
+        "material_id": mid, "movement_type": "in", "qty": 5, "unit_cost": 10.0,
+        "work_order_id": 987654,
+    })
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_material_validation_rejects_bad_enums_and_negative_dims(cli):
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(material_kind="rocket"))
+    assert r.status_code == 422
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(valuation_method="magic"))
+    assert r.status_code == 422
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(material_kind="bar", bar_length_cm=-600, bar_weight_kg=10))
+    assert r.status_code == 422
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(name_ar="   "))
+    assert r.status_code == 422
+    # القيم الفاضية للسياسات لسه مقبولة (تاخد الافتراضي)
+    r = await cli.post(f"{BASE}/materials", json=_mat_payload(valuation_method="", tracking=None))
+    assert r.status_code == 201, r.text
+    assert r.json()["valuation_method"] == "moving_average"
+
+
+@pytest.mark.asyncio
+async def test_cutting_commit_ignores_stock_items_of_other_material(cli):
+    """used_stock_item_ids كان بيمسح أي لوح بالـ id حتى لو تابع لمادة تانية."""
+    mat_a = (await cli.post(f"{BASE}/materials", json=_mat_payload(name_ar="لوح أ", material_kind="plate"))).json()["id"]
+    mat_b = (await cli.post(f"{BASE}/materials", json=_mat_payload(name_ar="لوح ب", material_kind="plate"))).json()["id"]
+    item_b = (await cli.post(f"{BASE}/sheet-stock", json={
+        "material_id": mat_b, "length_cm": 100, "width_cm": 50, "qty": 1,
+    })).json()["id"]
+    r = await cli.post(f"{BASE}/cutting-plan/commit", json={
+        "material_id": mat_a, "used_stock_item_ids": [item_b, item_b],
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["stock_items_consumed"] == 0
+    left = (await cli.get(f"{BASE}/sheet-stock?material_id={mat_b}")).json()
+    assert any(i["id"] == item_b for i in left)
+
+
+@pytest.mark.asyncio
+async def test_cutting_commit_rejects_invalid_waste_action(cli):
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload(material_kind="plate"))).json()["id"]
+    r = await cli.post(f"{BASE}/cutting-plan/commit", json={
+        "material_id": mid,
+        "waste_items": [{"kind": "sheet", "length_cm": 10, "width_cm": 10, "qty": 1, "action": "burn"}],
+    })
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sheet_stock_rejects_non_positive_dims(cli):
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload(material_kind="plate"))).json()["id"]
+    r = await cli.post(f"{BASE}/sheet-stock", json={"material_id": mid, "length_cm": 0, "width_cm": 50, "qty": 1})
+    assert r.status_code == 422
+    r = await cli.post(f"{BASE}/bar-stock", json={"material_id": mid, "length_cm": 100, "qty": -2})
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_write_inventory_but_can_read(client):
+    """كل راوترات المخزون كانت require_any — viewer يقدر يسجّل/يعكس حركات بطلب مباشر."""
+    from app.api.auth import create_token
+    tok = create_token(user_id=990001, username="viewer_probe", role="viewer", tenant_id=1)
+    h = {"Authorization": f"Bearer {tok}"}
+    r = await client.get(f"{BASE}/materials", headers=h)
+    assert r.status_code == 200
+    r = await client.post(f"{BASE}/materials", json=_mat_payload(), headers=h)
+    assert r.status_code == 403
+    r = await client.post("/api/v1/warehouses", json={"code": "VW1", "name_ar": "x"}, headers=h)
+    assert r.status_code == 403
+    r = await client.post(f"{BASE}/batches", json={}, headers=h)
+    assert r.status_code == 403
+    # حساب مخطط التقطيع (بدون كتابة) لسه متاح للقراءة
+    r = await client.post(f"{BASE}/bar-cutting-plan", json={
+        "bar_length_cm": 600, "pieces": [{"label": "A", "length_cm": 100, "qty": 2}],
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_price_catalog_rejects_foreign_or_invalid_source(cli, cli2):
+    """upsert-from-source / create كانوا بيقبلوا ref_id لمادة ورشة تانية
+    (والتكلفة الحية بتتسحب منها بعدين)، وأي kind غير material كان يعتبر equipment."""
+    PC = "/api/v1/price-catalog"
+    mid = (await cli.post(f"{BASE}/materials", json=_mat_payload())).json()["id"]
+    r = await cli2.post(f"{PC}/upsert-from-source", json={"kind": "material", "ref_id": mid, "name": "x"})
+    assert r.status_code == 400
+    r = await cli.post(f"{PC}/upsert-from-source", json={"kind": "banana", "ref_id": mid, "name": "x"})
+    assert r.status_code == 422
+    r = await cli.post(f"{PC}/upsert-from-source", json={"kind": "material", "ref_id": mid, "name": "x", "cost_price": -5})
+    assert r.status_code == 422
+    r = await cli.post(f"{PC}/upsert-from-source", json={"kind": "material", "ref_id": mid, "name": "x", "cost_price": 10})
+    assert r.status_code == 200, r.text
+    r = await cli.post(PC, json={"name": "صنف", "price_mode": "weird"})
+    assert r.status_code == 422
+    r = await cli.post(PC, json={"name": "صنف", "margin_pct": 5000})
+    assert r.status_code == 422
+    r = await cli2.post(PC, json={"name": "صنف", "source_type": "material", "source_id": mid})
+    assert r.status_code == 400
+    r = await cli.post(PC, json={"name": "صنف", "source_type": "material", "source_id": mid})
+    assert r.status_code == 200, r.text

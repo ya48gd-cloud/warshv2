@@ -35,11 +35,14 @@ export default function StockBatches() {
     () => api.batches.list({ ...(materialFilter ? { material_id: materialFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}) }),
     [materialFilter, statusFilter]
   )
-  const { data: trace } = useApi(
+  const { data: trace, reload: reloadTrace } = useApi(
     () => materialFilter ? api.batches.traceability(materialFilter) : Promise.resolve(null),
     [materialFilter]
   )
-  const { data: expiring } = useApi(() => api.batches.expiryAlerts(30))
+  const { data: expiring, reload: reloadExpiring } = useApi(() => api.batches.expiryAlerts(30))
+  // بعد أي استلام/صرف: الجدول + بطاقة التسوية + تنبيهات الصلاحية كلها لازم تتحدّث
+  // (قبل كده كان الجدول بس بيتحدّث وبطاقة التسوية تفضل تعرض أرقام قديمة)
+  const reloadAll = () => { reload(); reloadTrace(); reloadExpiring() }
 
   // ── إنشاء دُفعة جديدة ──────────────────────────────────────────────
   const [createModal, setCreateModal] = useState(false)
@@ -51,6 +54,7 @@ export default function StockBatches() {
     if (!form.lot_number?.trim()) { toast('أدخل رقم الدُفعة', 'error'); return }
     if (!form.qty_received || Number(form.qty_received) <= 0) { toast('أدخل كمية صحيحة', 'error'); return }
     if (form.unit_cost && Number(form.unit_cost) < 0) { toast('سعر الوحدة لا يمكن أن يكون سالباً', 'error'); return }
+    if (!form.received_date) { toast('تاريخ الاستلام مطلوب', 'error'); return }
     if (form.received_date && form.expiry_date && form.expiry_date < form.received_date) {
       toast('تاريخ الصلاحية لازم يكون بعد تاريخ الاستلام', 'error'); return
     }
@@ -66,7 +70,7 @@ export default function StockBatches() {
     })
     toast('تم استلام الدُفعة وتحديث الرصيد')
     setCreateModal(false)
-    reload()
+    reloadAll()
   })
 
   // ── صرف من دُفعة ───────────────────────────────────────────────────
@@ -80,13 +84,14 @@ export default function StockBatches() {
       await api.batches.issue(batch.id, { qty: Number(qty), reference: reference || null })
       toast('تم الصرف من الدُفعة')
       setIssueModal(null); setIssueQty(''); setIssueRef('')
-      reload()
+      reloadAll()
     } catch (e) {
       toast(e.message || 'تعذّر الصرف', 'error')
     }
   })
 
   const requestIssue = () => {
+    if (issuing) return
     if (!issueQty || Number(issueQty) <= 0) { toast('أدخل كمية صحيحة', 'error'); return }
     if (Number(issueQty) > Number(issueModal.qty_remaining)) {
       toast(`الكمية المطلوبة أكبر من المتبقي في الدُفعة (${issueModal.qty_remaining})`, 'error'); return
@@ -99,7 +104,8 @@ export default function StockBatches() {
     [materials]
   )
 
-  if (loading) return <PageSpinner />
+  // السبينر الكامل في أول تحميل بس — تغيير الفلتر ميخفيش الفلاتر نفسها
+  if (loading && !batches) return <PageSpinner />
 
   return (
     <div className="flex flex-col gap-4">
@@ -129,17 +135,18 @@ export default function StockBatches() {
             { value: 'active', label: 'نشطة' },
             { value: 'consumed', label: 'مستهلكة بالكامل' },
             { value: 'expired', label: 'منتهية الصلاحية' },
+            { value: 'returned', label: 'مرتجعة' },
           ]} />
       </div>
 
-      {trace && trace.system_stock !== trace.total_remaining_batches && (
+      {trace && Math.abs(Number(trace.system_stock || 0) - Number(trace.total_remaining_batches || 0)) > 0.0005 && (
         <div className="card p-3" style={{ background: 'var(--red-lt)', borderColor: 'var(--red)' }}>
           <div className="font-semibold text-sm" style={{ color: 'var(--red)' }}>
             ⚠️ فرق في تسوية «{trace.material_name}» — رصيد النظام: {trace.system_stock}، إجمالي الدُفعات: {trace.total_remaining_batches}
           </div>
         </div>
       )}
-      {trace && trace.system_stock === trace.total_remaining_batches && (
+      {trace && Math.abs(Number(trace.system_stock || 0) - Number(trace.total_remaining_batches || 0)) <= 0.0005 && (
         <div className="text-xs text-erp-muted">✓ رصيد «{trace.material_name}» متطابق مع مجموع دُفعاته</div>
       )}
 
@@ -169,14 +176,14 @@ export default function StockBatches() {
                   {write && (
                     <td>
                       {b.status === 'active' && b.qty_remaining > 0 && (
-                        <button className="btn btn-sm text-xs" onClick={() => setIssueModal(b)}>📤 صرف</button>
+                        <button className="btn btn-sm text-xs" onClick={() => { setIssueQty(''); setIssueRef(''); setIssueModal(b) }}>📤 صرف</button>
                       )}
                     </td>
                   )}
                 </tr>
               ))}
               {(!batches || batches.length === 0) && (
-                <tr><td colSpan={write ? 8 : 7} className="text-center text-erp-muted py-4">لا توجد دُفعات</td></tr>
+                <tr><td colSpan={write ? 9 : 8} className="text-center text-erp-muted py-4">لا توجد دُفعات</td></tr>
               )}
             </tbody>
           </table>
@@ -232,7 +239,7 @@ export default function StockBatches() {
         </div>
         <ModalFooter>
           <button className="btn" onClick={() => setIssueModal(null)}>إلغاء</button>
-          <button className="btn btn-primary" onClick={requestIssue}>📤 صرف</button>
+          <button className="btn btn-primary" onClick={requestIssue} disabled={issuing}>{issuing ? '…' : '📤 صرف'}</button>
         </ModalFooter>
       </Modal>
 

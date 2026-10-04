@@ -62,7 +62,7 @@ function ScrapRegister() {
     // التحقق هنا يمنع رسالة validation خام (اسم حقل إنجليزي وسط واجهة عربية).
     if (!form.reason || !form.reason.trim()) { toast('سبب الهالك مطلوب', 'error'); return }
     await api.production.recordScrap(form)
-    toast('تم تسجيل الهالك'); setModal(false); setForm({ date: today(), qty: '' }); reload()
+    toast('تم تسجيل الهالك'); setModal(false); setForm({ date: today(), qty: '', reason: '' }); reload()
   })
 
   if (loading) return <PageSpinner />
@@ -170,9 +170,23 @@ function ScrapSell() {
   const total = useMemo(() => lines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unit_price) || 0), 0), [lines])
 
   const [save, saving] = useAction(async () => {
+    if (!form.sale_date) { toast('تاريخ البيع مطلوب', 'error'); return }
     if (!form.treasury_id) { toast('اختر الخزينة', 'error'); return }
-    const validLines = lines.filter(l => l.material_id && Number(l.qty) > 0 && Number(l.unit_price) >= 0)
+    // سطر متعبّي جزئيًا كان بيتشال بصمت من غير ما المستخدم يعرف — دلوقتي بنبلّغ عنه
+    const touched = lines.filter(l => l.material_id || l.qty !== '' || l.unit_price !== '')
+    const badIdx = touched.findIndex(l => !l.material_id || !(Number(l.qty) > 0) || l.unit_price === '' || isNaN(Number(l.unit_price)) || Number(l.unit_price) < 0)
+    if (badIdx >= 0) { toast(`السطر ${lines.indexOf(touched[badIdx]) + 1}: اختر المادة وأدخل كمية أكبر من صفر وسعر غير سالب`, 'error'); return }
+    const validLines = touched
     if (!validLines.length) { toast('أضف سطر بيع واحد على الأقل', 'error'); return }
+    // الكمية المباعة لكل مادة (مجموع السطور) لازم متتعداش المتاح من الهالك
+    const perMat = {}
+    validLines.forEach(l => { perMat[l.material_id] = (perMat[l.material_id] || 0) + Number(l.qty) })
+    for (const [mid, q] of Object.entries(perMat)) {
+      const avail = (inv || []).find(r => String(r.material_id) === String(mid))
+      if (avail && q > Number(avail.available_qty || 0) + 1e-9) {
+        toast(`الكمية المطلوبة من «${avail.material_name}» (${q}) أكبر من المتاح (${Number(avail.available_qty).toFixed(2)})`, 'error'); return
+      }
+    }
     const res = await api.production.createScrapSale({
       sale_date: form.sale_date,
       buyer_name: form.buyer_name || null,

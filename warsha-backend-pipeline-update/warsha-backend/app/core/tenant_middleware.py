@@ -29,8 +29,9 @@ class TenantMiddleware(BaseHTTPMiddleware):
         # استخرج التوكن من الرأس
         auth = request.headers.get("authorization") or request.headers.get("Authorization")
         if auth and auth.lower().startswith("bearer "):
-            token = auth.split(None, 1)[1].strip()
-            token_data = verify_token(token)
+            _parts = auth.split(None, 1)
+            if len(_parts) == 2 and _parts[1].strip():
+                token_data = verify_token(_parts[1].strip())
 
         tid = None
         if token_data:

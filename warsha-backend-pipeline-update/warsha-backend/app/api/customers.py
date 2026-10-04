@@ -1,6 +1,7 @@
 from datetime import date
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+import html as _html_mod
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -13,7 +14,51 @@ from app.api.auth import require_any, get_current_user
 from app.models.models import Customer, CustomerOrder, CustomerOrderLine, CustomerPayment, CustomerPaymentAllocation, CustomerAsset, Equipment, ExtProject, AssetMovement
 from app.services.invoice_due import get_invoice_due_status
 
-router = APIRouter(prefix="/customers", tags=["customers"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر ينشئ/يعدّل/يحذف
+    عملاء وطلبات ويسجّل دفعات بطلب API مباشر (ROLE_WRITE['viewer'] = [])."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
+router = APIRouter(prefix="/customers", tags=["customers"],
+                   dependencies=[Depends(require_any), Depends(_block_viewer_writes)])
+
+
+def _h(v) -> str:
+    """HTML-escape لكل قيمة بيدخلها المستخدم في صفحات الطباعة (منع XSS مخزّن)."""
+    return _html_mod.escape(str(v if v is not None else ""))
+
+
+_VALID_ORDER_CREATE_STATUSES = {"pending", "in_production", "delivered", "cancelled"}
+
+
+def _validate_order_input(data) -> None:
+    if data.quantity is None or data.quantity <= 0:
+        raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
+    if data.unit_price is not None and data.unit_price < 0:
+        raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    for l in data.lines or []:
+        if l.qty is None or l.qty <= 0:
+            raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
+        if l.unit_price is not None and l.unit_price < 0:
+            raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    if data.order_date and data.delivery_date and data.delivery_date < data.order_date:
+        raise HTTPException(400, "تاريخ التسليم يجب أن يكون بعد تاريخ الطلب")
+
+
+async def _check_location_belongs(db: AsyncSession, location_id, customer_id: int) -> None:
+    """الموقع لازم يكون موقع لنفس العميل (ونفس الـ tenant) — كان أي رقم بيتقبل."""
+    if location_id is None:
+        return
+    from app.models.models import CustomerLocation
+    loc = await db.get(CustomerLocation, location_id)
+    if not loc or loc.customer_id != customer_id:
+        raise HTTPException(400, "الموقع المحدد لا يخص هذا العميل")
 
 
 async def _next_customer_code(db: AsyncSession) -> str:
@@ -113,9 +158,14 @@ async def list_customers(db: AsyncSession = Depends(get_db)):
         inv_total, inv_paid = inv_res.one()
 
         # Sum orders
+        # نفس قواعد كشف الحساب: الطلب الملغي أو اللي اتفوتر مايتحسبش كمديونية
+        invoiced_order_ids = select(Invoice.customer_order_id).where(
+            Invoice.customer_id == cust.id, Invoice.customer_order_id.isnot(None))
         ord_res = await db.execute(
             select(sqlfunc.coalesce(sqlfunc.sum(CustomerOrder.total_price), 0))
-            .where(CustomerOrder.customer_id == cust.id)
+            .where(CustomerOrder.customer_id == cust.id,
+                   CustomerOrder.status != "cancelled",
+                   CustomerOrder.id.notin_(invoiced_order_ids))
         )
         ord_total = ord_res.scalar()
 
@@ -171,9 +221,15 @@ async def get_customer(cust_id: int, db: AsyncSession = Depends(get_db)):
 async def create_customer(data: CustomerIn, db: AsyncSession = Depends(get_db)):
     if data.credit_limit is not None and data.credit_limit < 0:
         raise HTTPException(400, "حد الائتمان لا يمكن أن يكون سالباً")
+    if not (data.name or "").strip():
+        raise HTTPException(400, "اسم العميل مطلوب")
     from app.core.database import current_tenant_id as _ctid_cust
     d = data.model_dump()
-    d['code'] = d.get('code') or await _next_customer_code(db)
+    d['name'] = d['name'].strip()
+    d['code'] = (d.get('code') or '').strip() or await _next_customer_code(db)
+    # كود مكرر كان بيوصل لقيد UNIQUE ويرجع 500 بدل رسالة واضحة
+    if await db.scalar(select(Customer.id).where(Customer.code == d['code'])):
+        raise HTTPException(400, f"كود العميل '{d['code']}' مستخدم بالفعل")
     d['tenant_id'] = _ctid_cust.get() or 1
     c = Customer(**d)
     db.add(c)
@@ -187,9 +243,16 @@ async def update_customer(cust_id: int, data: CustomerIn, db: AsyncSession = Dep
     if not c: raise HTTPException(404)
     if data.credit_limit is not None and data.credit_limit < 0:
         raise HTTPException(400, "حد الائتمان لا يمكن أن يكون سالباً")
+    if not (data.name or "").strip():
+        raise HTTPException(400, "اسم العميل مطلوب")
     d = data.model_dump()
-    if not d.get("code"):
+    d["name"] = d["name"].strip()
+    if not (d.get("code") or "").strip():
         d["code"] = c.code  # حافظ على الكود الموجود لو لم يُرسَل
+    elif d["code"] != c.code and await db.scalar(
+        select(Customer.id).where(Customer.code == d["code"], Customer.id != cust_id)
+    ):
+        raise HTTPException(400, f"كود العميل '{d['code']}' مستخدم بالفعل")
     for k, v in d.items():
         setattr(c, k, v)
     await db.commit()
@@ -207,6 +270,14 @@ async def delete_customer(cust_id: int, db: AsyncSession = Depends(get_db)):
     ord_count  = await db.scalar(select(sqlfunc.count()).select_from(CustomerOrder).where(CustomerOrder.customer_id == cust_id))
     if (inv_count or 0) > 0 or (ord_count or 0) > 0:
         raise HTTPException(400, f"لا يمكن حذف العميل — لديه {inv_count} فاتورة و{ord_count} طلب. أرشف العميل بدلاً من الحذف.")
+    # إصلاح ثغرة تكامل: عميل عليه دفعات/عروض أسعار/إشعارات دائنة/أوامر توريد
+    # كان بيتحذف ويسيبهم بمرجع عميل يتيم (ويكسر الـ FK على Postgres).
+    from app.models.models import Quotation, CreditNote, DeliveryOrder
+    for _model, _label in ((CustomerPayment, "دفعات"), (Quotation, "عروض أسعار"),
+                           (CreditNote, "إشعارات دائنة"), (DeliveryOrder, "أوامر توريد")):
+        _cnt = await db.scalar(select(sqlfunc.count()).select_from(_model).where(_model.customer_id == cust_id))
+        if (_cnt or 0) > 0:
+            raise HTTPException(400, f"لا يمكن حذف العميل — لديه {_cnt} من {_label}. أرشف العميل بدلاً من الحذف.")
     await db.delete(c)
     await db.commit()
     return {"message": "تم الحذف"}
@@ -268,8 +339,11 @@ async def customer_statement(cust_id: int, db: AsyncSession = Depends(get_db)):
 
     # الإجمالي = طلبات العملاء + الفواتير
     # لا نضيف طلب الإجمالي إلا إذا لم يتحوّل إلى فاتورة بعد (منع double-counting)
-    invoice_order_ids = {inv.quotation_id for inv in invoices if inv.quotation_id}
-    total_orders   = sum(o.total_price for o in orders if o.status != 'cancelled')
+    # إصلاح: الطلب اللي اتفوتر (Invoice.customer_order_id) كان بيتحسب مرتين —
+    # مرة كطلب ومرة كفاتورة. (المتغير القديم كان بيقارن بـ quotation_id غلط.)
+    invoice_order_ids = {getattr(inv, "customer_order_id", None) for inv in invoices} - {None}
+    total_orders   = sum(o.total_price for o in orders
+                         if o.status != 'cancelled' and o.id not in invoice_order_ids)
     total_invoices = sum(inv.total for inv in invoices)
     total_charged  = total_orders + total_invoices
 
@@ -459,8 +533,14 @@ async def customer_ledger(cust_id: int, date_from: date = None, date_to: date = 
                           db: AsyncSession = Depends(get_db)):
     """كشف حساب تفصيلي للعميل من تاريخ لتاريخ — فواتير + مدفوعات مرتّبة زمنياً"""
     from app.models.models import Invoice
+    from app.core.database import current_tenant_id as _ctid_ledger
     cust = await db.get(Customer, cust_id)
-    if not cust: raise HTTPException(404, "العميل غير موجود")
+    # عزل صريح بالـ tenant (دفاع إضافي فوق الفلتر التلقائي): عميل ورشة تانية = 404
+    if not cust or _ctid_ledger.get() is None or cust.tenant_id != _ctid_ledger.get():
+        raise HTTPException(404, "العميل غير موجود")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "تاريخ البداية يجب أن يكون قبل تاريخ النهاية")
+    from app.models.models import CreditNote as _CN
 
     # الرصيد الافتتاحي = صافي كل الحركات قبل date_from
     opening_balance = 0.0
@@ -475,7 +555,13 @@ async def customer_ledger(cust_id: int, date_from: date = None, date_to: date = 
             op_pay_q = op_pay_q.where(CustomerPayment.location_id == location_id)
         op_inv_total = float((await db.execute(op_inv_q)).scalar() or 0)
         op_pay_total = float((await db.execute(op_pay_q)).scalar() or 0)
-        opening_balance = round(op_inv_total - op_pay_total, 2)
+        op_cn_total = 0.0
+        if not location_id:
+            op_cn_total = float((await db.execute(
+                select(func.coalesce(func.sum(_CN.total), 0)).where(
+                    _CN.customer_id == cust_id, _CN.status == "issued", _CN.date < date_from)
+            )).scalar() or 0)
+        opening_balance = round(op_inv_total - op_pay_total - op_cn_total, 2)
 
     inv_q = select(Invoice).where(Invoice.customer_id == cust_id)
     if location_id:
@@ -498,6 +584,18 @@ async def customer_ledger(cust_id: int, date_from: date = None, date_to: date = 
     for p in payments:
         rows.append({"date": str(p.payment_date), "type": "payment", "ref": f"دفعة #{p.id}",
                      "description": p.notes or "دفعة", "debit": 0.0, "credit": float(p.amount)})
+
+    # إصلاح ثغرة تكامل: الإشعارات الدائنة الصادرة بتخفّض رصيد العميل فعلاً
+    # (issue_credit_note) لكنها ماكانتش بتظهر في كشف الحساب — فالرصيد الختامي
+    # في الكشف كان أعلى من الرصيد الحقيقي بقيمة كل المرتجعات.
+    if not location_id:
+        cn_q = select(_CN).where(_CN.customer_id == cust_id, _CN.status == "issued")
+        if date_from: cn_q = cn_q.where(_CN.date >= date_from)
+        if date_to:   cn_q = cn_q.where(_CN.date <= date_to)
+        for cn in (await db.execute(cn_q)).scalars().all():
+            rows.append({"date": str(cn.date), "type": "credit_note", "ref": cn.code,
+                         "description": f"إشعار دائن {cn.code}" + (f" — {cn.reason}" if cn.reason else ""),
+                         "debit": 0.0, "credit": float(cn.total)})
 
     rows.sort(key=lambda r: (r["date"], 0 if r["type"] == "invoice" else 1))
     bal = opening_balance
@@ -572,26 +670,26 @@ async def print_customer_statement(
         bal_color = "#dc2626" if r["balance"] > 0 else "#059669"
         if r["type"] == "invoice":
             rows_html += f"""
-            <tr class="inv-row" style="font-weight:600;background:#f8fafc;cursor:pointer" onclick="toggle('{r['ref']}')">
+            <tr class="inv-row" style="font-weight:600;background:#f8fafc;cursor:pointer" onclick="toggle({_h(__import__('json').dumps(str(r['ref'])))})">
               <td>{r['date']}</td>
-              <td><span style="color:#1e3a5f">📄 {r['ref']}</span></td>
-              <td>{r['desc']}</td>
+              <td><span style="color:#1e3a5f">📄 {_h(r['ref'])}</span></td>
+              <td>{_h(r['desc'])}</td>
               <td style="color:#dc2626;font-weight:700">{_egp(r['debit'])}</td>
               <td>—</td>
               <td style="color:{bal_color};font-weight:700">{_egp(r['balance'])}</td>
               <td style="font-size:10px;color:#94a3b8">{'▼' if mode=='detailed' and r['lines'] else ''}</td>
             </tr>"""
             if mode == "detailed" and r["lines"]:
-                rows_html += f'<tr id="lines-{r["ref"]}" class="lines-row" style="display:none"><td colspan="7" style="padding:0"><table style="width:100%;font-size:11px;background:#f1f5f9"><thead><tr style="background:#e2e8f0"><th style="padding:4px 8px;text-align:right">البيان</th><th>الكمية</th><th>الوحدة</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>'
+                rows_html += f'<tr id="lines-{_h(r["ref"])}" class="lines-row" style="display:none"><td colspan="7" style="padding:0"><table style="width:100%;font-size:11px;background:#f1f5f9"><thead><tr style="background:#e2e8f0"><th style="padding:4px 8px;text-align:right">البيان</th><th>الكمية</th><th>الوحدة</th><th>السعر</th><th>الإجمالي</th></tr></thead><tbody>'
                 for l in r["lines"]:
-                    rows_html += f'<tr><td style="padding:4px 8px">{l["desc"]}</td><td style="text-align:center">{l["qty"]}</td><td style="text-align:center">{l["unit"]}</td><td>{_egp(l["price"])}</td><td style="font-weight:600">{_egp(l["total"])}</td></tr>'
+                    rows_html += f'<tr><td style="padding:4px 8px">{_h(l["desc"])}</td><td style="text-align:center">{l["qty"]}</td><td style="text-align:center">{_h(l["unit"])}</td><td>{_egp(l["price"])}</td><td style="font-weight:600">{_egp(l["total"])}</td></tr>'
                 rows_html += "</tbody></table></td></tr>"
         else:
             rows_html += f"""
             <tr style="background:#f0fdf4">
               <td>{r['date']}</td>
-              <td><span style="color:#059669">💰 {r['ref']}</span></td>
-              <td>{r['desc']}</td>
+              <td><span style="color:#059669">💰 {_h(r['ref'])}</span></td>
+              <td>{_h(r['desc'])}</td>
               <td>—</td>
               <td style="color:#059669;font-weight:700">{_egp(r['credit'])}</td>
               <td style="color:{bal_color};font-weight:700">{_egp(r['balance'])}</td>
@@ -624,7 +722,7 @@ async def print_customer_statement(
 <html dir="rtl" lang="ar">
 <head>
 <meta charset="UTF-8">
-<title>كشف حساب — {cust.name}</title>
+<title>كشف حساب — {_h(cust.name)}</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   @page {{ size: A4; margin: 12mm }}
@@ -648,8 +746,8 @@ async def print_customer_statement(
 <body>
 <div class="header">
   <div>
-    <h1>كشف حساب — {cust.name}</h1>
-    <div class="meta">{getattr(cust,'code','') or ''} &nbsp;|&nbsp; كشف {mode_label} &nbsp;|&nbsp; تاريخ الطباعة: {date.today().strftime('%Y/%m/%d')}</div>
+    <h1>كشف حساب — {_h(cust.name)}</h1>
+    <div class="meta">{_h(getattr(cust,'code','') or '')} &nbsp;|&nbsp; كشف {mode_label} &nbsp;|&nbsp; تاريخ الطباعة: {date.today().strftime('%Y/%m/%d')}</div>
   </div>
   <div style="text-align:left;font-size:20px">🏭</div>
 </div>
@@ -767,17 +865,23 @@ def _order_dict(o: CustomerOrder) -> dict:
 
 @router.post("/orders", status_code=201)
 async def create_order(data: OrderIn, db: AsyncSession = Depends(get_db)):
-    if data.order_date and data.delivery_date and data.delivery_date < data.order_date:
-        raise HTTPException(400, "تاريخ التسليم يجب أن يكون بعد تاريخ الطلب")
+    _validate_order_input(data)
+    if data.status not in _VALID_ORDER_CREATE_STATUSES:
+        raise HTTPException(400, f"حالة غير صالحة. القيم المسموحة: {sorted(_VALID_ORDER_CREATE_STATUSES)}")
     # إصلاح ثغرة تحقق: إنشاء طلب لعميل رقمه غير موجود (أو تابع لـ tenant تاني)
     # كان ينجح بصمت — الطلب يتسجل بمرجع عميل يتيم، ورصيده لا يتحدث لأنه
     # ببساطة مش موجود.
     if not await db.get(Customer, data.customer_id):
         raise HTTPException(404, "العميل غير موجود")
+    await _check_location_belongs(db, data.location_id, data.customer_id)
+    if data.equipment_id is not None and not await db.get(Equipment, data.equipment_id):
+        raise HTTPException(404, "المعدة غير موجودة")
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
 
-    code = data.code or await _next_order_code(db)
+    code = (data.code or "").strip() or await _next_order_code(db)
+    if await db.scalar(select(CustomerOrder.id).where(CustomerOrder.code == code)):
+        raise HTTPException(400, f"رقم الطلب '{code}' مستخدم بالفعل")
 
     # حساب الإجمالي: من البنود لو موجودة، وإلا من الحقول التقليدية
     if data.lines:
@@ -811,9 +915,10 @@ async def create_order(data: OrderIn, db: AsyncSession = Depends(get_db)):
                 notes=l.notes, sort_order=i,
             ))
 
-    # تحديث رصيد العميل
+    # تحديث رصيد العميل (الطلب المُنشأ كـ"ملغي" مالوش مديونية — وإلا الرصيد
+    # يزيد ومفيش أي مسار يرجّعه لأن الإلغاء حالة نهائية)
     cust = await db.get(Customer, data.customer_id)
-    if cust:
+    if cust and data.status != "cancelled":
         cust.balance += total
 
     await db.commit()
@@ -944,6 +1049,10 @@ async def edit_order_fields(order_id: int, data: OrderIn, db: AsyncSession = Dep
         raise HTTPException(404)
     if o.status != "pending":
         raise HTTPException(400, "لا يمكن تعديل الطلب بعد بدء الإنتاج أو التسليم")
+    _validate_order_input(data)
+    await _check_location_belongs(db, data.location_id, data.customer_id)
+    if data.equipment_id is not None and not await db.get(Equipment, data.equipment_id):
+        raise HTTPException(404, "المعدة غير موجودة")
 
     old_total = Decimal(str(o.total_price))
 
@@ -1018,6 +1127,15 @@ async def record_payment(data: PaymentIn, db: AsyncSession = Depends(get_db),
     # خزنة مقابلة (الخزنة بترفض amt<=0 بصمت)، فيفضل السجل غير متزن تمامًا.
     if data.amount is None or data.amount <= 0:
         raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
+    # إصلاح ثغرة عزل/تحقق: الدفعة كانت بتتسجّل لأي customer_id (حتى لو مش
+    # موجود أو تابع لورشة تانية) — سجل دفعة + حركة خزنة + قيد بمرجع يتيم.
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    if data.order_id is not None:
+        _o = await db.get(CustomerOrder, data.order_id)
+        if not _o or _o.customer_id != data.customer_id:
+            raise HTTPException(400, "الطلب المحدد لا يخص هذا العميل")
+    await _check_location_belongs(db, data.location_id, data.customer_id)
 
     from app.core.database import current_tenant_id as _ctid_cpay
     payment_data = data.model_dump()
@@ -1129,7 +1247,7 @@ async def print_order(order_id: int, db: AsyncSession = Depends(get_db)):
     ws_name    = prof.name    if prof else "الورشة"
     ws_address = prof.address if prof else ""
     ws_phone   = prof.phone   if prof else ""
-    logo_html  = f'<img src="{prof.logo_data}" style="max-height:70px;max-width:200px">' if (prof and prof.logo_data) else ""
+    logo_html  = f'<img src="{_h(prof.logo_data)}" style="max-height:70px;max-width:200px">' if (prof and prof.logo_data) else ""
 
     STATUS_MAP = {"pending": "معلق", "in_progress": "جاري التنفيذ", "delivered": "مُسلَّم", "cancelled": "ملغي"}
     status_ar = STATUS_MAP.get(o.status, o.status)
@@ -1141,8 +1259,8 @@ async def print_order(order_id: int, db: AsyncSession = Depends(get_db)):
             rows_html += f"""
             <tr>
                 <td style="text-align:center">{i}</td>
-                <td>{l.description}</td>
-                <td style="text-align:center">{float(l.qty):g} {l.unit}</td>
+                <td>{_h(l.description)}</td>
+                <td style="text-align:center">{float(l.qty):g} {_h(l.unit)}</td>
                 <td style="text-align:center">{float(l.unit_price):,.2f}</td>
                 <td style="text-align:center">{float(l.total_price):,.2f}</td>
             </tr>"""
@@ -1152,7 +1270,7 @@ async def print_order(order_id: int, db: AsyncSession = Depends(get_db)):
         rows_html = f"""
         <tr>
             <td style="text-align:center">1</td>
-            <td>{o.description or ""}</td>
+            <td>{_h(o.description or "")}</td>
             <td style="text-align:center">{o.quantity} قطعة</td>
             <td style="text-align:center">{float(o.unit_price):,.2f}</td>
             <td style="text-align:center">{total_val:,.2f}</td>
@@ -1161,7 +1279,7 @@ async def print_order(order_id: int, db: AsyncSession = Depends(get_db)):
     delivery_row = f"<tr><td>تاريخ التسليم المتوقع</td><td>{o.delivery_date}</td></tr>" if o.delivery_date else ""
 
     html = f"""<!DOCTYPE html><html dir="rtl" lang="ar">
-<head><meta charset="UTF-8"><title>طلب {o.code}</title>
+<head><meta charset="UTF-8"><title>طلب {_h(o.code)}</title>
 <style>
   body{{font-family:Arial,sans-serif;padding:20px;color:#222;direction:rtl}}
   .header{{display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #1a56a0;margin-bottom:16px;padding-bottom:12px}}
@@ -1179,19 +1297,19 @@ async def print_order(order_id: int, db: AsyncSession = Depends(get_db)):
 <body>
 <div class="header">
   <div class="ws-info">
-    <h2>{ws_name}</h2>
-    <p>{ws_address}</p>
-    <p>{ws_phone}</p>
+    <h2>{_h(ws_name)}</h2>
+    <p>{_h(ws_address)}</p>
+    <p>{_h(ws_phone)}</p>
   </div>
   {logo_html}
-  <div class="doc-title">طـلـب عـمـيـل<br><span style="font-size:20px;font-weight:bold">{o.code}</span></div>
+  <div class="doc-title">طـلـب عـمـيـل<br><span style="font-size:20px;font-weight:bold">{_h(o.code)}</span></div>
 </div>
 <table class="meta-table" style="width:100%">
-  <tr><td><b>العميل</b></td><td>{o.customer.name if o.customer else ""}</td>
+  <tr><td><b>العميل</b></td><td>{_h(o.customer.name if o.customer else "")}</td>
       <td><b>تاريخ الطلب</b></td><td>{o.order_date}</td></tr>
   {delivery_row}
   <tr><td><b>الحالة</b></td><td>{status_ar}</td>
-      <td><b>ملاحظات</b></td><td>{o.notes or ""}</td></tr>
+      <td><b>ملاحظات</b></td><td>{_h(o.notes or "")}</td></tr>
 </table>
 <table class="items">
   <thead><tr><th>#</th><th>الوصف</th><th>الكمية</th><th>سعر الوحدة</th><th>الإجمالي</th></tr></thead>
@@ -1201,7 +1319,7 @@ async def print_order(order_id: int, db: AsyncSession = Depends(get_db)):
         <td style="text-align:center">{total_val:,.2f} ج.م</td></tr>
   </tbody>
 </table>
-<div class="notes">النظام: {ws_name} — تم طباعة هذه الوثيقة من نظام Warsh ERP</div>
+<div class="notes">النظام: {_h(ws_name)} — تم طباعة هذه الوثيقة من نظام Warsh ERP</div>
 <script>window.onload=()=>window.print()</script>
 </body></html>"""
     return HTMLResponse(html)

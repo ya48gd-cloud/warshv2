@@ -1,7 +1,7 @@
 """Attendance and daily wage management"""
 from datetime import date as date_type, timedelta
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +12,62 @@ from app.core.database import get_db
 from app.api.auth import require_any
 from app.models.models import Worker, Attendance, PayrollRun, PayrollLine
 
-router = APIRouter(prefix="/attendance", tags=["attendance"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر يسجّل/يعدّل/يحذف
+    حضور (وبالتالي يغيّر أجور الكشف) بطلب API مباشر (ROLE_WRITE['viewer'] = [])."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
+router = APIRouter(prefix="/attendance", tags=["attendance"],
+                   dependencies=[Depends(require_any), Depends(_block_viewer_writes)])
+
+# الحالات اللي بيفهمها توليد كشف الرواتب (workers.generate_from_attendance)
+# + حالات المشاريع الخارجية (external_projects). أي قيمة تانية كانت بتتسجل
+# بصمت وتتحسب "صفر أجر" من غير ما المستخدم يعرف ليه.
+_VALID_STATUSES = {"present", "absent", "half", "leave", "on_project", "half_project"}
+_PROJECT_STATUSES = {"on_project", "half_project"}
+_MAX_OVERTIME = Decimal("24")
+
+
+def _validate_status(status) -> str:
+    if status not in _VALID_STATUSES:
+        raise HTTPException(400, f"حالة حضور غير صالحة: {status}. القيم المسموحة: {sorted(_VALID_STATUSES)}")
+    return status
+
+
+def _validate_overtime(value) -> Decimal:
+    try:
+        ot = Decimal(str(value if value is not None else 0))
+    except Exception:
+        raise HTTPException(400, "ساعات العمل الإضافي غير صالحة")
+    if not ot.is_finite():
+        raise HTTPException(400, "ساعات العمل الإضافي غير صالحة")
+    if ot < 0:
+        raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تكون سالبة")
+    if ot > _MAX_OVERTIME:
+        raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تتجاوز 24 ساعة في اليوم")
+    return ot.quantize(Decimal("0.1"))
+
+
+async def _ensure_not_in_paid_payroll(db: AsyncSession, tid: int, the_date) -> None:
+    """تعديل/حذف حضور يوم داخل فترة كشف رواتب *مصروف* كان بيغيّر أساس
+    الأجر اللي اتصرف فعلاً من الخزنة واتقيّد محاسبيًا، من غير أي أثر على
+    الكشف — فيطلع الحضور والرواتب المصروفة مش متطابقين."""
+    paid = await db.scalar(
+        select(PayrollRun.id).where(
+            PayrollRun.tenant_id == tid,
+            PayrollRun.status == "paid",
+            PayrollRun.week_start <= the_date,
+            PayrollRun.week_end >= the_date,
+        ).limit(1)
+    )
+    if paid:
+        raise HTTPException(409, f"لا يمكن تعديل حضور يوم {the_date} — داخل كشف رواتب مصروف (#{paid})")
 
 
 class AttendanceIn(BaseModel):
@@ -51,14 +106,15 @@ async def record_attendance(data: AttendanceIn, db: AsyncSession = Depends(get_d
     the_date = data.work_date or data.attendance_date
     if not the_date:
         raise HTTPException(400, "يرجى تحديد التاريخ")
-    if data.overtime_hours is not None and data.overtime_hours < 0:
-        raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تكون سالبة")
+    _validate_status(data.status)
+    overtime = _validate_overtime(data.overtime_hours)
 
     from app.core.database import current_tenant_id as _ctid_att
     tid = _ctid_att.get() or 1
     worker = await db.get(Worker, data.worker_id)
     if not worker or worker.tenant_id != tid:
         raise HTTPException(404, "العامل غير موجود")
+    await _ensure_not_in_paid_payroll(db, tid, the_date)
     existing = (await db.execute(
         select(Attendance).where(
             Attendance.worker_id == data.worker_id,
@@ -69,8 +125,10 @@ async def record_attendance(data: AttendanceIn, db: AsyncSession = Depends(get_d
 
     if existing:
         existing.status = data.status
-        existing.overtime_hours = data.overtime_hours
+        existing.overtime_hours = overtime
         existing.notes = data.notes
+        if data.status not in _PROJECT_STATUSES:
+            existing.ext_project_id = None
         await db.commit()
         return {"id": existing.id, "worker_id": existing.worker_id, "date": str(existing.date),
                 "status": existing.status, "overtime_hours": float(existing.overtime_hours or 0),
@@ -81,7 +139,7 @@ async def record_attendance(data: AttendanceIn, db: AsyncSession = Depends(get_d
         worker_id=data.worker_id,
         date=the_date,
         status=data.status,
-        overtime_hours=data.overtime_hours,
+        overtime_hours=overtime,
         notes=data.notes,
     )
     db.add(att)
@@ -131,17 +189,35 @@ async def bulk_attendance(data: BulkAttendanceIn, db: AsyncSession = Depends(get
     from app.core.database import current_tenant_id as _ctid_battat
     tid = _ctid_battat.get() or 1
 
+    await _ensure_not_in_paid_payroll(db, tid, the_date)
+
     tenant_worker_ids = set((await db.execute(
         select(Worker.id).where(Worker.tenant_id == tid)
     )).scalars().all())
 
-    results = []
+    # تحقق كامل قبل أي كتابة — سجل غلط في النص كان بيسيب اللي قبله متسجل
+    # في الجلسة، وقيمة worker_id نصية ("5") كانت بترجع 404 رغم إن العامل موجود.
+    cleaned = []
+    seen = set()
     for rec in data.records:
-        if rec.get("worker_id") not in tenant_worker_ids:
+        if not isinstance(rec, dict):
+            raise HTTPException(400, "صيغة سجل الحضور غير صحيحة")
+        try:
+            wid = int(rec.get("worker_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"رقم العامل غير صالح: {rec.get('worker_id')}")
+        if wid not in tenant_worker_ids:
             raise HTTPException(404, f"العامل {rec.get('worker_id')} غير موجود")
-        overtime = Decimal(str(rec.get("overtime_hours") or 0))
-        if overtime < 0:
-            raise HTTPException(400, "ساعات العمل الإضافي لا يمكن أن تكون سالبة")
+        if wid in seen:
+            raise HTTPException(400, f"العامل {wid} مكرر في نفس الطلب")
+        seen.add(wid)
+        status = _validate_status(rec.get("status", "present") or "present")
+        overtime = _validate_overtime(rec.get("overtime_hours"))
+        cleaned.append((rec, wid, status, overtime))
+
+    results = []
+    for rec, wid, status, overtime in cleaned:
+        rec = {**rec, "worker_id": wid, "status": status}
         existing = (await db.execute(
             select(Attendance).where(
                 Attendance.worker_id == rec["worker_id"],
@@ -155,6 +231,8 @@ async def bulk_attendance(data: BulkAttendanceIn, db: AsyncSession = Depends(get
             existing.overtime_hours = overtime
             if rec.get("notes") is not None:
                 existing.notes = rec.get("notes")
+            if existing.status not in _PROJECT_STATUSES:
+                existing.ext_project_id = None
         else:
             att = Attendance(
                 tenant_id=tid,
@@ -206,7 +284,7 @@ async def _week_attendance(week_start: date_type, db: AsyncSession):
     for a in att_records:
         att_map.setdefault(a.worker_id, {})[str(a.date)] = {
             "status": a.status,
-            "overtime": float(a.overtime_hours),
+            "overtime": float(a.overtime_hours or 0),
             "id": a.id,
         }
 
@@ -255,6 +333,8 @@ async def _week_attendance(week_start: date_type, db: AsyncSession):
 async def get_worker_attendance(worker_id: int, month: int, year: int,
                                 db: AsyncSession = Depends(get_db)):
     from calendar import monthrange
+    if not (1 <= month <= 12) or not (1900 <= year <= 9999):
+        raise HTTPException(400, "الشهر أو السنة غير صالحة")
     _, days_in_month = monthrange(year, month)
     start = date_type(year, month, 1)
     end   = date_type(year, month, days_in_month)
@@ -265,6 +345,7 @@ async def get_worker_attendance(worker_id: int, month: int, year: int,
     records = (await db.execute(
         select(Attendance).where(
             Attendance.worker_id == worker_id,
+            Attendance.tenant_id == w.tenant_id,
             Attendance.date >= start,
             Attendance.date <= end,
         ).order_by(Attendance.date)
@@ -280,7 +361,7 @@ async def get_worker_attendance(worker_id: int, month: int, year: int,
         "days_present": total_days,
         "gross_pay": round(total_days * float(w.daily_wage or 0), 2),
         "records": [{"date": str(a.date), "status": a.status,
-                     "overtime": float(a.overtime_hours)} for a in records]
+                     "overtime": float(a.overtime_hours or 0)} for a in records]
     }
 
 
@@ -291,5 +372,6 @@ async def delete_attendance(att_id: int, db: AsyncSession = Depends(get_db)):
     att = await db.get(Attendance, att_id)
     if not att or att.tenant_id != (_ctid_del_att.get() or 1):
         raise HTTPException(404, "سجل الحضور غير موجود")
+    await _ensure_not_in_paid_payroll(db, att.tenant_id, att.date)
     await db.delete(att)
     await db.commit()

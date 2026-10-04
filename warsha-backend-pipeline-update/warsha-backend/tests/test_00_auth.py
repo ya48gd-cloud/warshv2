@@ -154,3 +154,107 @@ async def test_me_with_expired_token(client):
     r = await client.get("/api/v1/auth/me",
                          headers={"Authorization": f"Bearer {expired_token}"})
     assert r.status_code in (401, 403)
+
+
+# ── Core security hardening (live account checks / throttling / validation) ──
+@pytest.mark.asyncio
+async def test_deactivated_user_token_is_rejected(client):
+    u, tenant = await _create_tenant_and_user("deact_user", "Pass1234!")
+    tok = create_token(u.id, u.username, u.role, tenant.id)
+    h = {"Authorization": f"Bearer {tok}"}
+    assert (await client.get("/api/v1/users/", headers=h)).status_code == 200
+    async with TestSessionLocal() as db:
+        row = await db.get(User, u.id)
+        row.is_active = False
+        await db.commit()
+    assert (await client.get("/api/v1/users/", headers=h)).status_code == 401
+    assert (await client.get("/api/v1/auth/me", headers=h)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_demoted_user_loses_admin_rights_immediately(client):
+    u, tenant = await _create_tenant_and_user("demoted_user", "Pass1234!")
+    tok = create_token(u.id, u.username, "admin", tenant.id)
+    h = {"Authorization": f"Bearer {tok}"}
+    async with TestSessionLocal() as db:
+        row = await db.get(User, u.id)
+        row.role = "viewer"
+        await db.commit()
+    r = await client.get("/api/v1/users/", headers=h)
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_disabled_tenant_blocks_token_and_slugless_login(client):
+    u, tenant = await _create_tenant_and_user("tenant_off_user", "Pass1234!")
+    tok = create_token(u.id, u.username, u.role, tenant.id)
+    async with TestSessionLocal() as db:
+        t = await db.get(Tenant, tenant.id)
+        t.is_active = False
+        await db.commit()
+    r = await client.get("/api/v1/users/", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 403
+    r = await client.post("/api/v1/auth/login", json={
+        "username": "tenant_off_user", "password": "Pass1234!"})
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_login_is_throttled_after_repeated_failures(client):
+    from app.api import auth as _auth
+    _auth._login_failures.clear()
+    u, tenant = await _create_tenant_and_user("throttle_user", "RightPass1!")
+    body = {"username": "throttle_user", "password": "wrong!!", "tenant_slug": tenant.slug}
+    for _ in range(_auth._LOGIN_MAX_FAILS):
+        assert (await client.post("/api/v1/auth/login", json=body)).status_code == 401
+    r = await client.post("/api/v1/auth/login", json={**body, "password": "RightPass1!"})
+    assert r.status_code == 429
+    _auth._login_failures.clear()
+    r = await client.post("/api/v1/auth/login", json={**body, "password": "RightPass1!"})
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_signup_rejects_blank_names(client):
+    r = await client.post("/api/v1/auth/signup-internal", json={
+        "workshop_name": "   ", "workshop_slug": "blank-name-shop",
+        "admin_username": "adm", "admin_password": "Secure123!"})
+    assert r.status_code == 400
+    r = await client.post("/api/v1/auth/signup-internal", json={
+        "workshop_name": "ورشة", "workshop_slug": "blank-user-shop",
+        "admin_username": "  ", "admin_password": "Secure123!"})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_user_strips_username_so_login_works(cli, client):
+    r = await cli.post("/api/v1/users/", json={
+        "username": "  spaced_user ", "password": "Pass1234!", "role": "viewer"})
+    assert r.status_code == 201, r.text
+    assert r.json()["username"] == "spaced_user"
+    r = await client.post("/api/v1/auth/login", json={
+        "username": "spaced_user", "password": "Pass1234!", "tenant_slug": "tenant-1"})
+    assert r.status_code == 200
+    r = await cli.post("/api/v1/users/", json={"username": "   ", "password": "Pass1234!"})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_workshop_profile_null_currency_defaults(cli):
+    r = await cli.put("/api/v1/workshop/profile", json={"name": "ورشتي", "currency": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["currency"] == "ج.م"
+    r = await cli.put("/api/v1/workshop/profile", json={"name": "   "})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_logo_extension_not_taken_from_client_filename(cli):
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+    r = await cli.post("/api/v1/workshop/profile/logo",
+                       files={"file": ("evil.html", png, "image/png")})
+    assert r.status_code == 200, r.text
+    r = await cli.get("/api/v1/workshop/profile/logo")
+    assert r.status_code == 200
+    assert "text/html" not in r.headers.get("content-type", "")
+    assert r.headers.get("x-content-type-options") == "nosniff"

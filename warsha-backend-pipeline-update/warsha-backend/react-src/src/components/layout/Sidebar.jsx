@@ -16,6 +16,8 @@ const MODULES = [
           { page: 'inventory',  icon: NavIconBox,  label: 'المخزون' },
           { page: 'stockbatches', icon: NavIconBox, label: 'دفعات المخزون (Lot)' },
           { page: 'warehouses', icon: NavIconBox, label: 'المخازن المنطقية' },
+          // صفحة الجرد كانت مسجّلة في App و ROLE_NAV لكن بدون أي رابط يوصل لها
+          { page: 'stockcount', icon: NavIconBox, label: 'جرد المخزون' },
         ]
       },
       {
@@ -245,7 +247,7 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
     if (!user) return
     const fetchBadges = () => {
       api.reports.installmentsBadge()
-        .then(r => setBadges(b => ({ ...b, overdue_installments: r.overdue_count || 0 })))
+        .then(r => setBadges(b => ({ ...b, overdue_installments: r?.overdue_count || 0 })))
         .catch(bgErr('badge count', () => {}))
     }
     fetchBadges()
@@ -269,7 +271,8 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
   const [activeModule, setActiveModule] = useState(() => {
     const fromCurrent = visibleModules.find(m => m.sections.some(sec => sec.items.some(i => i.page === current)))
     if (fromCurrent) return fromCurrent.id
-    const saved = localStorage.getItem(MODULE_STORAGE_KEY)
+    let saved = null
+    try { saved = localStorage.getItem(MODULE_STORAGE_KEY) } catch { /* تخزين غير متاح */ }
     if (saved && visibleModules.some(m => m.id === saved)) return saved
     return visibleModules[0]?.id
   })
@@ -280,7 +283,7 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
   }, [current])
 
   useEffect(() => {
-    if (activeModule) localStorage.setItem(MODULE_STORAGE_KEY, activeModule)
+    if (activeModule) { try { localStorage.setItem(MODULE_STORAGE_KEY, activeModule) } catch { /* تخزين غير متاح */ } }
   }, [activeModule])
 
   const currentModule = visibleModules.find(m => m.id === activeModule) || visibleModules[0]
@@ -292,7 +295,7 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
   const dashboardAllowed = allowed.includes(DASHBOARD_ITEM.page)
 
   return (
-    <nav className="warsha-sidebar">
+    <nav className="warsha-sidebar" aria-label="القائمة الرئيسية">
       {/* Top: Logo + Collapse toggle */}
       <div className="warsha-sidebar-top">
         <WarshaLogo />
@@ -308,6 +311,8 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
             const isActive = current === DASHBOARD_ITEM.page
             return (
               <button
+                type="button"
+                aria-current={isActive ? 'page' : undefined}
                 className={`warsha-nav-item${isActive ? ' active' : ''}`}
                 onClick={() => onNavigate(DASHBOARD_ITEM.page)}
               >
@@ -325,6 +330,8 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
         {visibleModules.map(m => (
           <button
             key={m.id}
+            type="button"
+            aria-pressed={m.id === activeModule}
             className={`warsha-module-tab${m.id === activeModule ? ' active' : ''}`}
             title={m.label}
             onClick={() => setActiveModule(m.id)}
@@ -344,6 +351,8 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
           return (
             <div key={sec.label} className="warsha-nav-section">
               <button
+                type="button"
+                aria-expanded={!isCollapsed}
                 className="warsha-nav-group-label"
                 onClick={() => toggleSection(sec.label)}
               >
@@ -363,6 +372,8 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
                 return (
                   <button
                     key={item.page}
+                    type="button"
+                    aria-current={isActive ? 'page' : undefined}
                     className={`warsha-nav-item${isActive ? ' active' : ''}`}
                     onClick={() => onNavigate(item.page)}
                   >
@@ -398,7 +409,7 @@ export default function Sidebar({ current, onNavigate, apiStatus }) {
             <div className="warsha-user-name">{user?.full_name || user?.username}</div>
             <div className="warsha-user-role" style={{ color: roleColor }}>{meta?.label}</div>
           </div>
-          <button className="warsha-logout-btn" onClick={logout} title="تسجيل الخروج">
+          <button type="button" className="warsha-logout-btn" onClick={logout} title="تسجيل الخروج" aria-label="تسجيل الخروج">
             <NavIconLogout />
           </button>
         </div>

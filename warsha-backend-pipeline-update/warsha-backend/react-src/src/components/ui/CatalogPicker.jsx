@@ -6,7 +6,80 @@ const hdr = (json=false) => ({ ...(json?{'Content-Type':'application/json'}:{}),
 
 const ICONS = { 'حديد وصلب':'🔩','ألمونيوم':'🪨','نحاس':'🟡','بلاستيك وبولي':'🟠','كيماويات':'🧪','كهرباء':'⚡','موتورات':'⚙️','أدوات':'🔧','عام':'📦' }
 
-export default function CatalogPicker({ open, onImport, onSelect, onClose }) {
+// الغلاف: بيقرر أي منتقي يتعرض. قبل كده كان فيه `if (open === false) return null`
+// قبل الـ hooks (مخالفة لقواعد React hooks)، وكمان صفحة كتالوج الأسعار كانت
+// بتبعت onlySource='material'|'equipment' عشان تجيب تكلفة مادة/معدة من المخزون،
+// لكن المكوّن كان بيتجاهلها ويعرض الكتالوج العام — فالاختيار كان بيستورد مادة
+// جديدة بدل ما يرجّع id المادة/المعدة، و cost-source كان بيفشل.
+export default function CatalogPicker(props) {
+  if (props.open === false) return null
+  if (props.onlySource === 'material' || props.onlySource === 'equipment') return <SourcePicker {...props} />
+  return <GlobalCatalogPicker {...props} />
+}
+
+// منتقي مادة/معدة من بيانات الورشة نفسها (يستخدم /price-catalog/search/unified)
+function SourcePicker({ onlySource, onSelect, onClose }) {
+  const [q, setQ] = useState('')
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const t = setTimeout(async () => {
+      setLoading(true); setError('')
+      try {
+        const p = new URLSearchParams()
+        if (q) p.append('q', q)
+        const r = await fetch(`${BASE}/price-catalog/search/unified?${p}`, { headers: hdr() })
+        const data = await r.json().catch(() => null)
+        if (!r.ok) throw new Error((data && typeof data.detail === 'string' && data.detail) || 'تعذّر تحميل القائمة')
+        if (!cancelled) setItems((Array.isArray(data) ? data : []).filter(it => it.source === onlySource))
+      } catch (e) {
+        if (!cancelled) { setItems([]); setError(e.message || 'تعذّر تحميل القائمة') }
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }, 300)
+    return () => { cancelled = true; clearTimeout(t) }
+  }, [q, onlySource])
+
+  const title = onlySource === 'material' ? '🧱 اختر مادة من المخزون' : '⚙️ اختر معدة'
+  return (
+    <div style={{ position:'fixed',inset:0,background:'rgba(0,0,0,.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:9999,direction:'rtl',fontFamily:'Cairo,sans-serif' }}
+      onClick={e => e.target === e.currentTarget && onClose?.()}>
+      <div style={{ background:'var(--surface,#fff)',borderRadius:16,width:'90%',maxWidth:560,maxHeight:'80vh',display:'flex',flexDirection:'column',boxShadow:'0 20px 60px rgba(0,0,0,.3)',border:'1px solid var(--border,#E8E6E0)' }}>
+        <div style={{ padding:'14px 18px',borderBottom:'1px solid var(--border,#E8E6E0)',display:'flex',justifyContent:'space-between',alignItems:'center' }}>
+          <div style={{ fontWeight:800,fontSize:15,color:'var(--text,#1A1A2E)' }}>{title}</div>
+          <button onClick={onClose} style={{ background:'none',border:'none',fontSize:22,cursor:'pointer',color:'var(--muted,#7A7870)' }}>✕</button>
+        </div>
+        <div style={{ padding:'10px 18px',borderBottom:'1px solid var(--border,#E8E6E0)' }}>
+          <input autoFocus value={q} onChange={e=>setQ(e.target.value)} placeholder="🔍 ابحث بالاسم أو الكود..."
+            style={{ padding:'8px 10px',border:'1px solid var(--border,#E8E6E0)',borderRadius:7,fontSize:13,outline:'none',boxSizing:'border-box',width:'100%' }} />
+        </div>
+        <div style={{ flex:1,overflowY:'auto',padding:'6px 0' }}>
+          {loading ? <div style={{ padding:30,textAlign:'center',color:'var(--muted,#7A7870)' }}>جاري البحث...</div>
+          : error ? <div style={{ padding:30,textAlign:'center',color:'#C0392B' }}>⚠️ {error}</div>
+          : items.length === 0 ? <div style={{ padding:30,textAlign:'center',color:'var(--muted,#7A7870)' }}>لا توجد نتائج</div>
+          : items.map(it => (
+            <div key={`${it.source}-${it.id}`} onClick={() => onSelect?.(it)}
+              style={{ padding:'10px 18px',cursor:'pointer',display:'flex',justifyContent:'space-between',gap:12,borderBottom:'1px solid var(--border,#E8E6E0)' }}>
+              <div style={{ minWidth:0 }}>
+                <div style={{ fontWeight:700,fontSize:13,color:'var(--text,#1A1A2E)' }}>{it.name}</div>
+                <div style={{ fontSize:11,color:'var(--muted,#7A7870)' }}>{it.model_no || '—'} · {it.unit}</div>
+              </div>
+              <div style={{ fontSize:12,fontWeight:700,color:'var(--teal,#0F6E56)',whiteSpace:'nowrap' }}>
+                {Number(it.cost_price || 0).toLocaleString('ar-EG', { maximumFractionDigits: 2, numberingSystem: 'latn' })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function GlobalCatalogPicker({ onImport, onSelect, onClose }) {
   const [q, setQ] = useState('')
   const [cat, setCat] = useState('')
   const [cats, setCats] = useState([])
@@ -16,8 +89,6 @@ export default function CatalogPicker({ open, onImport, onSelect, onClose }) {
   const [form, setForm] = useState({ unit_cost:'', stock_qty:'0', reorder_level:'0' })
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
-
-  if (open === false) return null
 
   useEffect(() => {
     fetch(`${BASE}/catalog/categories`, { headers: hdr() }).then(r=>r.json()).then(r=>setCats(Array.isArray(r)?r:[])).catch(()=>{})
@@ -36,14 +107,22 @@ export default function CatalogPicker({ open, onImport, onSelect, onClose }) {
   useEffect(() => { const t = setTimeout(search, 300); return ()=>clearTimeout(t) }, [q, cat, search])
 
   async function doImport() {
-    if (!sel) return
+    if (!sel || busy) return
+    // نفس فحوصات الباك-إند (ImportIn) — قيم سالبة مرفوضة
+    if (['unit_cost','stock_qty','reorder_level'].some(k => form[k] !== '' && Number(form[k]) < 0)) {
+      setMsg('❌ القيم لا يمكن أن تكون سالبة'); return
+    }
     setBusy(true); setMsg('')
     const res = await fetch(`${BASE}/catalog/${sel.id}/import`, {
       method:'POST', headers: hdr(true),
       body: JSON.stringify({ unit_cost: parseFloat(form.unit_cost)||0, stock_qty: parseFloat(form.stock_qty)||0, reorder_level: parseFloat(form.reorder_level)||0 })
-    }).then(r=>r.json()).catch(()=>({}))
+    }).then(r=>r.json()).catch(()=>({ detail: 'تعذر الاتصال بالخادم' }))
     if (res.material_id) { setMsg(`✅ ${res.message}`); onImport&&onImport(res); onSelect&&onSelect(res); setTimeout(onClose,1500) }
-    else setMsg(`❌ ${res.detail||'خطأ في الاستيراد'}`)
+    else {
+      const d = res.detail
+      const txt = typeof d === 'string' ? d : Array.isArray(d) ? d.map(x => x?.msg || '').filter(Boolean).join('، ') : ''
+      setMsg(`❌ ${txt || 'خطأ في الاستيراد'}`)
+    }
     setBusy(false)
   }
 

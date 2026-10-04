@@ -27,7 +27,11 @@ function StatusPill({ status }) {
   )
 }
 
-const today = () => new Date().toISOString().slice(0, 10)
+// التاريخ المحلي (toISOString بيرجع UTC فممكن يطلع تاريخ امبارح/بكرة)
+const today = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 const emptyItem = () => ({ description: '', qty: 1, unit: 'وحدة', unit_price: 0, sort_order: 0 })
 
 export default function WorkCompletionCerts() {
@@ -39,6 +43,9 @@ export default function WorkCompletionCerts() {
   const [showDetail, setShowDetail] = useState(false)
   const [confirmDel, setConfirmDel] = useState(null)
   const [saving, setSaving]       = useState(false)
+  const [acting, setActing]       = useState(false)   // منع الضغط المزدوج على إصدار/حذف/تحويل
+  const [confirmIssue, setConfirmIssue] = useState(null)
+  const [fromContractId, setFromContractId] = useState('')
   const [filterStatus, setFilter] = useState('')
 
   const { data: customers = [] }       = useApi(() => api.customers.list())
@@ -61,7 +68,7 @@ export default function WorkCompletionCerts() {
       const p = filterStatus ? { status: filterStatus } : {}
       const data = await api.workCompletionCerts.list(p)
       setCerts(Array.isArray(data) ? data : [])
-    } catch { addToast('خطأ في التحميل', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في التحميل', 'error') }
     finally { setLoading(false) }
   }, [filterStatus])
 
@@ -77,7 +84,7 @@ export default function WorkCompletionCerts() {
     draft:    certs.filter(c => c.status === 'draft').length,
     issued:   certs.filter(c => c.status === 'issued').length,
     totalVal: certs.filter(c => c.status === 'issued')
-                   .reduce((s, c) => s + (c.contract_value || 0), 0),
+                   .reduce((s, c) => s + (Number(c.contract_value) || 0), 0),
   }
 
   /* ── line helpers ── */
@@ -88,8 +95,24 @@ export default function WorkCompletionCerts() {
 
   /* ── create ── */
   const handleCreate = async () => {
+    if (saving) return
     if (!form.customer_id)   return addToast('اختر العميل', 'error')
-    if (!form.project_name)  return addToast('أدخل اسم المشروع', 'error')
+    if (!String(form.project_name || '').trim())  return addToast('أدخل اسم المشروع', 'error')
+    if (!form.date)          return addToast('أدخل تاريخ الشهادة', 'error')
+    if (form.start_date && form.end_date && form.end_date < form.start_date)
+      return addToast('تاريخ انتهاء العمل يجب أن يكون بعد تاريخ بدايته', 'error')
+    const cv = form.contract_value === '' ? 0 : Number(form.contract_value)
+    if (!Number.isFinite(cv) || cv < 0) return addToast('قيمة العقد لا يمكن أن تكون سالبة', 'error')
+    // كان parseInt(...) || 12 بيحوّل صفر (بدون ضمان) لـ 12 شهر بصمت
+    const months = Number(form.warranty_months)
+    if (form.warranty_months === '' || !Number.isInteger(months) || months < 0)
+      return addToast('فترة الضمان لازم تكون عدد صحيح من الشهور (صفر أو أكثر)', 'error')
+    const usedItems = form.items.filter(it => String(it.description || '').trim())
+    for (const it of usedItems) {
+      const q = Number(it.qty), p = it.unit_price === '' ? 0 : Number(it.unit_price)
+      if (!Number.isFinite(q) || q <= 0) return addToast(`كمية البند "${it.description}" يجب أن تكون أكبر من صفر`, 'error')
+      if (!Number.isFinite(p) || p < 0)  return addToast(`سعر الوحدة للبند "${it.description}" لا يمكن أن يكون سالباً`, 'error')
+    }
     setSaving(true)
     try {
       const payload = {
@@ -97,21 +120,21 @@ export default function WorkCompletionCerts() {
         invoice_id:       form.invoice_id  ? parseInt(form.invoice_id)  : null,
         contract_id:      form.contract_id ? parseInt(form.contract_id) : null,
         date:             form.date,
-        project_name:     form.project_name,
+        project_name:     String(form.project_name).trim(),
         project_location: form.project_location || null,
         start_date:       form.start_date || null,
         end_date:         form.end_date || null,
-        contract_value:   parseFloat(form.contract_value) || 0,
-        warranty_months:  parseInt(form.warranty_months) || 12,
+        contract_value:   cv,
+        warranty_months:  months,
         scope_summary:    form.scope_summary || null,
         notes:            form.notes || null,
-        items: form.items.map((it, i) => ({
-          description: it.description,
-          qty:         parseFloat(it.qty) || 1,
+        items: usedItems.map((it, i) => ({
+          description: String(it.description).trim(),
+          qty:         Number(it.qty),
           unit:        it.unit || 'وحدة',
-          unit_price:  parseFloat(it.unit_price) || 0,
+          unit_price:  Number(it.unit_price) || 0,
           sort_order:  i,
-        })).filter(it => it.description),
+        })),
       }
       await api.workCompletionCerts.create(payload)
       addToast('تم إنشاء الشهادة', 'success')
@@ -133,26 +156,38 @@ export default function WorkCompletionCerts() {
 
   /* ── from contract ── */
   const handleFromContract = async (cid) => {
-    if (!cid) return
+    if (!cid || acting) return
+    setFromContractId(cid)
+    setActing(true)
     try {
       await api.workCompletionCerts.fromContract(cid)
       addToast('تم إنشاء شهادة إتمام من العقد', 'success')
       load()
     } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    finally {
+      setActing(false)
+      // نرجّع القائمة لوضعها الأصلي عشان نفس العقد يقدر يتختار تاني (والتحويل ميتكررش بالغلط)
+      setFromContractId('')
+    }
   }
 
   /* ── issue ── */
   const handleIssue = async (id) => {
+    if (acting) return
+    setActing(true)
     try {
       await api.workCompletionCerts.issue(id)
       addToast('تم إصدار الشهادة', 'success')
       setShowDetail(false)
       load()
     } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    finally { setActing(false) }
   }
 
   /* ── delete ── */
   const handleDelete = async (id) => {
+    if (acting) return
+    setActing(true)
     try {
       await api.workCompletionCerts.delete(id)
       addToast('تم الحذف', 'success')
@@ -160,6 +195,7 @@ export default function WorkCompletionCerts() {
       setShowDetail(false)
       load()
     } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    finally { setActing(false) }
   }
 
   const printCert = (id) => api.print(`/work-completion-certs/${id}/print`)
@@ -212,12 +248,13 @@ export default function WorkCompletionCerts() {
           <option value="issued">صادرة</option>
         </select>
 
-        <select defaultValue=""
+        <select value={fromContractId} disabled={acting}
           onChange={e => handleFromContract(e.target.value)}
           style={{ border: '1px solid #E5E7EB', borderRadius: 8, padding: '7px 12px',
             fontSize: 13, fontFamily: 'inherit', background: '#fff' }}>
           <option value="">← إنشاء من عقد توريد</option>
-          {(Array.isArray(supplyContracts) ? supplyContracts : []).map(sc => (
+          {/* العقود الملغاة لا يصح إصدار شهادة إتمام لها */}
+          {(Array.isArray(supplyContracts) ? supplyContracts : []).filter(sc => sc.status !== 'cancelled').map(sc => (
             <option key={sc.id} value={sc.id}>{sc.code} — {sc.customer_name}</option>
           ))}
         </select>
@@ -334,7 +371,7 @@ export default function WorkCompletionCerts() {
                   <tr style={{ background: 'linear-gradient(90deg,#3d2600,#B8892A)', color: '#fff' }}>
                     <td colSpan={5} style={{ padding: '10px 12px', fontWeight: 700 }}>إجمالي الأعمال</td>
                     <td style={{ padding: '10px 12px', fontWeight: 900, fontSize: 15 }}>
-                      {egp(selected.items.reduce((s, it) => s + it.total_price, 0))}
+                      {egp(selected.items.reduce((s, it) => s + (Number(it.total_price) || 0), 0))}
                     </td>
                   </tr>
                 </tbody>
@@ -361,14 +398,15 @@ export default function WorkCompletionCerts() {
               🖨️ طباعة
             </button>
             {selected.status === 'draft' && (
-              <button onClick={() => handleIssue(selected.id)}
+              <button onClick={() => setConfirmIssue(selected.id)} disabled={acting}
                 style={{ background: '#15803D', color: '#fff', border: 'none', borderRadius: 8,
-                  padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
-                ✅ إصدار الشهادة
+                  padding: '9px 20px', fontWeight: 700, cursor: acting ? 'not-allowed' : 'pointer',
+                  opacity: acting ? .7 : 1, fontFamily: 'inherit' }}>
+                {acting ? 'جاري…' : '✅ إصدار الشهادة'}
               </button>
             )}
             {selected.status === 'draft' && (
-              <button onClick={() => setConfirmDel(selected.id)}
+              <button onClick={() => setConfirmDel(selected.id)} disabled={acting}
                 style={{ background: '#FEE2E2', color: '#991B1B', border: 'none', borderRadius: 8,
                   padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
                 🗑️ حذف
@@ -452,7 +490,7 @@ export default function WorkCompletionCerts() {
             {/* Warranty */}
             <div>
               <label style={{ fontSize: 12, fontWeight: 700, color: '#374151', display: 'block', marginBottom: 5 }}>فترة الضمان (شهر)</label>
-              <input type="number" min="0" value={form.warranty_months}
+              <input type="number" min="0" step="1" value={form.warranty_months}
                 onChange={e => setForm(f => ({ ...f, warranty_months: e.target.value }))}
                 style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                   padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}/>
@@ -465,7 +503,9 @@ export default function WorkCompletionCerts() {
                 style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                   padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}>
                 <option value="">بدون عقد</option>
-                {(Array.isArray(supplyContracts) ? supplyContracts : []).map(sc => (
+                {(Array.isArray(supplyContracts) ? supplyContracts : [])
+                  .filter(sc => !form.customer_id || String(sc.customer_id) === String(form.customer_id) || String(sc.id) === String(form.contract_id))
+                  .map(sc => (
                   <option key={sc.id} value={sc.id}>{sc.code} — {sc.customer_name}</option>
                 ))}
               </select>
@@ -477,7 +517,9 @@ export default function WorkCompletionCerts() {
                 style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                   padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}>
                 <option value="">بدون فاتورة</option>
-                {(Array.isArray(invoices) ? invoices : []).map(inv => (
+                {(Array.isArray(invoices) ? invoices : [])
+                  .filter(inv => !form.customer_id || !inv.customer_id || String(inv.customer_id) === String(form.customer_id) || String(inv.id) === String(form.invoice_id))
+                  .map(inv => (
                   <option key={inv.id} value={inv.id}>{inv.code}</option>
                 ))}
               </select>
@@ -600,6 +642,15 @@ export default function WorkCompletionCerts() {
         confirmVariant="danger"
         onConfirm={() => handleDelete(confirmDel)}
         onCancel={() => setConfirmDel(null)}
+      />
+
+      <ConfirmDialog
+        open={!!confirmIssue}
+        title="إصدار شهادة الإتمام"
+        message="بعد الإصدار لا يمكن حذف الشهادة. هل تريد المتابعة؟"
+        confirmLabel="إصدار"
+        onConfirm={() => handleIssue(confirmIssue)}
+        onCancel={() => setConfirmIssue(null)}
       />
     </div>
   )

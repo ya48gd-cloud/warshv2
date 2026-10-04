@@ -21,15 +21,31 @@ function StatusPill({ status }) {
   )
 }
 
+// عدد الأيام المتبقية حتى تاريخ (YYYY-MM-DD) محسوبة على التاريخ المحلي —
+// new Date('YYYY-MM-DD') بيتفسّر UTC فكان الضمان اللي بينتهي النهارده يظهر "منتهي".
+function daysUntil(end) {
+  if (!end) return null
+  const [y, m, d] = String(end).slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return null
+  const now = new Date()
+  const todayMid = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  return Math.round((new Date(y, m - 1, d) - todayMid) / 86400000)
+}
+
 function DaysLeft({ end }) {
   if (!end) return null
-  const days = Math.ceil((new Date(end) - new Date()) / 86400000)
+  const days = daysUntil(end)
+  if (days === null) return null
   if (days < 0)  return <span style={{ color: '#991B1B', fontWeight: 700, fontSize: 11 }}>منتهي</span>
   if (days < 30) return <span style={{ color: '#D97706', fontWeight: 700, fontSize: 11 }}>{days} يوم</span>
   return <span style={{ color: '#15803D', fontSize: 11 }}>{days} يوم</span>
 }
 
-const today = () => new Date().toISOString().slice(0, 10)
+// التاريخ المحلي (toISOString بيرجع UTC فممكن يطلع تاريخ امبارح/بكرة)
+const today = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 
 export default function WarrantyCerts() {
   const addToast = useToast()
@@ -40,6 +56,8 @@ export default function WarrantyCerts() {
   const [showDetail, setShowDetail] = useState(false)
   const [confirmDel, setConfirmDel] = useState(null)
   const [saving, setSaving]       = useState(false)
+  const [acting, setActing]       = useState(false)   // منع الضغط المزدوج على إصدار/حذف
+  const [confirmIssue, setConfirmIssue] = useState(null)
   const [filterStatus, setFilter] = useState('')
   const [filterExp, setFilterExp] = useState('')    // expiring | expired
 
@@ -63,13 +81,12 @@ export default function WarrantyCerts() {
       const data = await api.warrantyCerts.list(p)
       let list = Array.isArray(data) ? data : []
       if (filterExp === 'expiring') {
-        const cutoff = new Date(); cutoff.setDate(cutoff.getDate() + 30)
-        list = list.filter(c => new Date(c.warranty_end) <= cutoff && new Date(c.warranty_end) >= new Date())
+        list = list.filter(c => { const d = daysUntil(c.warranty_end); return d !== null && d >= 0 && d <= 30 })
       } else if (filterExp === 'expired') {
-        list = list.filter(c => new Date(c.warranty_end) < new Date())
+        list = list.filter(c => { const d = daysUntil(c.warranty_end); return d !== null && d < 0 })
       }
       setCerts(list)
-    } catch { addToast('خطأ في التحميل', 'error') }
+    } catch (e) { addToast(e?.message || 'خطأ في التحميل', 'error') }
     finally { setLoading(false) }
   }, [filterStatus, filterExp])
 
@@ -77,19 +94,24 @@ export default function WarrantyCerts() {
 
   const stats = {
     total:    certs.length,
-    active:   certs.filter(c => new Date(c.warranty_end) >= new Date()).length,
+    active:   certs.filter(c => (daysUntil(c.warranty_end) ?? -1) >= 0).length,
     expiring: certs.filter(c => {
-      const d = new Date(c.warranty_end), now = new Date()
-      const cut = new Date(); cut.setDate(cut.getDate() + 30)
-      return d >= now && d <= cut
+      const d = daysUntil(c.warranty_end)
+      return d !== null && d >= 0 && d <= 30
     }).length,
-    expired:  certs.filter(c => new Date(c.warranty_end) < new Date()).length,
+    expired:  certs.filter(c => (daysUntil(c.warranty_end) ?? 0) < 0).length,
   }
 
   const handleCreate = async () => {
+    if (saving) return
     if (!form.customer_id)   return addToast('اختر العميل', 'error')
-    if (!form.product_name)  return addToast('أدخل اسم المنتج', 'error')
+    if (!String(form.product_name || '').trim())  return addToast('أدخل اسم المنتج', 'error')
+    if (!form.date)           return addToast('أدخل تاريخ الشهادة', 'error')
     if (!form.warranty_start) return addToast('أدخل تاريخ بداية الضمان', 'error')
+    // كان parseInt(...) || 12 بيحوّل أي قيمة غير صالحة (أو صفر) لـ 12 شهر بصمت
+    const months = Number(form.warranty_months)
+    if (form.warranty_months === '' || !Number.isInteger(months) || months < 1)
+      return addToast('مدة الضمان لازم تكون عدد صحيح من الشهور أكبر من صفر', 'error')
     setSaving(true)
     try {
       const payload = {
@@ -97,10 +119,10 @@ export default function WarrantyCerts() {
         invoice_id:      form.invoice_id ? parseInt(form.invoice_id) : null,
         wcc_id:          form.wcc_id ? parseInt(form.wcc_id) : null,
         date:            form.date,
-        product_name:    form.product_name,
+        product_name:    String(form.product_name).trim(),
         model_no:        form.model_no || null,
         serial_no:       form.serial_no || null,
-        warranty_months: parseInt(form.warranty_months) || 12,
+        warranty_months: months,
         warranty_start:  form.warranty_start,
         covered_items:   form.covered_items || null,
         exclusions:      form.exclusions || null,
@@ -126,15 +148,20 @@ export default function WarrantyCerts() {
   })
 
   const handleIssue = async (id) => {
+    if (acting) return
+    setActing(true)
     try {
       await api.warrantyCerts.issue(id)
       addToast('تم إصدار شهادة الضمان', 'success')
       setShowDetail(false)
       load()
     } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    finally { setActing(false) }
   }
 
   const handleDelete = async (id) => {
+    if (acting) return
+    setActing(true)
     try {
       await api.warrantyCerts.delete(id)
       addToast('تم الحذف', 'success')
@@ -142,6 +169,7 @@ export default function WarrantyCerts() {
       setShowDetail(false)
       load()
     } catch (e) { addToast(e?.message || 'خطأ', 'error') }
+    finally { setActing(false) }
   }
 
   const printCert = (id) => api.print(`/warranty-certs/${id}/print`)
@@ -332,14 +360,15 @@ export default function WarrantyCerts() {
               🖨️ طباعة
             </button>
             {selected.status === 'draft' && (
-              <button onClick={() => handleIssue(selected.id)}
+              <button onClick={() => setConfirmIssue(selected.id)} disabled={acting}
                 style={{ background: '#15803D', color: '#fff', border: 'none', borderRadius: 8,
-                  padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
-                ✅ إصدار الشهادة
+                  padding: '9px 20px', fontWeight: 700, cursor: acting ? 'not-allowed' : 'pointer',
+                  opacity: acting ? .7 : 1, fontFamily: 'inherit' }}>
+                {acting ? 'جاري…' : '✅ إصدار الشهادة'}
               </button>
             )}
             {selected.status === 'draft' && (
-              <button onClick={() => setConfirmDel(selected.id)}
+              <button onClick={() => setConfirmDel(selected.id)} disabled={acting}
                 style={{ background: '#FEE2E2', color: '#991B1B', border: 'none', borderRadius: 8,
                   padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
                 🗑️ حذف
@@ -365,7 +394,7 @@ export default function WarrantyCerts() {
               { label: 'اسم المنتج *', field: 'product_name', type: 'text', placeholder: 'اسم الجهاز / المنتج', col: 2 },
               { label: 'الموديل', field: 'model_no', type: 'text', placeholder: 'رقم الموديل' },
               { label: 'الرقم التسلسلي', field: 'serial_no', type: 'text', placeholder: 'S/N' },
-              { label: 'مدة الضمان (شهر)', field: 'warranty_months', type: 'number' },
+              { label: 'مدة الضمان (شهر) *', field: 'warranty_months', type: 'number', min: 1, step: 1 },
               { label: 'تاريخ بداية الضمان *', field: 'warranty_start', type: 'date' },
               { label: 'للتواصل والصيانة', field: 'service_contact', type: 'text', placeholder: 'رقم هاتف أو بريد' },
             ].map(f => (
@@ -382,6 +411,7 @@ export default function WarrantyCerts() {
                 ) : (
                   <input type={f.type} value={form[f.field]}
                     placeholder={f.placeholder || ''}
+                    min={f.min} step={f.step}
                     onChange={e => setForm(frm => ({ ...frm, [f.field]: e.target.value }))}
                     style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                       padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}/>
@@ -396,7 +426,9 @@ export default function WarrantyCerts() {
                 style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                   padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}>
                 <option value="">بدون فاتورة</option>
-                {(Array.isArray(invoices) ? invoices : []).map(inv => (
+                {(Array.isArray(invoices) ? invoices : [])
+                  .filter(inv => !form.customer_id || !inv.customer_id || String(inv.customer_id) === String(form.customer_id) || String(inv.id) === String(form.invoice_id))
+                  .map(inv => (
                   <option key={inv.id} value={inv.id}>{inv.code}</option>
                 ))}
               </select>
@@ -408,7 +440,9 @@ export default function WarrantyCerts() {
                 style={{ width: '100%', border: '1px solid #D1D5DB', borderRadius: 8,
                   padding: '8px 12px', fontSize: 13, fontFamily: 'inherit' }}>
                 <option value="">بدون ربط</option>
-                {(Array.isArray(wccList) ? wccList : []).map(w => (
+                {(Array.isArray(wccList) ? wccList : [])
+                  .filter(w => !form.customer_id || !w.customer_id || String(w.customer_id) === String(form.customer_id) || String(w.id) === String(form.wcc_id))
+                  .map(w => (
                   <option key={w.id} value={w.id}>{w.code} — {w.project_name}</option>
                 ))}
               </select>
@@ -464,6 +498,15 @@ export default function WarrantyCerts() {
         confirmVariant="danger"
         onConfirm={() => handleDelete(confirmDel)}
         onCancel={() => setConfirmDel(null)}
+      />
+
+      <ConfirmDialog
+        open={!!confirmIssue}
+        title="إصدار شهادة الضمان"
+        message="بعد الإصدار لا يمكن حذف الشهادة. هل تريد المتابعة؟"
+        confirmLabel="إصدار"
+        onConfirm={() => handleIssue(confirmIssue)}
+        onCancel={() => setConfirmIssue(null)}
       />
     </div>
   )

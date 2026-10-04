@@ -136,3 +136,126 @@ async def test_two_tenants_same_operation_no_clash(cli, cli2):
     assert r2.status_code == 201
     # IDs are different (even if names match)
     assert r1.json()["id"] != r2.json()["id"]
+
+
+# ════════════════ BULK UPDATE / DELETE ISOLATION (shell) ═════════════
+@pytest.mark.asyncio
+async def test_bulk_update_delete_scoped_to_current_tenant():
+    """فلتر الـ tenant التلقائي كان على SELECT بس — أي update(Model)/delete(Model)
+    جماعي من جوه طلب ورشة كان بيعدّل/يمسح صفوف كل الورش."""
+    from sqlalchemy import update, delete, select
+    from app.core.database import current_tenant_id
+    from app.models.models import MaterialCategory
+    from tests.conftest import TestSessionLocal
+
+    tok = current_tenant_id.set(1)
+    try:
+        async with TestSessionLocal() as s:
+            r = await s.execute(update(MaterialCategory).values(name_en="HACKED"))
+            assert r.rowcount == 1
+            r = await s.execute(delete(MaterialCategory).where(MaterialCategory.id.in_([1, 2])))
+            assert r.rowcount == 1
+            await s.rollback()
+    finally:
+        current_tenant_id.reset(tok)
+
+    # خارج سياق الطلب (مهام خلفية/سوبر أدمن) — بدون فلترة كما كان
+    async with TestSessionLocal() as s:
+        r = await s.execute(
+            select(MaterialCategory.name_en).where(MaterialCategory.id == 2)
+        )
+        assert r.scalar_one() == "General"
+        r = await s.execute(update(MaterialCategory).values(name_en="X"))
+        assert r.rowcount == 2
+        await s.rollback()
+
+
+@pytest.mark.asyncio
+async def test_cert_codes_do_not_collide_across_tenants(cli, cli2):
+    """WCC/WR code عليه UNIQUE على مستوى الجدول كله؛ ورشة تانية كانت بتولّد
+    WCC-0001 / WR-0001 المستخدم عند ورشة أولى فتقع في 500."""
+    c1 = (await cli.post(CUST, json={"name": "عميل شهادات 1"})).json()["id"]
+    c2 = (await cli2.post(CUST, json={"name": "عميل شهادات 2"})).json()["id"]
+    wr = {"date": "2026-01-01", "product_name": "خلاط", "warranty_months": 12,
+          "warranty_start": "2026-01-01"}
+    r1 = await cli.post("/api/v1/warranty-certs", json={**wr, "customer_id": c1})
+    assert r1.status_code == 201, r1.text
+    r2 = await cli2.post("/api/v1/warranty-certs", json={**wr, "customer_id": c2})
+    assert r2.status_code == 201, r2.text
+    assert r1.json()["code"] != r2.json()["code"]
+
+
+@pytest.mark.asyncio
+async def test_unhandled_integrity_error_returns_409_without_leak(client):
+    """IntegrityError غير ممسوك كان بيرجع 500 عام؛ دلوقتي 409 برسالة عربية
+    من غير نص الخطأ الخام (أسماء الجداول/القيود)."""
+    from fastapi.routing import APIRoute
+    from sqlalchemy.exc import IntegrityError
+    from app.main import app
+
+    async def _boom():
+        raise IntegrityError("INSERT INTO secret_table ...", {}, Exception("UNIQUE constraint failed: secret_table.code"))
+
+    route = APIRoute("/__test_integrity_boom", _boom, methods=["GET"])
+    app.router.routes.append(route)
+    try:
+        r = await client.get("/__test_integrity_boom")
+    finally:
+        app.router.routes.remove(route)
+    assert r.status_code == 409
+    assert "secret_table" not in r.text
+    assert r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_stock_count_sessions_isolated(cli, cli2):
+    r = await cli.post("/api/v1/production/stock-count")
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    own = await cli.get("/api/v1/production/stock-count")
+    assert sid in [x["id"] for x in own.json()]
+    other = await cli2.get("/api/v1/production/stock-count")
+    assert other.status_code == 200
+    assert sid not in [x["id"] for x in other.json()]
+    # الجلسة مش قابلة للإغلاق من ورشة تانية
+    r2 = await cli2.post(f"/api/v1/production/stock-count/{sid}/close")
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_customer_ledger_cross_tenant_404(cli, cli2):
+    cid = (await cli.post(CUST, json={"name": "عميل كشف"})).json()["id"]
+    assert (await cli.get(f"{CUST}/{cid}/ledger")).status_code == 200
+    assert (await cli2.get(f"{CUST}/{cid}/ledger")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_smart_alerts_and_mrp_never_default_to_tenant_1(cli):
+    """get_smart_alerts/run_mrp كانوا بيرجعوا لـ tenant 1 لو مفيش tenant."""
+    from app.services.production import get_smart_alerts, run_mrp
+    from app.core.database import current_tenant_id
+    from tests.conftest import TestSessionLocal
+    # مادة ناقصة عند tenant 1 → كانت هتظهر في التنبيهات/الـ MRP لطلب بدون ورشة
+    r = await cli.post(INV + "/materials", json={
+        "code": "LOW-1", "name_ar": "ناقصة", "name_en": "low", "unit": "kg",
+        "unit_cost": 10, "reorder_level": 100, "category_id": 1})
+    assert r.status_code in (200, 201), r.text
+    assert current_tenant_id.get() is None
+    async with TestSessionLocal() as s:
+        assert await get_smart_alerts(s) == []
+        assert await run_mrp(s) == []
+
+
+@pytest.mark.asyncio
+async def test_viewer_blocked_from_writes_on_remaining_routers(client):
+    """field-service / ext-projects / supply-contracts / WCC / warranty كانوا
+    require_any بس — viewer يقدر يكتب بطلب API مباشر."""
+    from app.api.auth import create_token
+    tok = create_token(user_id=990777, username="viewer_shell", role="viewer", tenant_id=1)
+    h = {"Authorization": f"Bearer {tok}"}
+    for base in ("/api/v1/field-service/orders", "/api/v1/ext-projects",
+                 "/api/v1/supply-contracts", "/api/v1/work-completion-certs",
+                 "/api/v1/warranty-certs"):
+        assert (await client.get(base, headers=h)).status_code == 200, base
+        r = await client.post(base, json={}, headers=h)
+        assert r.status_code == 403, (base, r.status_code)

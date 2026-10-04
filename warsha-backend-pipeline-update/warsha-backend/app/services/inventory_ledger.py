@@ -145,6 +145,99 @@ async def get_or_create_warehouse_bin(db: AsyncSession, tenant_id: int, warehous
     return loc
 
 
+_COMPOSITE_PREFIX_WAREHOUSE = (
+    ("WIP-", "WIP"), ("FG-", "FG"), ("SCRAP-", "SCRAP"), ("REMNANT-", "REMNANT"),
+)
+
+
+async def reconcile_unlocated_stock(db: AsyncSession) -> int:
+    """
+    يضمن إن SUM(StockQuant.qty) لكل مادة = Material.stock_qty.
+
+    المخزون اللي اتسجّل قبل تفعيل المواقع (بيانات قديمة / ترحيل من Access /
+    حركات من غير location) بيبقى جوه stock_qty بس من غير أي StockQuant، فكل
+    حاجة بتعتمد على رصيد الموقع (الحجز لأوامر الإنتاج، التحويل بين المخازن،
+    عرض رصيد كل مخزن) كانت بتشوفه صفر. الفرق الموجب بيتحط في المخزن الطبيعي
+    للمادة: WIP/FG/SCRAP/REMNANT للمواد المركّبة حسب الكود، وRAW لغير كده.
+    الفرق السالب (مواقع أكتر من الإجمالي) بيتساب زي ما هو ويتسجل في اللوج.
+    Idempotent — آمن يتنادى مع كل تشغيل. لا يعمل commit.
+    """
+    import logging
+    log = logging.getLogger("erp.inventory")
+
+    located = dict((await db.execute(
+        select(StockQuant.material_id, func.coalesce(func.sum(StockQuant.qty), 0))
+        .group_by(StockQuant.material_id)
+    )).all())
+    fixed = 0
+    for mat in (await db.execute(select(Material))).scalars():
+        total = Decimal(str(mat.stock_qty or 0))
+        gap = total - Decimal(str(located.get(mat.id, 0) or 0))
+        if gap == 0:
+            continue
+        if gap < 0:
+            log.warning("stock reconcile: material %s has more located stock than its total (%s)", mat.id, gap)
+            continue
+        wh_code = "RAW"
+        for prefix, code in _COMPOSITE_PREFIX_WAREHOUSE:
+            if (mat.code or "").startswith(prefix):
+                wh_code = code
+                break
+        loc = await get_or_create_warehouse_bin(db, mat.tenant_id, wh_code)
+        await _sync_quant(db, tenant_id=mat.tenant_id, material_id=mat.id,
+                          delta_qty=gap, location_id=loc.id)
+        fixed += 1
+    if fixed:
+        log.warning("stock reconcile: assigned un-located stock of %s materials to a warehouse", fixed)
+    return fixed
+
+
+async def fg_qty_to_release(db: AsyncSession, wo, fg_mat: Material, *,
+                            extra_delivered: Decimal = Decimal("0"),
+                            extra_invoiced: Decimal = Decimal("0")) -> Decimal:
+    """
+    المعدة لازم تخرج من مخزون تام الصنع (FG) مرة واحدة بس، سواء الفاتورة سبقت
+    التسليم أو العكس. الفاتورة وأمر التسليم الاتنين بيخصموا FG — من غير
+    التنسيق ده: فاتورة ثم تسليم = التسليم يترفض ("الرصيد غير كافٍ")، أو
+    يتخصم مرتين لو فيه رصيد تاني.
+
+    المطلوب إخراجه = max(المفوتر، المسلَّم) بعد العملية الحالية − اللي خرج فعلًا.
+    """
+    from app.models.models import DeliveryOrder, DeliveryOrderLine, Invoice
+
+    delivered = Decimal("0")
+    rows = (await db.execute(
+        select(DeliveryOrderLine.qty)
+        .join(DeliveryOrder, DeliveryOrder.id == DeliveryOrderLine.order_id)
+        .where(DeliveryOrderLine.work_order_id == wo.id, DeliveryOrder.status == "delivered")
+    )).scalars().all()
+    for q in rows:
+        try:
+            delivered += Decimal(str(q).strip())
+        except Exception:
+            pass
+    delivered += extra_delivered
+
+    invoiced = extra_invoiced
+    if await db.scalar(select(Invoice.id).where(Invoice.work_order_id == wo.id)):
+        invoiced = max(invoiced, Decimal(str(wo.quantity or 1)))
+
+    out_qty = await db.scalar(
+        select(func.coalesce(func.sum(StockMovement.qty), 0)).where(
+            StockMovement.material_id == fg_mat.id, StockMovement.movement_type == "out",
+            StockMovement.source_doc_type.in_(("sales_invoice", "delivery")),
+        )
+    ) or 0
+    back_qty = await db.scalar(
+        select(func.coalesce(func.sum(StockMovement.qty), 0)).where(
+            StockMovement.material_id == fg_mat.id, StockMovement.movement_type == "in",
+            StockMovement.source_doc_type == "sales_invoice_delete",
+        )
+    ) or 0
+    released = Decimal(str(out_qty)) - Decimal(str(back_qty))
+    return max(Decimal("0"), max(invoiced, delivered) - released)
+
+
 async def post_receipt(
     db: AsyncSession,
     *,

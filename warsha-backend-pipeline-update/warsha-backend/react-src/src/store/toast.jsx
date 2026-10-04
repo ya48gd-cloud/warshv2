@@ -9,6 +9,9 @@ export function ToastProvider({ children }) {
   const counter = useRef(0)
 
   const toast = useCallback((msg, type = 'success') => {
+    // حماية: رسالة undefined/كائن (مثلاً err.message فاضية) كانت بتكسر msg.length
+    msg = msg == null ? '' : (typeof msg === 'string' ? msg : (msg.message || String(msg)))
+    if (!msg) msg = type === 'error' ? 'حدث خطأ غير متوقع' : 'تم'
     const id = ++counter.current
     // إصلاح شكوى متكررة: مدة العرض كانت ثابتة (3.2 ثانية) لكل رسالة —
     // رسالة خطأ طويلة (زي "الكمية المتاحة غير كافية — الرصيد الكلي...")
@@ -39,7 +42,7 @@ export function ToastProvider({ children }) {
   return (
     <ToastCtx.Provider value={toast}>
       {children}
-      <div className="fixed bottom-6 left-6 z-[200] flex flex-col gap-2">
+      <div className="fixed bottom-6 left-6 z-[200] flex flex-col gap-2" role="status" aria-live="polite" dir="rtl">
         {toasts.map(t => (
           <div
             key={t.id}
@@ -53,6 +56,7 @@ export function ToastProvider({ children }) {
             <span>{t.type === 'error' ? '✗' : t.type === 'warn' ? '⚠' : '✓'}</span>
             <span style={{ flex: 1 }}>{t.msg}</span>
             <button
+              type="button"
               onClick={() => dismiss(t.id)}
               aria-label="إغلاق"
               style={{

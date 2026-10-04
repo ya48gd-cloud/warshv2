@@ -12,8 +12,20 @@ const TABS = [
   { key: 'installments',  label: '📅 الأقساط' },
 ]
 
-export default function InvoicingHub({ onNavigate }) {
+export default function InvoicingHub({ onNavigate, pageParams }) {
   const [activeTab, setActiveTab] = useState('invoices')
+  const [highlightId, setHighlightId] = useState(pageParams?.highlight ?? null)
+
+  // إصلاح: الضغط على كود الفاتورة من تبويب الأقساط كان بينادي navigate('invoices')
+  // وإحنا أصلاً في نفس الصفحة، فمكانش بيحصل أي حاجة. نحوّل للتبويب ونفلتر عليها.
+  const handleNavigate = (p, params = null) => {
+    if (p === 'invoices') {
+      setActiveTab('invoices')
+      setHighlightId(params?.highlight ?? null)
+      return
+    }
+    onNavigate?.(p, params)
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -32,9 +44,9 @@ export default function InvoicingHub({ onNavigate }) {
         ))}
       </div>
 
-      {activeTab === 'invoices'     && <Invoices />}
+      {activeTab === 'invoices'     && <Invoices highlightId={highlightId} />}
       {activeTab === 'creditnotes'  && <CreditNotes />}
-      {activeTab === 'installments' && <Installments onNavigate={onNavigate} />}
+      {activeTab === 'installments' && <Installments onNavigate={handleNavigate} />}
     </div>
   )
 }

@@ -90,3 +90,32 @@ async def test_delete_nonexistent_workshop_still_404(client):
     headers = await _super_headers(client)
     r = await client.delete(f"{SUPER}/workshops/999999", headers=headers)
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_workshop_validates_and_seeds_warehouses(client):
+    headers = await _super_headers(client)
+    r = await client.post(f"{SUPER}/workshops", json={
+        "workshop_name": "ورشة", "workshop_slug": "sa-short-pass",
+        "admin_username": "a", "admin_password": "123",
+    }, headers=headers)
+    assert r.status_code == 400
+    r = await client.post(f"{SUPER}/workshops", json={
+        "workshop_name": "ورشة", "workshop_slug": "sa-bad-plan",
+        "admin_username": "a", "admin_password": "secret123", "plan": "x" * 40,
+    }, headers=headers)
+    assert r.status_code == 400
+
+    tid = await _create_workshop(client, headers, slug="sa-seeded-shop")
+    from sqlalchemy import select, func
+    from app.models.models import Warehouse
+    from tests.conftest import TestSessionLocal
+    async with TestSessionLocal() as db:
+        n = await db.scalar(select(func.count()).select_from(Warehouse).where(Warehouse.tenant_id == tid))
+    assert n and n >= 8
+
+
+@pytest.mark.asyncio
+async def test_super_login_non_ascii_password_is_401_not_500(client):
+    r = await client.post(f"{SUPER}/login", json={"username": "superadmin", "password": "كلمة"})
+    assert r.status_code == 401

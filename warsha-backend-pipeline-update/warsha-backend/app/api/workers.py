@@ -1,17 +1,31 @@
 from datetime import date, timedelta
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import select, func, update, or_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
 from app.core.database import get_db
 from app.api.auth import require_any
 from app.models.models import Worker, PayrollRun, PayrollLine, Attendance, WorkerAdvance, ExtProjectMember
 
-router = APIRouter(prefix="/workers", tags=["workers"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+_WRITE_ROLES = {"admin", "accountant"}   # مطابق لـ ROLE_WRITE['workers'] في الواجهة
+
+
+async def _require_workers_write(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: أي مستخدم مسجّل (مشاهد/إنتاج) كان يقدر بطلب API
+    مباشر يضيف/يحذف سلف (حركة خزنة + قيد)، ينشئ/يصرف/يحذف كشوف رواتب،
+    أو يعدّل أجور العمال — رغم إن الواجهة بتسمح بالكتابة لـ admin/accountant بس."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") not in _WRITE_ROLES:
+        raise HTTPException(403, f"صلاحية '{user.get('role')}' لا تسمح بتعديل بيانات العمال والرواتب")
+    return user
+
+
+router = APIRouter(prefix="/workers", tags=["workers"],
+                   dependencies=[Depends(require_any), Depends(_require_workers_write)])
 
 
 async def _next_worker_code(db: AsyncSession, tenant_id: int) -> str:
@@ -32,17 +46,58 @@ async def _next_worker_code(db: AsyncSession, tenant_id: int) -> str:
 
 
 class WorkerIn(BaseModel):
-    code: Optional[str] = None; name: str
-    job_title: Optional[str] = None; phone: Optional[str] = None
-    national_id: Optional[str] = None; hire_date: Optional[date] = None
+    # الحدود القصوى مطابقة لأطوال أعمدة جدول workers — قبل كده القيمة الأطول
+    # كانت بتوصل للـ DB وتسقط بخطأ 500 (أو تتقص بصمت حسب محرّك القاعدة).
+    code: Optional[str] = Field(None, max_length=30); name: str = Field(..., max_length=200)
+    job_title: Optional[str] = Field(None, max_length=100); phone: Optional[str] = Field(None, max_length=30)
+    national_id: Optional[str] = Field(None, max_length=30); hire_date: Optional[date] = None
     daily_wage: Decimal; notes: Optional[str] = None
-    contract_type:     Optional[str]  = None
-    insurance_number:  Optional[str]  = None
+    contract_type:     Optional[str]  = Field(None, max_length=30)
+    insurance_number:  Optional[str]  = Field(None, max_length=50)
     contract_end_date: Optional[date] = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("اسم العامل مطلوب")
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def _strip_code(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator("daily_wage")
+    @classmethod
+    def _wage_2dp(cls, v: Decimal) -> Decimal:
+        # عمود Numeric(12,2): قيمة زي 150.005 أو NaN/Infinity كانت بتوصل للـ DB
+        # كما هي فتحسابات الكشف تختلف عن المخزَّن.
+        if v is not None:
+            if not v.is_finite():
+                raise ValueError("الأجر اليومي غير صالح")
+            v = v.quantize(Decimal("0.01"))
+            if v >= Decimal("10000000000"):
+                raise ValueError("الأجر اليومي كبير جدًا")
+        return v
 
 class AdvanceIn(BaseModel):
     worker_id: int; amount: Decimal
     advance_type: str = "advance"; date: date; notes: Optional[str] = None
+
+    @field_validator("amount")
+    @classmethod
+    def _amount_2dp(cls, v: Decimal) -> Decimal:
+        # المبلغ بيتسجل في WorkerAdvance (Numeric 12,2) وفي حركة الخزنة والقيد —
+        # من غير تقريب موحّد ممكن الخزنة تتخصم بقيمة مختلفة عن السلفة المخزَّنة.
+        if v is not None:
+            if not v.is_finite():
+                raise ValueError("المبلغ غير صالح")
+            v = v.quantize(Decimal("0.01"))
+            if v >= Decimal("10000000000"):
+                raise ValueError("المبلغ كبير جدًا")
+        return v
 
 class PayrollRunIn(BaseModel):
     week_start: date; week_end: date; notes: Optional[str] = None
@@ -50,6 +105,8 @@ class PayrollRunIn(BaseModel):
 
 def wd(w): return {"id":w.id,"code":w.code,"name":w.name,"job_title":w.job_title,
     "phone":w.phone,"hire_date":str(w.hire_date) if w.hire_date else None,
+    # national_id لازم يرجع — شاشة التعديل كانت بتفتحه فاضي وتبعته null فيتمسح.
+    "national_id":getattr(w,"national_id",None),
     "daily_wage":float(w.daily_wage or 0),"is_active":w.is_active,"notes":w.notes,
     "contract_type":    getattr(w,"contract_type",None),
     "insurance_number": getattr(w,"insurance_number",None),
@@ -134,6 +191,10 @@ async def add_advance(data: AdvanceIn, db: AsyncSession = Depends(get_db)):
     worker = await db.get(Worker, data.worker_id)
     if not worker or worker.tenant_id != tid_adv:
         raise HTTPException(404, "العامل غير موجود")
+    if not worker.is_active:
+        # العامل المعطَّل مابيدخلش كشوف الرواتب (إلا لو له حضور في الفترة)،
+        # فسلفة جديدة له بتطلع فلوس من الخزنة من غير أي فرصة استرداد.
+        raise HTTPException(400, "لا يمكن تسجيل سلفة/منحة لعامل معطَّل")
 
     adv_payload = data.model_dump()
     adv_payload['tenant_id'] = tid_adv
@@ -184,8 +245,9 @@ async def del_advance(aid: int, db: AsyncSession = Depends(get_db)):
         select(TreasuryTransaction).where(
             TreasuryTransaction.linked_type == "worker_advance",
             TreasuryTransaction.linked_id == aid,
+            TreasuryTransaction.tenant_id == tid_da,
         )
-    )).scalar_one_or_none()
+    )).scalars().first()
     if txn:
         treasury = await db.get(Treasury, txn.treasury_id)
         if treasury:
@@ -209,7 +271,7 @@ async def list_payroll(db: AsyncSession = Depends(get_db)):
     # احسب عدد العمال لكل كشف
     result = []
     for x in runs:
-        lines_r = await db.execute(select(PayrollLine).where(PayrollLine.payroll_run_id == x.id))
+        lines_r = await db.execute(select(PayrollLine).where(PayrollLine.payroll_run_id == x.id, PayrollLine.tenant_id == tid))
         worker_count = len(lines_r.scalars().all())
         result.append({
             "id": x.id,
@@ -227,8 +289,24 @@ async def list_payroll(db: AsyncSession = Depends(get_db)):
 @router.post("/payroll", status_code=201)
 async def create_payroll(data: PayrollRunIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_pr
+    if data.week_end < data.week_start:
+        raise HTTPException(400, "تاريخ نهاية الكشف يجب أن يكون بعد تاريخ البداية")
+    if (data.week_end - data.week_start).days > 31:
+        raise HTTPException(400, "مدة كشف الرواتب لا يمكن أن تتجاوز 31 يومًا")
+    tid_cp = _ctid_pr.get() or 1
+    # كشفان متداخلان في نفس الفترة كانا بيحسبوا نفس أيام الحضور مرتين —
+    # يعني العامل يتصرف له أجر نفس اليوم مرتين من الخزنة.
+    overlap = await db.scalar(
+        select(PayrollRun.id).where(
+            PayrollRun.tenant_id == tid_cp,
+            PayrollRun.week_start <= data.week_end,
+            PayrollRun.week_end >= data.week_start,
+        ).limit(1)
+    )
+    if overlap:
+        raise HTTPException(400, f"يوجد كشف رواتب آخر (#{overlap}) يغطي نفس الفترة أو جزءًا منها")
     pr_payload = data.model_dump()
-    pr_payload['tenant_id'] = _ctid_pr.get() or 1
+    pr_payload['tenant_id'] = tid_cp
     run = PayrollRun(**pr_payload); db.add(run); await db.commit(); await db.refresh(run)
     return {"id":run.id,"week_start":str(run.week_start),"week_end":str(run.week_end)}
 
@@ -247,8 +325,18 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
     if run.status == "paid":
         raise HTTPException(400, "لا يمكن إعادة توليد كشف مصروف بالفعل")
 
+    # العامل اللي اتعطّل بعد ما اشتغل أيام في الفترة كان بيتشال من الكشف
+    # كليًا فيضيع أجر أيامه — نضمّن كمان أي عامل معطَّل له حضور في الفترة.
+    worked_ids_q = select(Attendance.worker_id).where(
+        Attendance.tenant_id == tid,
+        Attendance.date >= run.week_start,
+        Attendance.date <= run.week_end,
+    )
     workers = (await db.execute(
-        select(Worker).where(Worker.is_active==True, Worker.tenant_id==tid)
+        select(Worker).where(
+            Worker.tenant_id == tid,
+            or_(Worker.is_active == True, Worker.id.in_(worked_ids_q)),
+        ).order_by(Worker.id)
     )).scalars().all()
 
     # جلب كل سجلات الحضور في الأسبوع
@@ -343,9 +431,10 @@ async def generate_from_attendance(run_id: int, db: AsyncSession = Depends(get_d
         })
         # الأجر الأساسي × أيام الورشة + أجر الساعات الإضافية (بسعر الساعة = يومية/8) + أجر المشروع × أيام المشروع
         overtime_hours = info.get("overtime_hours", Decimal("0"))
-        overtime_pay   = (w.daily_wage or Decimal("0")) * overtime_hours / Decimal("8")
-        gross_workshop = (w.daily_wage or Decimal("0")) * info["days_workshop"] + overtime_pay
-        gross_project  = info["gross_project"]
+        _c = Decimal("0.01")
+        overtime_pay   = ((w.daily_wage or Decimal("0")) * overtime_hours / Decimal("8")).quantize(_c)
+        gross_workshop = ((w.daily_wage or Decimal("0")) * info["days_workshop"]).quantize(_c) + overtime_pay
+        gross_project  = Decimal(info["gross_project"]).quantize(_c)
         gross          = gross_workshop + gross_project
         total_days     = info["days_workshop"] + info["days_project"]
 
@@ -437,10 +526,24 @@ async def pay_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, "هذا الكشف مصروف بالفعل")
 
     lines_count = (await db.execute(
-        select(func.count()).select_from(PayrollLine).where(PayrollLine.payroll_run_id == run_id)
+        select(func.count()).select_from(PayrollLine).where(
+            PayrollLine.payroll_run_id == run_id, PayrollLine.tenant_id == _tid_pr,
+        )
     )).scalar() or 0
     if lines_count == 0:
         raise HTTPException(400, "لا يمكن صرف كشف لم يتم توليده بعد")
+
+    # حجز ذرّي للكشف قبل أي قيد/حركة خزنة — طلبان متزامنان (ضغطتين على زر
+    # الصرف) كانا بيعدّوا فحص status الفوق الاتنين ويصرفوا الكشف مرتين.
+    claimed = await db.execute(
+        update(PayrollRun)
+        .where(PayrollRun.id == run_id, PayrollRun.tenant_id == _tid_pr, PayrollRun.status != "paid")
+        .values(status="paid")
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(400, "هذا الكشف مصروف بالفعل")
 
     import datetime as _dt
     run_code = f"PAY-{run_id}-{run.week_start}"
@@ -495,7 +598,7 @@ async def get_payroll_detail(run_id: int, db: AsyncSession = Depends(get_db)):
     lines_r = await db.execute(
         select(PayrollLine)
         .options(selectinload(PayrollLine.worker))
-        .where(PayrollLine.payroll_run_id == run_id)
+        .where(PayrollLine.payroll_run_id == run_id, PayrollLine.tenant_id == run.tenant_id)
         .order_by(PayrollLine.worker_id)
     )
     lines = lines_r.scalars().all()
@@ -533,12 +636,12 @@ async def delete_payroll_run(run_id: int, db: AsyncSession = Depends(get_db)):
     if run.status == "paid": raise HTTPException(400, "لا يمكن حذف كشف مصروف")
     # أعد تفعيل السلف المرتبطة
     settled_advances = (await db.execute(
-        sa_select(WorkerAdvance).where(WorkerAdvance.payroll_run_id == run_id)
+        sa_select(WorkerAdvance).where(WorkerAdvance.payroll_run_id == run_id, WorkerAdvance.tenant_id == run.tenant_id)
     )).scalars().all()
     for adv in settled_advances:
         adv.is_settled = False
         adv.payroll_run_id = None
-    lines = (await db.execute(sa_select(PayrollLine).where(PayrollLine.payroll_run_id==run_id))).scalars().all()
+    lines = (await db.execute(sa_select(PayrollLine).where(PayrollLine.payroll_run_id==run_id, PayrollLine.tenant_id==run.tenant_id))).scalars().all()
     for l in lines: await db.delete(l)
     await db.delete(run)
     await db.commit()

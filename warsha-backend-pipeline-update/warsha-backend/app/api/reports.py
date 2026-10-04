@@ -42,6 +42,34 @@ def _tid() -> int:
     return tid
 
 
+# حالات الفاتورة المفتوحة (عليها رصيد مستحق). installment_scheduler بيحوّل
+# الفاتورة غير المدفوعة المتأخرة لحالة "overdue" فعليًا في الداتابيز — لو
+# اتفلترت بـ unpaid/partial بس، المديونيات المتأخرة (أهم جزء في الـ aging!)
+# كانت بتختفي من تقارير المديونيات وإجمالي المستحقات.
+OPEN_INVOICE_STATUSES = ("unpaid", "partial", "overdue")
+
+# حركات خزينة (شيكات) اتعكس أثرها على الرصيد — لازم متتحسبش في التدفق النقدي
+# وإلا الرصيد المحسوب في التقرير يختلف عن رصيد الخزنة الفعلي.
+VOID_CHEQUE_STATUSES = ("bounced", "cancelled")
+
+
+def _active_txn_cond():
+    """شرط استبعاد حركات الخزينة المرتدّة/الملغاة (cheque_status NULL = حركة عادية)."""
+    return (TreasuryTransaction.cheque_status.is_(None)) | (
+        TreasuryTransaction.cheque_status.notin_(VOID_CHEQUE_STATUSES)
+    )
+
+
+def _check_range(date_from: Optional[date], date_to: Optional[date]) -> None:
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "تاريخ البداية يجب أن يكون قبل تاريخ النهاية")
+
+
+def _dt_end(d: date) -> datetime:
+    """نهاية اليوم — لمقارنة date_to مع أعمدة DateTime بدون استبعاد اليوم الأخير."""
+    return datetime.combine(d, time.max)
+
+
 # ══════════════════════════════════════════════════════════════
 # INVENTORY REPORTS — تقارير المخزون
 # ══════════════════════════════════════════════════════════════
@@ -239,6 +267,7 @@ async def inventory_movement_report(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     q = select(StockMovement).options(selectinload(StockMovement.material)).where(
         StockMovement.tenant_id == tid,
@@ -394,6 +423,7 @@ async def inventory_transactions(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     res = await db.execute(
         select(StockMovement)
@@ -436,6 +466,7 @@ async def production_summary(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     # تحويل date → datetime لضمان المقارنة الصحيحة مع عمود DateTime
     dt_from = datetime.combine(date_from, time.min)
@@ -491,10 +522,12 @@ async def scrap_analysis(
         selectinload(ScrapRecord.material),
         selectinload(ScrapRecord.work_order),
     ).where(ScrapRecord.tenant_id == tid)
+    _check_range(date_from, date_to)
     if date_from:
-        q = q.where(ScrapRecord.recorded_at >= date_from)
+        q = q.where(ScrapRecord.recorded_at >= datetime.combine(date_from, time.min))
     if date_to:
-        q = q.where(ScrapRecord.recorded_at <= date_to)
+        # recorded_at عمود DateTime — المقارنة بـ date مباشرة كانت بتستبعد كل هالك اليوم الأخير
+        q = q.where(ScrapRecord.recorded_at <= _dt_end(date_to))
 
     res = await db.execute(q.order_by(ScrapRecord.total_cost.desc()))
     scraps = res.scalars().all()
@@ -537,6 +570,7 @@ async def profitability_report(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     dt_from = datetime.combine(date_from, time.min)
     dt_to   = datetime.combine(date_to, time.max)
@@ -635,6 +669,7 @@ async def sales_summary(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     inv_res = await db.execute(
         select(Invoice).options(selectinload(Invoice.customer))
@@ -677,7 +712,7 @@ async def receivables_aging(db: AsyncSession = Depends(get_db)):
     unpaid_res = await db.execute(
         select(Invoice).options(selectinload(Invoice.customer)).where(
             Invoice.tenant_id == tid,
-            Invoice.status.in_(["unpaid", "partial"]),
+            Invoice.status.in_(OPEN_INVOICE_STATUSES),
             Invoice.total > Invoice.paid_amount,
         ).order_by(Invoice.due_date)
     )
@@ -770,7 +805,9 @@ async def overdue_installments(db: AsyncSession = Depends(get_db)):
         )
         .where(
             InvoicePaymentSchedule.tenant_id == tid,
-            InvoicePaymentSchedule.status.in_(["pending", "partial"]),
+            # installment_scheduler بيحوّل القسط المتأخر لـ status="overdue" فعليًا —
+            # من غيرها الأقساط المتأخرة كانت بتختفي من تقرير المتأخرات بعد أول تشغيل له.
+            InvoicePaymentSchedule.status.in_(["pending", "partial", "overdue"]),
             InvoicePaymentSchedule.due_date < today,
         )
         .order_by(InvoicePaymentSchedule.due_date)
@@ -879,6 +916,7 @@ async def sales_by_customer(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     res = await db.execute(
         select(
@@ -921,6 +959,7 @@ async def purchases_summary(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     res = await db.execute(
         select(PurchaseInvoice).options(selectinload(PurchaseInvoice.supplier))
@@ -960,6 +999,7 @@ async def purchases_by_supplier(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     res = await db.execute(
         select(
@@ -999,6 +1039,7 @@ async def workers_summary(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     payroll_res = await db.execute(
         select(PayrollRun).where(
@@ -1049,6 +1090,7 @@ async def labor_performance_report(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     workers = (await db.execute(
         select(Worker).where(Worker.tenant_id == tid, Worker.is_active == True)
@@ -1078,7 +1120,9 @@ async def labor_performance_report(
             func.coalesce(func.sum(WorkOrderMember.actual_hours), 0).label("actual_hours"),
             func.coalesce(func.sum(WorkOrderMember.actual_hours * WorkOrderMember.hourly_rate), 0).label("labor_cost"),
         ).join(WorkOrder, WorkOrder.id == WorkOrderMember.work_order_id)
-         .where(WorkOrder.tenant_id == tid, WorkOrder.created_at >= date_from, WorkOrder.created_at <= date_to)
+         .where(WorkOrder.tenant_id == tid,
+                WorkOrder.created_at >= datetime.combine(date_from, time.min),
+                WorkOrder.created_at <= _dt_end(date_to))
          .group_by(WorkOrderMember.worker_id)
     )
     wom = {r.worker_id: r for r in wom_res}
@@ -1173,15 +1217,20 @@ async def _period_cogs(db: AsyncSession, tid: int, date_from: date, date_to: dat
     cogs_account_ids = select(ChartOfAccount.id).where(
         ChartOfAccount.tenant_id == tid, ChartOfAccount.code == "5100",
     )
+    # صافي الحساب = مدين − دائن: مرتجعات المبيعات (journal_cogs_reversal) وقيود
+    # العكس (journal_reverse_entry) بتسجّل 5100 في الجانب الدائن — لو حسبنا
+    # المدين بس، تكلفة البضاعة المرتجعة كانت بتفضل محسوبة والربح يطلع أقل من الحقيقي.
     total = await db.scalar(
-        select(func.coalesce(func.sum(AccountingEntryLine.amount), 0))
+        select(func.coalesce(func.sum(case(
+            (AccountingEntryLine.side == "debit", AccountingEntryLine.amount),
+            else_=-AccountingEntryLine.amount,
+        )), 0))
         .select_from(AccountingEntryLine)
         .join(AccountingEntry, AccountingEntry.id == AccountingEntryLine.entry_id)
         .where(
             AccountingEntry.tenant_id == tid,
             AccountingEntry.entry_date >= date_from,
             AccountingEntry.entry_date <= date_to,
-            AccountingEntryLine.side == "debit",
             AccountingEntryLine.account_id.in_(cogs_account_ids),
         )
     )
@@ -1192,15 +1241,18 @@ async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: dat
     """يحسب أهم مؤشرات الأداء لفترة معيّنة (مقصورة على tenant الحالي)"""
     sales_total = float(await db.scalar(
         select(func.coalesce(func.sum(Invoice.total), 0))
-        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to,
+               Invoice.status != "cancelled")
     ) or 0)
     collected = float(await db.scalar(
         select(func.coalesce(func.sum(Invoice.paid_amount), 0))
-        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to,
+               Invoice.status != "cancelled")
     ) or 0)
     invoices_count = await db.scalar(
         select(func.count()).select_from(Invoice)
-        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to)
+        .where(Invoice.tenant_id == tid, Invoice.date >= date_from, Invoice.date <= date_to,
+               Invoice.status != "cancelled")
     ) or 0
     purchases_total = float(await db.scalar(
         select(func.coalesce(func.sum(PurchaseInvoice.total), 0))
@@ -1227,12 +1279,14 @@ async def _period_kpis(db: AsyncSession, tid: int, date_from: date, date_to: dat
     cashflow_in = float(await db.scalar(
         select(func.coalesce(func.sum(TreasuryTransaction.amount), 0))
         .where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.direction == "in",
-               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
+               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to,
+               _active_txn_cond())
     ) or 0)
     cashflow_out = float(await db.scalar(
         select(func.coalesce(func.sum(TreasuryTransaction.amount), 0))
         .where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.direction == "out",
-               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
+               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to,
+               _active_txn_cond())
     ) or 0)
 
     cogs_actual = await _period_cogs(db, tid, date_from, date_to)
@@ -1274,7 +1328,9 @@ async def period_comparison_report(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
+    _check_range(compare_from, compare_to)
     if not compare_from or not compare_to:
         period_len = (date_to - date_from).days + 1
         compare_to = date_from - timedelta(days=1)
@@ -1339,7 +1395,8 @@ async def executive_dashboard(db: AsyncSession = Depends(get_db)):
     mtd_wo_cost = await db.scalar(
         select(func.coalesce(func.sum(WorkOrder.actual_cost), 0)).where(
             WorkOrder.tenant_id == tid,
-            extract("month", WorkOrder.created_at) == today.month,
+            # كان extract(month) بس — بيجمع نفس الشهر من كل السنين السابقة
+            WorkOrder.created_at >= datetime.combine(month_start, time.min),
             WorkOrder.status == "done",
         )
     )
@@ -1347,17 +1404,19 @@ async def executive_dashboard(db: AsyncSession = Depends(get_db)):
     # Sales KPIs
     mtd_sales = await db.scalar(
         select(func.coalesce(func.sum(Invoice.total), 0)).where(
-            Invoice.tenant_id == tid, Invoice.date >= month_start
+            Invoice.tenant_id == tid, Invoice.date >= month_start,
+            Invoice.status != "cancelled",
         )
     )
     mtd_collected = await db.scalar(
         select(func.coalesce(func.sum(Invoice.paid_amount), 0)).where(
-            Invoice.tenant_id == tid, Invoice.date >= month_start
+            Invoice.tenant_id == tid, Invoice.date >= month_start,
+            Invoice.status != "cancelled",
         )
     )
     total_receivable = await db.scalar(
         select(func.coalesce(func.sum(Invoice.total - Invoice.paid_amount), 0)).where(
-            Invoice.tenant_id == tid, Invoice.status.in_(["unpaid", "partial"])
+            Invoice.tenant_id == tid, Invoice.status.in_(OPEN_INVOICE_STATUSES)
         )
     )
 
@@ -1387,7 +1446,7 @@ async def executive_dashboard(db: AsyncSession = Depends(get_db)):
             "mtd_invoiced": float(mtd_sales or 0),
             "mtd_collected": float(mtd_collected or 0),
             "total_receivable": float(total_receivable or 0),
-            "collection_rate": round(float(mtd_collected or 0) / float(mtd_sales or 1) * 100, 1),
+            "collection_rate": round(float(mtd_collected or 0) / float(mtd_sales) * 100, 1) if float(mtd_sales or 0) else 0,
         },
         "purchases": {
             "mtd_purchases": float(mtd_purchases or 0),
@@ -1414,6 +1473,7 @@ async def cashflow_report(
         date_from = date.today().replace(day=1)
     if not date_to:
         date_to = date.today()
+    _check_range(date_from, date_to)
 
     # ── الأرصدة الحالية للخزن ──
     treas_q = select(Treasury).where(Treasury.tenant_id == tid, Treasury.is_active == True)
@@ -1422,12 +1482,18 @@ async def cashflow_report(
     treasuries = (await db.execute(treas_q)).scalars().all()
 
     # ── الرصيد الافتتاحي: رصيد بداية الخزن + الحركات قبل date_from ──
-    opening_balance = sum(float(t.opening_balance or 0) for t in treasuries)
+    # الرصيد الافتتاحي لازم يشمل كل الخزن (حتى الموقوفة) لأن حركاتها السابقة
+    # (prior_q تحت) محسوبة بالكامل — وإلا الرصيد المتراكم يطلع غلط.
+    all_treas_q = select(func.coalesce(func.sum(Treasury.opening_balance), 0)).where(Treasury.tenant_id == tid)
+    if treasury_id:
+        all_treas_q = all_treas_q.where(Treasury.id == treasury_id)
+    opening_balance = float(await db.scalar(all_treas_q) or 0)
     prior_q = select(
         func.coalesce(func.sum(
             case((TreasuryTransaction.direction == "in", TreasuryTransaction.amount), else_=-TreasuryTransaction.amount)
         ), 0)
-    ).where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.txn_date < date_from)
+    ).where(TreasuryTransaction.tenant_id == tid, TreasuryTransaction.txn_date < date_from,
+            _active_txn_cond())
     if treasury_id:
         prior_q = prior_q.where(TreasuryTransaction.treasury_id == treasury_id)
     opening_balance += float(await db.scalar(prior_q) or 0)
@@ -1436,7 +1502,8 @@ async def cashflow_report(
     txn_q = (
         select(TreasuryTransaction)
         .where(TreasuryTransaction.tenant_id == tid,
-               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to)
+               TreasuryTransaction.txn_date >= date_from, TreasuryTransaction.txn_date <= date_to,
+               _active_txn_cond())
         .order_by(TreasuryTransaction.txn_date)
     )
     if treasury_id:
@@ -1533,7 +1600,8 @@ async def monthly_sales_breakdown(db: AsyncSession = Depends(get_db)):
 
         total = await db.scalar(
             select(func.coalesce(func.sum(Invoice.total), 0))
-            .where(Invoice.tenant_id == tid, Invoice.date >= mo_start, Invoice.date <= mo_end)
+            .where(Invoice.tenant_id == tid, Invoice.date >= mo_start, Invoice.date <= mo_end,
+                   Invoice.status != "cancelled")
         )
         results.append({"month": f"{year}-{month:02d}", "total": float(total or 0)})
 
@@ -1551,6 +1619,19 @@ async def production_by_type(db: AsyncSession = Depends(get_db)):
     )
     work_orders = res.scalars().all()
 
+    # الإيراد الفعلي = إجمالي الفواتير المرتبطة بأمر الإنتاج (نفس مصدر تقرير
+    # الربحية /profitability). كان الكود بيستخدم planned_cost كـ "إيراد" —
+    # يعني الهامش المعروض كان مجرد انحراف التكلفة الفعلية عن المخططة، مش ربح.
+    wo_ids = [wo.id for wo in work_orders]
+    revenue_by_wo: dict = {}
+    if wo_ids:
+        rev_rows = await db.execute(
+            select(Invoice.work_order_id, func.coalesce(func.sum(Invoice.total), 0))
+            .where(Invoice.tenant_id == tid, Invoice.work_order_id.in_(wo_ids))
+            .group_by(Invoice.work_order_id)
+        )
+        revenue_by_wo = {r[0]: float(r[1] or 0) for r in rev_rows.all()}
+
     # تجميع حسب الفئة (أول جزء من كود أمر الإنتاج)
     type_map: dict = {}
     for wo in work_orders:
@@ -1559,7 +1640,7 @@ async def production_by_type(db: AsyncSession = Depends(get_db)):
         if category not in type_map:
             type_map[category] = {"name": category, "revenue": 0.0, "cost": 0.0, "count": 0}
         type_map[category]["cost"]    += float(wo.actual_cost or 0)
-        type_map[category]["revenue"] += float(wo.planned_cost or 0)
+        type_map[category]["revenue"] += revenue_by_wo.get(wo.id, 0.0)
         type_map[category]["count"]   += 1
 
     result = [
@@ -1597,7 +1678,7 @@ async def print_aging_report(db: AsyncSession = Depends(get_db)):
     unpaid_res = await db.execute(
         select(Invoice).options(selectinload(Invoice.customer)).where(
             Invoice.tenant_id == tid,
-            Invoice.status.in_(["unpaid", "partial"]),
+            Invoice.status.in_(OPEN_INVOICE_STATUSES),
             Invoice.total > Invoice.paid_amount,
         ).order_by(Invoice.due_date)
     )
@@ -1609,11 +1690,16 @@ async def print_aging_report(db: AsyncSession = Depends(get_db)):
     prof_res = await db.execute(q.limit(1))
     prof = prof_res.scalar_one_or_none()
     cname = _h.escape(prof.name if prof else "ورشة معدات الاعلاف")
-    cphone = _h.escape(prof.mobile or prof.phone or "" if prof else "")
+    # الأقواس مهمة: من غيرها `prof.mobile or ... if prof else ""` بيتقيّم
+    # prof.mobile الأول فيرمي AttributeError (500) لو مفيش WorkshopProfile.
+    cphone = _h.escape(((prof.mobile or prof.phone) if prof else "") or "")
+    # logo_data بيتحط جوه attribute — نهرب الاقتباسات (منع حقن HTML في صفحة
+    # الطباعة من قيمة مخزّنة تحتوي ").
+    _logo = str((prof.logo_data or "") if prof else "")
     logo_html = (
-        f'<img src="{prof.logo_data}" alt="logo" '
+        f'<img src="{_h.escape(_logo, quote=True)}" alt="logo" '
         'style="max-height:55px;max-width:130px;object-fit:contain;display:block;"/>'
-        if prof and prof.logo_data else ""
+        if _logo else ""
     )
 
     buckets_def = [
@@ -1768,6 +1854,18 @@ from urllib.parse import quote
 from fastapi.responses import StreamingResponse
 
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """حماية من CSV/Formula Injection: أي نص يبدأ بـ = + - @ (اسم عميل، ملاحظة...)
+    Excel بينفّذه كمعادلة (ممكن HYPERLINK/DDE خبيث). نسبقه بـ ' عشان يتعرض
+    كنص. الأرقام (int/float) مش بتتأثر — القيم السالبة تفضل أرقام عادية."""
+    if isinstance(value, str) and value and value[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
 def _csv_response(rows: list[list], headers: list[str], filename: str) -> StreamingResponse:
     """Build a UTF-8-with-BOM CSV that Excel opens correctly."""
     buf = io.StringIO()
@@ -1775,10 +1873,17 @@ def _csv_response(rows: list[list], headers: list[str], filename: str) -> Stream
     w = csv.writer(buf)
     w.writerow(headers)
     for row in rows:
-        w.writerow(row)
+        w.writerow([_csv_safe(c) for c in row])
     buf.seek(0)
     # دعم أسماء ملفات بالعربية في Content-Disposition (latin-1 لا يدعمها)
-    ascii_name = filename.encode('ascii', 'ignore').decode('ascii') or 'export.csv'
+    # اسم الملف ممكن يحتوي اسم عميل/مورد — نشيل أي حرف ممكن يكسر الهيدر
+    # (" أو \r\n أو ; ...) عشان نمنع Header injection.
+    ascii_name = ''.join(
+        ch for ch in filename.encode('ascii', 'ignore').decode('ascii')
+        if ch.isalnum() or ch in '._-'
+    )
+    if not ascii_name or ascii_name.startswith('.'):
+        ascii_name = 'export.csv'
     disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
         iter([buf.read().encode('utf-8-sig')]),
@@ -1791,11 +1896,12 @@ def _csv_response(rows: list[list], headers: list[str], filename: str) -> Stream
 async def export_materials(db: AsyncSession = Depends(get_db)):
     tid = _tid()
     rows = (await db.execute(
-        select(Material).where(Material.tenant_id == tid).order_by(Material.code)
+        select(Material).options(selectinload(Material.category))
+        .where(Material.tenant_id == tid).order_by(Material.code)
     )).scalars().all()
     headers = ['الكود', 'الاسم', 'الفئة', 'الوحدة', 'الكمية', 'حد الطلب', 'سعر الوحدة', 'قيمة المخزون']
     data = [[
-        m.code, m.name_ar or m.name_en or '', '',
+        m.code, m.name_ar or m.name_en or '', (m.category.name_ar if m.category else ''),
         m.unit, float(m.stock_qty), float(m.reorder_level),
         float(m.unit_cost), round(float(m.stock_qty) * float(m.unit_cost), 2),
     ] for m in rows]
@@ -1831,7 +1937,8 @@ async def export_customers(db: AsyncSession = Depends(get_db)):
     )).scalars().all()
     headers = ['الاسم', 'الهاتف', 'البريد', 'العنوان', 'الرصيد']
     data = [[
-        c.name, c.phone or '', c.email or '', c.address or '',
+        # Customer مالوش عمود email — c.email كان بيرمي AttributeError (500) لأي تصدير فيه عميل
+        c.name, c.phone or '', getattr(c, 'email', None) or '', c.address or '',
         float(c.balance or 0),
     ] for c in rows]
     return _csv_response(data, headers, 'customers.csv')
@@ -1862,9 +1969,19 @@ async def export_work_orders(db: AsyncSession = Depends(get_db)):
 async def export_profitability(
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
+    group_by: str = Query("work_order", pattern="^(work_order|customer|equipment)$"),
     db: AsyncSession = Depends(get_db),
 ):
-    report = await profitability_report(date_from, date_to, "work_order", db)
+    report = await profitability_report(date_from, date_to, group_by, db)
+    if group_by in ("customer", "equipment"):
+        # تصدير نفس التجميع المعروض في الشاشة (كان التصدير بيتجاهل group_by)
+        g_headers = ['العميل' if group_by == 'customer' else 'المعدة',
+                     'عدد الأوامر', 'الإيراد', 'التكلفة', 'الربح', 'الهامش %']
+        g_data = [[g['name'], g['count'], g['revenue'], g['cost'], g['profit'], g['margin_pct']]
+                  for g in report['grouped']]
+        g_data.append(['الإجمالي', report['count'], report['total_revenue'], report['total_cost'],
+                       report['total_profit'], report['total_margin_pct']])
+        return _csv_response(g_data, g_headers, f'profitability_by_{group_by}.csv')
     headers = ['الكود', 'العميل', 'المعدة', 'الحالة', 'الإيراد', 'التكلفة', 'الربح', 'الهامش %']
     data = [[
         r['code'], r['customer'], r['equipment'], r['status'],
@@ -1958,6 +2075,14 @@ async def export_customer_ledger(cust_id: int, date_from: Optional[date] = None,
                                   location_id: Optional[int] = None,
                                   db: AsyncSession = Depends(get_db)):
     from app.api.customers import customer_ledger
+    tid = _tid()
+    # customer_ledger بيجيب العميل بـ db.get(Customer, id) من غير فلتر tenant —
+    # نتأكد هنا إن العميل تابع للمستأجر الحالي قبل تصدير كشف حسابه.
+    owned = await db.scalar(
+        select(Customer.id).where(Customer.id == cust_id, Customer.tenant_id == tid)
+    )
+    if not owned:
+        raise HTTPException(404, "العميل غير موجود")
     report = await customer_ledger(cust_id, date_from, date_to, location_id, db)
     headers = ['التاريخ', 'النوع', 'المرجع', 'البيان', 'مدين', 'دائن', 'الرصيد']
     data = []
@@ -1976,6 +2101,7 @@ async def export_supplier_ledger(sid: int, date_from: Optional[date] = None,
                                   date_to: Optional[date] = None,
                                   db: AsyncSession = Depends(get_db)):
     from app.api.purchases import supplier_ledger
+    _tid()
     report = await supplier_ledger(sid, date_from, date_to, db)
     headers = ['التاريخ', 'النوع', 'المرجع', 'البيان', 'مدين', 'دائن', 'الرصيد']
     data = []
@@ -1998,11 +2124,12 @@ async def export_supplier_ledger(sid: int, date_from: Optional[date] = None,
 async def payment_history(
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
-    payment_type: Optional[str] = None,   # customer | supplier | all
+    payment_type: Optional[str] = Query(None, pattern="^(customer|supplier|all)?$"),   # customer | supplier | all
     db: AsyncSession = Depends(get_db),
 ):
     """سجل موحد لجميع المدفوعات — عملاء وموردين"""
     tid = _tid()
+    _check_range(date_from, date_to)
     results = []
 
     # ── دفعات العملاء ──────────────────────────────────────────

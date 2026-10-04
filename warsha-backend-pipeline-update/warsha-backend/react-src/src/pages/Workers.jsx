@@ -22,6 +22,9 @@ const JOB_TITLES = [
   { value: 'other',     label: 'أخرى' },
 ]
 
+// الأنواع المقبولة في الباك إند: advance / deduction / bonus
+const ADV_LABEL = { advance: 'سلفة', deduction: 'خصم', bonus: 'منحة' }
+
 export default function Workers() {
   const { canWrite } = useAuth()
   const toast = useToast()
@@ -40,7 +43,11 @@ export default function Workers() {
     return !lq ? workers : workers.filter(w =>
       w.name?.toLowerCase().includes(lq) ||
       w.job_title?.toLowerCase().includes(lq) ||
-      w.code?.toLowerCase().includes(lq)
+      // البحث بالعربي عن الوظيفة (القيمة المخزنة إنجليزي)
+      (JOB_TITLES.find(j => j.value === w.job_title)?.label || '').includes(q.trim()) ||
+      w.code?.toLowerCase().includes(lq) ||
+      w.phone?.includes(q.trim()) ||
+      w.national_id?.includes(q.trim())
     )
   }, [workers, q])
 
@@ -48,7 +55,8 @@ export default function Workers() {
   const openAdd = async () => {
     setForm({ job_title: 'mechanic', daily_wage: '', code: '' })
     setModal({ mode: 'add' })
-    try { const r = await api.workers.nextCode(); setForm(f => ({ ...f, code: r.code })) } catch (_) {}
+    // لا تكتب فوق كود كتبه المستخدم بالفعل قبل وصول الرد
+    try { const r = await api.workers.nextCode(); setForm(f => ({ ...f, code: f.code || r?.code || '' })) } catch (_) {}
   }
   const openEdit = (item) => {
     setForm({ ...item })
@@ -56,15 +64,21 @@ export default function Workers() {
   }
 
   const [save, saving] = useAction(async () => {
+    if (saving) return
     if (!form.name?.trim())       { toast('الاسم مطلوب', 'error'); return }
-    if (!form.daily_wage || Number(form.daily_wage) <= 0) { toast('الأجر اليومي مطلوب', 'error'); return }
+    if (form.name.trim().length > 200) { toast('الاسم طويل جداً (الحد 200 حرف)', 'error'); return }
+    if (!form.daily_wage || !(Number(form.daily_wage) > 0)) { toast('الأجر اليومي مطلوب ويجب أن يكون أكبر من صفر', 'error'); return }
+    if ((form.code || '').trim().length > 30) { toast('الكود طويل جداً (الحد 30 حرف)', 'error'); return }
+    if ((form.phone || '').length > 30) { toast('رقم الهاتف طويل جداً', 'error'); return }
+    if ((form.national_id || '').length > 30) { toast('الرقم القومي طويل جداً', 'error'); return }
+    if ((form.insurance_number || '').length > 50) { toast('رقم التأمين طويل جداً', 'error'); return }
     if (form.hire_date && form.contract_end_date && form.contract_end_date < form.hire_date) {
       toast('تاريخ نهاية العقد لازم يكون بعد تاريخ التعيين', 'error'); return
     }
 
     const payload = {
-      code:              form.code,
-      name:              form.name,
+      code:              (form.code || '').trim() || null,
+      name:              form.name.trim(),
       job_title:         form.job_title || 'other',
       daily_wage:        Number(form.daily_wage),
       phone:             form.phone || null,
@@ -99,7 +113,7 @@ export default function Workers() {
   return (
     <div className="flex flex-col gap-4">
       {/* Summary bar */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="card text-center py-3">
           <div className="text-xs text-erp-muted mb-1">عدد العمال</div>
           <div className="text-xl font-bold" style={{ color: 'var(--teal)' }}>{filtered.length}</div>
@@ -295,7 +309,7 @@ export function WorkerProfile({ workerId, onBack }) {
   const { canWrite } = useAuth()
   const write = canWrite('workers')
 
-  const { data: profile, loading, reload } = useApi(
+  const { data: profile, loading, error: loadError, reload } = useApi(
     () => api.get(`/workers/${workerId}/profile`),
     [workerId]
   )
@@ -304,7 +318,9 @@ export function WorkerProfile({ workerId, onBack }) {
   const [saving, setSaving] = useState(false)
 
   const saveAdv = async () => {
-    if (!advForm.amount || Number(advForm.amount) <= 0) { toast('أدخل المبلغ', 'error'); return }
+    if (saving) return
+    if (!advForm.amount || !(Number(advForm.amount) > 0)) { toast('أدخل مبلغاً أكبر من صفر', 'error'); return }
+    if (!advForm.date) { toast('التاريخ مطلوب', 'error'); return }
     setSaving(true)
     try {
       await api.post('/workers/advances', {
@@ -318,21 +334,35 @@ export function WorkerProfile({ workerId, onBack }) {
       setAdvModal(false)
       setAdvForm({ amount: '', advance_type: 'advance', date: new Date().toISOString().slice(0,10), notes: '' })
       reload()
-    } catch(e) { toast(e.message, 'error') }
+    } catch(e) { toast(e.message || 'حدث خطأ', 'error') }
     finally { setSaving(false) }
   }
 
+  const [deletingId, setDeletingId] = useState(null)
   const deleteAdv = async (a) => {
-    if (!window.confirm(`تأكيد حذف ${a.advance_type === 'bonus' ? 'المنحة' : 'السلفة'} (${Number(a.amount).toFixed(0)} ج)؟`)) return
+    if (deletingId) return
+    if (!window.confirm(`تأكيد حذف ${ADV_LABEL[a.advance_type] || 'السلفة'} (${egp(a.amount)})؟`)) return
+    setDeletingId(a.id)
     try {
       await api.delete(`/workers/advances/${a.id}`)
       toast('تم الحذف')
       reload()
-    } catch(e) { toast(e.message, 'error') }
+    } catch(e) { toast(e.message || 'حدث خطأ', 'error') }
+    finally { setDeletingId(null) }
   }
 
-  if (loading) return <div className="p-10 text-center animate-pulse text-erp-muted">جاري التحميل…</div>
-  if (!profile) return null
+  if (loading && !profile) return <div className="p-10 text-center animate-pulse text-erp-muted">جاري التحميل…</div>
+  if (!profile) return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-3">
+        <button className="btn btn-sm" onClick={onBack}>← العودة</button>
+      </div>
+      <div className="card p-8 text-center text-erp-muted text-sm">
+        <div className="mb-3">{loadError || 'تعذّر تحميل بيانات العامل'}</div>
+        <button className="btn btn-sm" onClick={reload}>إعادة المحاولة</button>
+      </div>
+    </div>
+  )
 
   const w = profile.worker || profile
   const advances = profile.advances || []
@@ -343,16 +373,17 @@ export function WorkerProfile({ workerId, onBack }) {
       <div className="flex items-center gap-3">
         <button className="btn btn-sm" onClick={onBack}>← العودة</button>
         <h2 className="text-base font-semibold">{w.name}</h2>
-        <span className="text-erp-muted text-sm">{w.job_title}</span>
+        <span className="text-erp-muted text-sm">{JOB_TITLES.find(j => j.value === w.job_title)?.label || w.job_title}</span>
+        {w.is_active === false && <span className="badge badge-gray">معطَّل</span>}
       </div>
 
       {/* KPIs */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {[
-          { label: 'الأجر اليومي',     val: `${Number(w.daily_wage||0).toFixed(0)} ج`,    color: 'var(--teal)'  },
-          { label: 'الأجر الأسبوعي',   val: `${(Number(w.daily_wage||0)*6).toFixed(0)} ج`, color: 'var(--blue)'  },
-          { label: 'سلف قائمة',        val: `${Number(profile.pending_advances||0).toFixed(0)} ج`, color: 'var(--red)' },
-          { label: 'منح غير محسوبة',   val: `${Number(profile.pending_bonus||0).toFixed(0)} ج`, color: 'var(--green)' },
+          { label: 'الأجر اليومي',     val: egp(w.daily_wage),                    color: 'var(--teal)'  },
+          { label: 'الأجر الأسبوعي',   val: egp(Number(w.daily_wage||0)*6),       color: 'var(--blue)'  },
+          { label: 'سلف قائمة',        val: egp(profile.pending_advances),        color: 'var(--red)' },
+          { label: 'منح غير محسوبة',   val: egp(profile.pending_bonus),           color: 'var(--green)' },
         ].map(k => (
           <div key={k.label} className="card text-center py-3">
             <div className="text-xs text-erp-muted mb-1">{k.label}</div>
@@ -376,7 +407,7 @@ export function WorkerProfile({ workerId, onBack }) {
         )}
       </div>
 
-      <div className="grid gap-4" style={{ gridTemplateColumns:'1fr 1fr' }}>
+      <div className="grid gap-4 grid-cols-1 lg:grid-cols-2">
         {/* Advances */}
         <div className="card p-0 overflow-hidden">
           <div className="px-4 py-3 border-b border-erp-border text-sm font-semibold">
@@ -390,19 +421,19 @@ export function WorkerProfile({ workerId, onBack }) {
               <tbody>
                 {advances.map(a => (
                   <tr key={a.id}>
-                    <td className="text-xs text-erp-muted">{a.date}</td>
-                    <td><span className={`badge ${a.advance_type==='bonus' ? 'badge-green' : 'badge-amber'}`}>
-                      {a.advance_type==='bonus' ? 'منحة' : 'سلفة'}
+                    <td className="text-xs text-erp-muted">{fmtDate(a.date)}</td>
+                    <td><span className={`badge ${a.advance_type==='bonus' ? 'badge-green' : a.advance_type==='deduction' ? 'badge-red' : 'badge-amber'}`}>
+                      {ADV_LABEL[a.advance_type] || 'سلفة'}
                     </span></td>
                     <td className="font-semibold" style={{ color: a.advance_type==='bonus' ? 'var(--green)' : 'var(--red)' }}>
-                      {Number(a.amount).toFixed(0)} ج
+                      {egp(a.amount)}
                     </td>
                     <td><span className={`badge ${a.is_settled ? 'badge-gray' : 'badge-blue'}`}>
                       {a.is_settled ? 'محسوب' : 'قائم'}
                     </span></td>
                     <td>
                       {!a.is_settled && (
-                        <button className="btn btn-sm" style={{ color: 'var(--red)' }} onClick={() => deleteAdv(a)} title="حذف">🗑️</button>
+                        <button className="btn btn-sm" style={{ color: 'var(--red)' }} onClick={() => deleteAdv(a)} disabled={!!deletingId} title="حذف">{deletingId === a.id ? '…' : '🗑️'}</button>
                       )}
                     </td>
                   </tr>
@@ -424,11 +455,11 @@ export function WorkerProfile({ workerId, onBack }) {
               <thead><tr><th>الأسبوع</th><th>الأيام</th><th>الإجمالي</th><th>الصافي</th></tr></thead>
               <tbody>
                 {payroll_lines.slice(0,8).map((l,i) => (
-                  <tr key={i}>
-                    <td className="text-xs text-erp-muted">{l.week_start}</td>
+                  <tr key={`${l.week_start}-${i}`}>
+                    <td className="text-xs text-erp-muted">{fmtDate(l.week_start)}</td>
                     <td>{Number(l.days_worked||0).toFixed(1)}</td>
-                    <td>{Number(l.gross_amount||0).toFixed(0)} ج</td>
-                    <td className="font-semibold" style={{ color:'var(--teal)' }}>{Number(l.net_amount||0).toFixed(0)} ج</td>
+                    <td>{egp(l.gross_amount)}</td>
+                    <td className="font-semibold" style={{ color:'var(--teal)' }}>{egp(l.net_amount)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -458,9 +489,9 @@ export function WorkerProfile({ workerId, onBack }) {
                 ))}
               </div>
               <div><label className="field-label">المبلغ (ج) *</label>
-                <input className="field-input w-full" type="number" step="1" min="1"
+                <input className="field-input w-full" type="number" step="0.01" min="0.01"
                   value={advForm.amount} onChange={e => setAdvForm(f => ({...f, amount:e.target.value}))} /></div>
-              <div><label className="field-label">التاريخ</label>
+              <div><label className="field-label">التاريخ *</label>
                 <input className="field-input w-full" type="date" value={advForm.date}
                   onChange={e => setAdvForm(f => ({...f, date:e.target.value}))} /></div>
               <div><label className="field-label">ملاحظات</label>

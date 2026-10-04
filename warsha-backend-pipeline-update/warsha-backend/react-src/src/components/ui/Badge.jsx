@@ -6,6 +6,6 @@ export default function Badge({ label, type = 'gray', className = '' }) {
 
 export function StatusBadge({ map, value }) {
   const entry = map?.[value]
-  if (!entry) return <span className="badge badge-gray">{value || '—'}</span>
+  if (!entry) return <span className="badge badge-gray">{value == null || value === '' ? '—' : String(value)}</span>
   return <span className={`badge ${entry.badge}`}>{entry.label}</span>
 }

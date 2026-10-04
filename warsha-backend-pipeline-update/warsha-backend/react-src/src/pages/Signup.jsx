@@ -22,13 +22,23 @@ export default function Signup({ onBack }) {
     e.preventDefault()
     if (!form.workshop_name?.trim())  return toast('اسم الورشة مطلوب', 'error')
     if (!form.workshop_slug?.trim())  return toast('مُعرّف الورشة مطلوب', 'error')
+    // اسم عربي بالكامل بيطلع slug فاضي بعد التنظيف — الباك هيرفضه، فنوضح السبب هنا
+    const cleanSlug = slugify(form.workshop_slug)
+    if (!cleanSlug) return toast('مُعرّف الورشة لازم يحتوي حروف إنجليزية أو أرقام', 'error')
     if (!form.admin_username?.trim()) return toast('اسم مستخدم المدير مطلوب', 'error')
     if (!form.admin_password || form.admin_password.length < 6)
       return toast('كلمة المرور قصيرة جداً (6 أحرف على الأقل)', 'error')
+    if (loading) return
 
     setLoading(true)
     try {
-      await signup({ ...form, workshop_slug: slugify(form.workshop_slug) })
+      await signup({
+        ...form,
+        workshop_name: form.workshop_name.trim(),
+        workshop_slug: cleanSlug,
+        admin_username: form.admin_username.trim(),
+        admin_full_name: form.admin_full_name?.trim() || null,
+      })
       toast('تم إنشاء الورشة بنجاح — مرحباً')
     } catch (err) {
       toast(err.message || 'فشل إنشاء الحساب', 'error')

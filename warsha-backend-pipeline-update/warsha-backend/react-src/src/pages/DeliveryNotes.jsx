@@ -14,6 +14,12 @@ import { PageSpinner } from '../components/ui/Spinner'
 
 const today = () => new Date().toISOString().slice(0, 10)
 
+// تهريب HTML لأي بيانات مستخدم بتتكتب في نافذة الطباعة (document.write) —
+// من غيره وصف بند أو اسم عميل فيه <script> أو <img onerror> كان بيتنفّذ.
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+))
+
 const STATUS_AR    = { draft: 'مسودة', confirmed: 'مؤكد', delivered: 'مُسلَّم', cancelled: 'ملغي' }
 const STATUS_COLOR = { draft: 'var(--text-secondary)', confirmed: 'var(--teal)', delivered: '#15803d', cancelled: 'var(--red)' }
 
@@ -54,14 +60,15 @@ export default function DeliveryNotes() {
   const [newLine,    setNewLine]     = useState(EMPTY_LINE)
   const [confirmDel, setConfirmDel] = useState(null)
   const [confirmCancel, setConfirmCancel] = useState(null)
+  const [confirmDeliver, setConfirmDeliver] = useState(null)
   const [acting,     setActing]     = useState(false)
   const [activeTab,  setActiveTab]  = useState('basic')
 
   const loadOrders = useCallback(async () => {
     try {
       const data = await api.deliveryOrders.list()
-      setOrders(data)
-    } catch { toast('تعذّر تحميل أوامر التوريد', 'error') }
+      setOrders(Array.isArray(data) ? data : [])
+    } catch (e) { toast(e?.message ? `تعذّر تحميل أوامر التوريد: ${e.message}` : 'تعذّر تحميل أوامر التوريد', 'error') }
     finally { setLoadingOrders(false) }
   }, [])
 
@@ -79,6 +86,17 @@ export default function DeliveryNotes() {
 
   const addLine = () => {
     if (!newLine.description.trim()) { toast('أدخل وصف البند', 'error'); return }
+    const q = Number(newLine.qty)
+    if (!(q > 0)) { toast('الكمية لازم تكون رقم أكبر من صفر', 'error'); return }
+    if (newLine.work_order_id) {
+      const row = pipeline?.find(p => String(p.work_order_id) === String(newLine.work_order_id))
+      const already = form.lines
+        .filter(l => String(l.work_order_id) === String(newLine.work_order_id))
+        .reduce((sum, l) => sum + (Number(l.qty) || 0), 0)
+      if (row && row.fg_qty != null && q + already > Number(row.fg_qty) + 1e-9) {
+        toast(`الكمية (${q + already}) أكبر من رصيد المخزون الجاهز المتاح (${row.fg_qty}) لأمر الإنتاج ${row.work_order_code}`, 'error'); return
+      }
+    }
     setForm(prev => ({ ...prev, lines: [...prev.lines, { ...newLine, id: Date.now() }] }))
     setNewLine(EMPTY_LINE)
   }
@@ -91,6 +109,9 @@ export default function DeliveryNotes() {
     if (!form.lines.length)         { toast('أضف بنداً واحداً على الأقل', 'error'); return }
     if (!form.driver_name.trim())   { toast('اسم السائق مطلوب (تبويب السيارة والسائق)', 'error'); return }
     if (!form.vehicle_plate.trim()) { toast('رقم اللوحة مطلوب (تبويب السيارة والسائق)', 'error'); return }
+    if (form.delivery_date && form.delivery_date < form.order_date) {
+      toast('تاريخ التسليم لا يمكن أن يكون قبل تاريخ الأمر (تبويب التسليم والاستلام)', 'error'); return
+    }
 
     const created = await api.deliveryOrders.create({
       ...form,
@@ -140,7 +161,8 @@ export default function DeliveryNotes() {
   })
 
   const handlePrint = async (o) => {
-    const ws = await fetchWorkshopProfile()
+    let ws = {}
+    try { ws = (await fetchWorkshopProfile()) || {} } catch { ws = {} }
     const w = window.open('', '_blank', 'width=900,height=700')
     if (!w) { toast('فعّل النوافذ المنبثقة (popup) في المتصفح عشان تقدر تطبع', 'error'); return }
 
@@ -150,20 +172,20 @@ export default function DeliveryNotes() {
     // logo_data = base64 data:URI مخزّنة في DB — تعمل في popup بدون مصادقة
     const logoSrc = ws.logo_data || null
     const logoHtml = logoSrc
-      ? `<img src="${logoSrc}" style="height:64px;object-fit:contain;"/>`
-      : `<div style="width:64px;height:64px;background:#C8A550;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:900;color:#fff;">${(ws.name || 'W')[0]}</div>`
+      ? `<img src="${esc(logoSrc)}" style="height:64px;object-fit:contain;"/>`
+      : `<div style="width:64px;height:64px;background:#C8A550;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:900;color:#fff;">${esc((ws.name || 'W')[0])}</div>`
 
     const rows = (o.lines || []).map((l, i) => `
       <tr style="background:${i % 2 === 0 ? '#fafafa' : '#fff'}">
         <td style="padding:9px 10px;text-align:center;color:#999;font-size:12px">${i + 1}</td>
-        <td style="padding:9px 10px"><b>${l.description}</b>${l.model_no ? `<br/><small style="color:#888;font-size:10px">${l.model_no}</small>` : ''}</td>
-        <td style="padding:9px 10px;text-align:center">${l.qty} ${l.unit}</td>
-        <td style="padding:9px 10px;font-size:12px;color:#555">${l.notes || '—'}</td>
+        <td style="padding:9px 10px"><b>${esc(l.description)}</b>${l.model_no ? `<br/><small style="color:#888;font-size:10px">${esc(l.model_no)}</small>` : ''}</td>
+        <td style="padding:9px 10px;text-align:center">${esc(l.qty)} ${esc(l.unit)}</td>
+        <td style="padding:9px 10px;font-size:12px;color:#555">${esc(l.notes || '—')}</td>
       </tr>`).join('')
 
     w.document.write(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
-<head><meta charset="UTF-8"/><title>أمر توريد — ${o.code}</title>
+<head><meta charset="UTF-8"/><title>أمر توريد — ${esc(o.code)}</title>
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -208,18 +230,18 @@ tbody tr:last-child td{border-bottom:none;}
     <div style="display:flex;align-items:center;gap:14px;">
       ${logoHtml}
       <div>
-        <div style="font-size:18px;font-weight:900;color:#fff;">${ws.name || 'الورشة'}</div>
-        ${ws.address ? `<div style="font-size:11px;color:rgba(255,255,255,.65);margin-top:2px;">${ws.address}</div>` : ''}
-        ${ws.phone   ? `<div style="font-size:11px;color:rgba(255,255,255,.65);">📞 ${ws.phone}</div>` : ''}
-        ${ws.tax_id  ? `<div style="font-size:10px;color:rgba(255,255,255,.5);">الرقم الضريبي: ${ws.tax_id}</div>` : ''}
+        <div style="font-size:18px;font-weight:900;color:#fff;">${esc(ws.name || 'الورشة')}</div>
+        ${ws.address ? `<div style="font-size:11px;color:rgba(255,255,255,.65);margin-top:2px;">${esc(ws.address)}</div>` : ''}
+        ${ws.phone   ? `<div style="font-size:11px;color:rgba(255,255,255,.65);">📞 ${esc(ws.phone)}</div>` : ''}
+        ${ws.tax_id  ? `<div style="font-size:10px;color:rgba(255,255,255,.5);">الرقم الضريبي: ${esc(ws.tax_id)}</div>` : ''}
       </div>
     </div>
     <div style="text-align:left;">
       <div style="font-size:20px;font-weight:900;color:#C8A550;">أمر توريد</div>
-      <div style="font-size:12px;color:rgba(255,255,255,.6);margin-top:2px;">${o.code}</div>
-      <div style="font-size:11px;color:rgba(255,255,255,.65);margin-top:6px;">تاريخ الأمر: <b>${o.order_date}</b></div>
-      ${o.delivery_date ? `<div style="font-size:11px;color:rgba(255,255,255,.65);">تاريخ التسليم: <b>${o.delivery_date}</b></div>` : ''}
-      <div style="margin-top:4px;font-weight:800;color:${o.status === 'delivered' ? '#86efac' : '#C8A550'}">${statusAr}</div>
+      <div style="font-size:12px;color:rgba(255,255,255,.6);margin-top:2px;">${esc(o.code)}</div>
+      <div style="font-size:11px;color:rgba(255,255,255,.65);margin-top:6px;">تاريخ الأمر: <b>${esc(o.order_date)}</b></div>
+      ${o.delivery_date ? `<div style="font-size:11px;color:rgba(255,255,255,.65);">تاريخ التسليم: <b>${esc(o.delivery_date)}</b></div>` : ''}
+      <div style="margin-top:4px;font-weight:800;color:${esc(o.status === 'delivered' ? '#86efac' : '#C8A550')}">${esc(statusAr)}</div>
     </div>
   </div>
   <div class="gold-stripe"></div>
@@ -227,31 +249,31 @@ tbody tr:last-child td{border-bottom:none;}
     <div class="grid2">
       <div class="info-box">
         <h3>بيانات العميل / الجهة المستلِمة</h3>
-        <div class="info-row"><span>الاسم</span><span>${o.customer_name}</span></div>
-        ${o.customer_phone ? `<div class="info-row"><span>الهاتف</span><span>${o.customer_phone}</span></div>` : ''}
-        ${o.customer_address ? `<div class="info-row"><span>العنوان</span><span>${o.customer_address}</span></div>` : ''}
-        ${o.delivery_address ? `<div class="info-row"><span>عنوان التسليم</span><span>${o.delivery_address}</span></div>` : ''}
-        ${o.received_by ? `<div class="info-row"><span>المستلم</span><span>${o.received_by}</span></div>` : ''}
-        ${o.receiver_title ? `<div class="info-row"><span>الصفة</span><span>${o.receiver_title}</span></div>` : ''}
-        ${o.receiver_phone ? `<div class="info-row"><span>هاتف المستلم</span><span>${o.receiver_phone}</span></div>` : ''}
+        <div class="info-row"><span>الاسم</span><span>${esc(o.customer_name)}</span></div>
+        ${o.customer_phone ? `<div class="info-row"><span>الهاتف</span><span>${esc(o.customer_phone)}</span></div>` : ''}
+        ${o.customer_address ? `<div class="info-row"><span>العنوان</span><span>${esc(o.customer_address)}</span></div>` : ''}
+        ${o.delivery_address ? `<div class="info-row"><span>عنوان التسليم</span><span>${esc(o.delivery_address)}</span></div>` : ''}
+        ${o.received_by ? `<div class="info-row"><span>المستلم</span><span>${esc(o.received_by)}</span></div>` : ''}
+        ${o.receiver_title ? `<div class="info-row"><span>الصفة</span><span>${esc(o.receiver_title)}</span></div>` : ''}
+        ${o.receiver_phone ? `<div class="info-row"><span>هاتف المستلم</span><span>${esc(o.receiver_phone)}</span></div>` : ''}
       </div>
       <div class="info-box">
         <h3>بيانات الأمر</h3>
-        <div class="info-row"><span>رقم الأمر</span><span>${o.code}</span></div>
-        <div class="info-row"><span>تاريخ الإنشاء</span><span>${o.order_date}</span></div>
-        ${o.reference ? `<div class="info-row"><span>مرجع</span><span>${o.reference}</span></div>` : ''}
-        <div class="info-row"><span>الحالة</span><span style="font-weight:800;color:${statusColor}">${statusAr}</span></div>
+        <div class="info-row"><span>رقم الأمر</span><span>${esc(o.code)}</span></div>
+        <div class="info-row"><span>تاريخ الإنشاء</span><span>${esc(o.order_date)}</span></div>
+        ${o.reference ? `<div class="info-row"><span>مرجع</span><span>${esc(o.reference)}</span></div>` : ''}
+        <div class="info-row"><span>الحالة</span><span style="font-weight:800;color:${esc(statusColor)}">${esc(statusAr)}</span></div>
       </div>
     </div>
 
     <div class="vehicle-box">
       <h3>🚛 بيانات المركبة والسائق</h3>
       <div class="vehicle-grid">
-        <div class="v-item"><div class="label">رقم اللوحة</div><div class="value">${o.vehicle_plate || '—'}</div></div>
-        <div class="v-item"><div class="label">نوع المركبة</div><div class="value">${o.vehicle_type || '—'}</div></div>
-        <div class="v-item"><div class="label">اسم السائق</div><div class="value">${o.driver_name || '—'}</div></div>
-        <div class="v-item"><div class="label">رقم الرخصة</div><div class="value">${o.driver_license || '—'}</div></div>
-        <div class="v-item"><div class="label">موبايل السائق</div><div class="value">${o.driver_phone || '—'}</div></div>
+        <div class="v-item"><div class="label">رقم اللوحة</div><div class="value">${esc(o.vehicle_plate || '—')}</div></div>
+        <div class="v-item"><div class="label">نوع المركبة</div><div class="value">${esc(o.vehicle_type || '—')}</div></div>
+        <div class="v-item"><div class="label">اسم السائق</div><div class="value">${esc(o.driver_name || '—')}</div></div>
+        <div class="v-item"><div class="label">رقم الرخصة</div><div class="value">${esc(o.driver_license || '—')}</div></div>
+        <div class="v-item"><div class="label">موبايل السائق</div><div class="value">${esc(o.driver_phone || '—')}</div></div>
       </div>
     </div>
 
@@ -265,8 +287,8 @@ tbody tr:last-child td{border-bottom:none;}
       <tbody>${rows}</tbody>
     </table>
 
-    ${o.delivery_notes ? `<div style="background:#fffbf0;border:1px solid #fde68a;border-radius:8px;padding:12px 14px;margin-bottom:18px;font-size:12.5px;"><b>ملاحظات التسليم:</b> ${o.delivery_notes}</div>` : ''}
-    ${o.notes ? `<div style="background:#F8F7F4;border:1px solid #E8E6E0;border-radius:8px;padding:12px 14px;margin-bottom:18px;font-size:12.5px;"><b>ملاحظات:</b> ${o.notes}</div>` : ''}
+    ${o.delivery_notes ? `<div style="background:#fffbf0;border:1px solid #fde68a;border-radius:8px;padding:12px 14px;margin-bottom:18px;font-size:12.5px;"><b>ملاحظات التسليم:</b> ${esc(o.delivery_notes)}</div>` : ''}
+    ${o.notes ? `<div style="background:#F8F7F4;border:1px solid #E8E6E0;border-radius:8px;padding:12px 14px;margin-bottom:18px;font-size:12.5px;"><b>ملاحظات:</b> ${esc(o.notes)}</div>` : ''}
 
     <div class="sig-row">
       <div class="sig-box">
@@ -276,12 +298,12 @@ tbody tr:last-child td{border-bottom:none;}
       </div>
       <div class="sig-box">
         <div class="title">المستلِم / الطرف الثاني</div>
-        <div class="sub">${o.received_by || o.customer_name}</div>
+        <div class="sub">${esc(o.received_by || o.customer_name)}</div>
         <div class="line">التوقيع</div>
       </div>
       <div class="sig-box">
         <div class="title">السائق</div>
-        <div class="sub">${o.driver_name || '—'}</div>
+        <div class="sub">${esc(o.driver_name || '—')}</div>
         <div class="line">التوقيع</div>
       </div>
     </div>
@@ -356,8 +378,8 @@ tbody tr:last-child td{border-bottom:none;}
                 <td>{o.order_date}</td>
                 <td>{o.driver_name || '—'}</td>
                 <td style={{ fontFamily: 'monospace' }}>{o.vehicle_plate || '—'}</td>
-                <td><span style={{ color: STATUS_COLOR[o.status], fontWeight: 600 }}>{STATUS_AR[o.status]}</span></td>
-                <td style={{ color: 'var(--text-secondary)' }}>{o.lines.length} بند</td>
+                <td><span style={{ color: STATUS_COLOR[o.status], fontWeight: 600 }}>{STATUS_AR[o.status] || o.status}</span></td>
+                <td style={{ color: 'var(--text-secondary)' }}>{(o.lines || []).length} بند</td>
                 <td onClick={e => e.stopPropagation()} style={{ display: 'flex', gap: 4 }}>
                   <button className="btn-sm" onClick={() => handlePrint(o)}>🖨️</button>
                   {(o.status === 'draft' || o.status === 'cancelled') && (
@@ -412,7 +434,7 @@ tbody tr:last-child td{border-bottom:none;}
           <table className="erp-table text-sm" style={{ marginBottom: 14 }}>
             <thead><tr><th>#</th><th>الوصف</th><th>الموديل</th><th>الكمية</th><th>ملاحظات</th></tr></thead>
             <tbody>
-              {detail.lines.map((l, i) => (
+              {(detail.lines || []).map((l, i) => (
                 <tr key={i}>
                   <td style={{ color: 'var(--text-secondary)' }}>{i + 1}</td>
                   <td style={{ fontWeight: 600 }}>{l.description}</td>
@@ -436,7 +458,7 @@ tbody tr:last-child td{border-bottom:none;}
               <button className="btn-teal" onClick={() => handleConfirm(detail)} disabled={acting}>✓ تأكيد الأمر</button>
             )}
             {detail.status === 'confirmed' && (
-              <button className="btn-teal" onClick={() => handleDeliver(detail)} disabled={acting}>🚛 تسجيل التسليم</button>
+              <button className="btn-teal" onClick={() => setConfirmDeliver(detail)} disabled={acting}>🚛 تسجيل التسليم</button>
             )}
             {(detail.status === 'draft' || detail.status === 'confirmed') && (
               <button className="btn-danger" onClick={() => setConfirmCancel(detail)} disabled={acting}>
@@ -615,6 +637,15 @@ tbody tr:last-child td{border-bottom:none;}
         message="هل تريد حذف أمر التوريد هذا نهائياً؟"
         onConfirm={() => { handleDelete(confirmDel); setConfirmDel(null) }}
         onCancel={() => setConfirmDel(null)}
+      />
+
+      <ConfirmDialog
+        open={!!confirmDeliver}
+        title="تسجيل التسليم"
+        message={`تأكيد تسليم أمر التوريد "${confirmDeliver?.code}"؟ البنود المرتبطة بأوامر إنتاج هتتخصم فعليًا من المخزون الجاهز (FG).`}
+        confirmLabel="تأكيد التسليم"
+        onConfirm={() => { const o = confirmDeliver; setConfirmDeliver(null); if (o) handleDeliver(o) }}
+        onCancel={() => setConfirmDeliver(null)}
       />
 
       <ConfirmDialog

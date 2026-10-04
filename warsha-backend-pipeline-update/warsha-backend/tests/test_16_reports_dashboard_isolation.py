@@ -229,3 +229,145 @@ async def test_period_comparison_cogs_includes_supply_contract_sales(cli):
     assert cur["cogs_actual"] == 50.0
     assert cur["profit"] == round(cur["sales_total"] - cur["cogs_actual"], 2)
     assert cur["profit"] < cur["sales_total"]
+
+
+# ════════════════ Reports hardening — دقة الأرقام وأمان التصدير ═════════════
+@pytest.mark.asyncio
+async def test_aging_and_receivables_include_overdue_status(cli):
+    """installment_scheduler بيكتب Invoice.status='overdue' فعليًا — قبل الإصلاح
+    الفاتورة دي كانت بتختفي من الـ aging ومن إجمالي المستحقات."""
+    cid = await _make_customer_pc(cli, "عميل متأخر")
+    past = date(2020, 1, 1).isoformat()
+    r = await cli.post(f"{SALES}/invoices", json={
+        "customer_id": cid, "date": past, "due_date": "2020-01-15",
+        "lines": [{"description": "بند", "qty": 1, "unit_price": 700}],
+    })
+    assert r.status_code == 201, r.text
+    iid = r.json()["id"]
+
+    s = await cli.post(f"{SALES}/admin/run-installment-scheduler")
+    assert s.status_code == 200, s.text
+
+    from app.core.database import AsyncSessionLocal
+    from app.models.models import Invoice
+    async with AsyncSessionLocal() as db:
+        inv = await db.get(Invoice, iid)
+        assert inv.status == "overdue"
+
+    aging = (await cli.get(f"{REPORTS}/sales/aging")).json()
+    codes = [e["id"] for b in aging["buckets"].values() for e in b]
+    assert iid in codes
+    assert aging["totals_by_bucket"]["90+"] >= 700
+
+    exe = (await cli.get(f"{REPORTS}/dashboard")).json()
+    assert exe["sales"]["total_receivable"] >= 700
+    k = (await cli.get(f"{DASHBOARD}/kpis")).json()
+    assert k["receivables"]["value"] >= 700
+
+    pr = await cli.get(f"{REPORTS}/sales/aging/print")
+    assert pr.status_code == 200
+    assert r.json()["code"] in pr.text
+
+
+@pytest.mark.asyncio
+async def test_reports_reject_inverted_date_range(cli):
+    for path in ("/sales/summary", "/cashflow", "/period-comparison",
+                 "/production/scrap-analysis", "/payments/history"):
+        r = await cli.get(f"{REPORTS}{path}",
+                          params={"date_from": "2025-02-01", "date_to": "2025-01-01"})
+        assert r.status_code == 400, (path, r.text)
+
+
+@pytest.mark.asyncio
+async def test_csv_export_neutralises_formula_injection(cli):
+    r = await cli.post(CUST, json={"name": "=HYPERLINK(\"http://evil\",\"x\")"})
+    assert r.status_code == 201, r.text
+    body = (await cli.get(f"{REPORTS}/export/customers")).content.decode("utf-8-sig")
+    lines = body.strip().splitlines()[1:]
+    assert any(ln.startswith("\"'=HYPERLINK") or ln.startswith("'=HYPERLINK") for ln in lines), lines
+    assert not any(ln.startswith("=") for ln in lines)
+
+
+@pytest.mark.asyncio
+async def test_export_customer_ledger_cross_tenant_blocked(cli, cli2):
+    cid = await _make_customer_pc(cli, "عميل كشف T1")
+    r_own = await cli.get(f"{REPORTS}/export/customer-ledger/{cid}")
+    assert r_own.status_code == 200, r_own.text
+    r_other = await cli2.get(f"{REPORTS}/export/customer-ledger/{cid}")
+    assert r_other.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_dashboard_production_chart_six_distinct_months(cli):
+    r = await cli.get(f"{DASHBOARD}/charts/production")
+    assert r.status_code == 200
+    labels = r.json()["labels"]
+    assert len(labels) == 6 and len(set(labels)) == 6
+
+
+@pytest.mark.asyncio
+async def test_all_report_and_export_endpoints_respond_with_data(cli):
+    """smoke: كل endpoints التقارير/التصدير لازم ترجع 200 وفيه بيانات فعلية
+    (export/customers كان بيرمي 500 لأن Customer مالوش email)."""
+    await _seed_coa(cli)
+    cid = await _make_customer_pc(cli, "عميل smoke")
+    await _make_material_pc(cli, unit_cost=3.0, qty=10)
+    r = await cli.post(f"{SALES}/invoices", json={
+        "customer_id": cid, "date": date.today().isoformat(),
+        "lines": [{"description": "بند", "qty": 2, "unit_price": 50}],
+    })
+    assert r.status_code == 201, r.text
+    paths = [
+        "/inventory/value", "/inventory/movement", "/inventory/slow-moving",
+        "/inventory/summary", "/inventory/transactions", "/inventory/reconciliation",
+        "/production/summary", "/production/scrap-analysis", "/profitability",
+        "/sales/summary", "/sales/aging", "/sales/installments/upcoming",
+        "/sales/installments/overdue", "/sales/installments/all",
+        "/sales/installments/badge", "/sales/by-customer", "/purchases/summary",
+        "/purchases/by-supplier", "/workers/summary", "/labor-performance",
+        "/period-comparison", "/dashboard", "/cashflow", "/analytics/monthly-sales",
+        "/analytics/production-by-type", "/payments/history", "/sales/aging/print",
+        "/export/materials", "/export/invoices", "/export/customers",
+        "/export/work-orders", "/export/quotations", "/export/profitability",
+        "/export/cashflow", "/export/labor-performance", "/export/period-comparison",
+        f"/export/customer-ledger/{cid}",
+    ]
+    for p in paths:
+        resp = await cli.get(f"{REPORTS}{p}")
+        assert resp.status_code == 200, (p, resp.status_code, resp.text[:300])
+    for p in ("/full", "/kpis", "/alerts", "/charts/production", "/charts/cashflow", "/charts/costs"):
+        resp = await cli.get(f"{DASHBOARD}{p}")
+        assert resp.status_code == 200, (p, resp.text[:300])
+
+
+@pytest.mark.asyncio
+async def test_cashflow_excludes_bounced_cheques_and_matches_treasury_balance(cli):
+    """الشيك المرتد بيتعكس أثره على رصيد الخزنة — تقرير التدفق النقدي لازم
+    يستبعده عشان closing_balance يطابق رصيد الخزنة الفعلي."""
+    T = "/api/v1/treasury"
+    r = await cli.post(f"{T}/accounts", json={"name": "خزنة تقرير", "kind": "cash",
+                                               "opening_balance": 1000})
+    assert r.status_code == 201, r.text
+    tr_id = r.json()["id"]
+    today = date.today().isoformat()
+    ok = await cli.post(f"{T}/transactions", json={
+        "treasury_id": tr_id, "direction": "in", "amount": 200, "txn_date": today})
+    assert ok.status_code == 201, ok.text
+    chq = await cli.post(f"{T}/transactions", json={
+        "treasury_id": tr_id, "direction": "in", "amount": 500, "txn_date": today,
+        "payment_method": "cheque", "cheque_number": "123", "cheque_date": today})
+    assert chq.status_code == 201, chq.text
+    b = await cli.patch(f"{T}/cheques/{chq.json()['id']}/status", json={"cheque_status": "bounced"})
+    assert b.status_code == 200, b.text
+
+    rep = (await cli.get(f"{REPORTS}/cashflow",
+                         params={"date_from": today, "date_to": today, "treasury_id": tr_id})).json()
+    assert rep["total_in"] == 200.0
+    assert rep["opening_balance"] == 1000.0
+    assert rep["closing_balance"] == 1200.0
+    bal = [t for t in rep["treasuries"] if t["id"] == tr_id][0]["balance"]
+    assert rep["closing_balance"] == bal
+
+    pc = (await cli.get(f"{REPORTS}/period-comparison",
+                        params={"date_from": today, "date_to": today})).json()
+    assert pc["current"]["cashflow_in"] == 200.0

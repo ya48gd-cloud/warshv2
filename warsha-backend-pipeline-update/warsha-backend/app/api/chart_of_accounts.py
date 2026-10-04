@@ -3,16 +3,16 @@ Chart of Accounts + Trial Balance + Double-Entry Journal
 دليل الحسابات + ميزان المراجعة + ربط دفعات العميل بالفواتير
 """
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, validator
 
-from app.core.database import get_db
+from app.core.database import get_db, current_tenant_id as _ctid
 from app.api.auth import require_any
 from app.models.models import (
     ChartOfAccount, AccountingEntry, AccountingEntryLine,
@@ -20,13 +20,40 @@ from app.models.models import (
     Customer,
 )
 
-router = APIRouter(prefix="/accounts", tags=["accounting_v2"], dependencies=[Depends(require_any)])
+# ── RBAC للكتابة ──────────────────────────────────────────────────────────
+# إصلاح ثغرة صلاحيات: الراوتر كان محمي بـ require_any بس — يعني مستخدم
+# "مشاهد" (viewer) أو "إنتاج" يقدر بطلب API مباشر ينشئ/يرحّل قيود يدوية،
+# يعدّل دليل الحسابات، يسجّل سداد/مخصص ضرائب، ويخصص دفعات على فواتير.
+# القراءة (التقارير) تفضل متاحة لأي مستخدم مسجّل زي ما هي.
+ACCOUNTING_WRITE_ROLES = ("admin", "accountant")
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def require_accounting_write(request: Request, user: dict = Depends(require_any)) -> dict:
+    if request.method.upper() not in _READ_METHODS and user.get("role") not in ACCOUNTING_WRITE_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"صلاحية '{user.get('role')}' غير كافية لتعديل الحسابات. مطلوب: {list(ACCOUNTING_WRITE_ROLES)}",
+        )
+    return user
+
+
+router = APIRouter(prefix="/accounts", tags=["accounting_v2"],
+                   dependencies=[Depends(require_any), Depends(require_accounting_write)])
+
+
+def _check_date_range(from_date: Optional[date], to_date: Optional[date]):
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(400, "تاريخ البداية يجب أن يكون قبل أو يساوي تاريخ النهاية")
 
 
 # ── Schemas ────────────────────────────────────────────────────
 
 _VALID_ACCOUNT_TYPES = {"asset", "liability", "equity", "revenue", "expense"}
 _VALID_SIDES = {"debit", "credit"}
+# مصادر مسموحة للقيود اليدوية فقط — مصادر القيود التلقائية (sales_invoice,
+# fixed_asset_purchase, ...) محجوزة لخدمة auto_journal
+_MANUAL_ENTRY_SOURCES = {"manual", "opening", "adjustment", "closing"}
 
 
 class AccountIn(BaseModel):
@@ -37,6 +64,30 @@ class AccountIn(BaseModel):
     normal_balance: str = "debit"
     parent_id: Optional[int] = None
     notes: Optional[str] = None
+
+    @validator("code")
+    def _valid_code(cls, v):
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("كود الحساب مطلوب")
+        if len(v) > 20:
+            raise ValueError("كود الحساب لا يزيد عن 20 حرفاً")
+        return v
+
+    @validator("name_ar")
+    def _valid_name_ar(cls, v):
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("اسم الحساب مطلوب")
+        if len(v) > 200:
+            raise ValueError("اسم الحساب لا يزيد عن 200 حرف")
+        return v
+
+    @validator("name_en")
+    def _valid_name_en(cls, v):
+        if v is not None and len(v) > 200:
+            raise ValueError("الاسم الإنجليزي لا يزيد عن 200 حرف")
+        return v
 
     @validator("account_type")
     def _valid_account_type(cls, v):
@@ -72,6 +123,13 @@ class EntryLineIn(BaseModel):
     def _positive_amount(cls, v):
         if v <= 0:
             raise ValueError("amount يجب أن يكون أكبر من صفر")
+        # العمود Numeric(14,2) — نقرّب هنا صراحةً قبل فحص التوازن، وإلا قيد
+        # متوازن بـ 3 خانات عشرية يتخزن مقرّباً فيطلع غير متوازن في الدفتر
+        v = v.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if v <= 0:
+            raise ValueError("amount يجب أن يكون أكبر من صفر")
+        if v >= Decimal("1000000000000"):
+            raise ValueError("amount أكبر من الحد المسموح")
         return v
 
 
@@ -83,11 +141,44 @@ class EntryIn(BaseModel):
     source_id: Optional[int] = None
     lines: List[EntryLineIn]
 
+    @validator("description")
+    def _valid_description(cls, v):
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("وصف القيد مطلوب")
+        if len(v) > 400:
+            raise ValueError("وصف القيد لا يزيد عن 400 حرف")
+        return v
+
+    @validator("reference")
+    def _valid_reference(cls, v):
+        if v is not None and len(v) > 100:
+            raise ValueError("المرجع لا يزيد عن 100 حرف")
+        return v
+
+    @validator("source")
+    def _valid_source(cls, v):
+        # إصلاح ثغرة mass-assignment: الـ source كان حر تماماً — قيد يدوي بـ
+        # source="fixed_asset_purchase"/"sales_invoice"/... + source_id مزوّر كان
+        # بيتلقط بعدين من journal_reverse_entry (اللي بتدور على آخر قيد بنفس
+        # (source, source_id)) فيتعكس القيد اليدوي بدل القيد الحقيقي ويختل الدفتر.
+        v = (v or "manual").strip() or "manual"
+        if v not in _MANUAL_ENTRY_SOURCES:
+            raise ValueError(f"source للقيد اليدوي يجب أن يكون أحد: {sorted(_MANUAL_ENTRY_SOURCES)}")
+        return v
+
     @validator("lines")
     def balanced(cls, lines):
+        # إصلاح ثغرة تحقق: قائمة سطور فاضية (أو سطر واحد) كانت بتعدي كـ"متوازنة"
+        # (0 == 0) فيتسجّل قيد بلا أي أثر أو بطرف واحد فقط
+        if len(lines) < 2:
+            raise ValueError("القيد يجب أن يحتوي على سطرين على الأقل")
+        if not any(l.side == "debit" for l in lines) or not any(l.side == "credit" for l in lines):
+            raise ValueError("القيد يجب أن يحتوي على طرف مدين وطرف دائن")
         debits = sum(l.amount for l in lines if l.side == "debit")
         credits = sum(l.amount for l in lines if l.side == "credit")
-        if abs(debits - credits) > Decimal("0.01"):
+        # المبالغ مقرّبة لخانتين — لازم تساوي تام (فرق 0.01 كان بيعدي ويختل الميزان)
+        if debits != credits:
             raise ValueError(f"القيد غير متوازن: مدين={float(debits):.2f}, دائن={float(credits):.2f}")
         return lines
 
@@ -217,10 +308,45 @@ async def seed_chart(db: AsyncSession = Depends(get_db)):
     return {"message": "تم زرع دليل الحسابات", "count": added}
 
 
+# أكواد الحسابات اللي خدمة القيود التلقائية (auto_journal / الأصول الثابتة /
+# الضرائب) بتدور عليها بالكود حرفياً — تغيير كود واحد منها كان بيخلي كل
+# القيود التلقائية المرتبطة بيه تتخطى بصمت (_post_entry بترجع من غير قيد).
+_SYSTEM_ACCOUNT_CODES = {c for c, *_ in DEFAULT_ACCOUNTS}
+
+
+async def _get_tenant_account(db: AsyncSession, tid: int, acc_id: int) -> Optional[ChartOfAccount]:
+    acc = await db.get(ChartOfAccount, acc_id)
+    if not acc or acc.tenant_id != tid:
+        return None
+    return acc
+
+
+async def _validate_parent(db: AsyncSession, tid: int, parent_id: Optional[int], self_id: Optional[int] = None):
+    """إصلاح ثغرة عزل/تحقق: parent_id كان يُقبل من غير أي تحقق — حساب أب من
+    ورشة تانية، أو غير موجود، أو الحساب نفسه/أحد أبنائه (حلقة لا نهائية في الشجرة)."""
+    if parent_id is None:
+        return
+    if self_id is not None and parent_id == self_id:
+        raise HTTPException(400, "لا يمكن أن يكون الحساب أباً لنفسه")
+    parent = await _get_tenant_account(db, tid, parent_id)
+    if not parent:
+        raise HTTPException(400, "الحساب الأب غير موجود")
+    if self_id is not None:
+        # امشِ لأعلى من الأب — لو قابلنا الحساب نفسه يبقى فيه حلقة
+        seen = set()
+        cur = parent
+        while cur is not None and cur.parent_id is not None and cur.id not in seen:
+            seen.add(cur.id)
+            if cur.parent_id == self_id:
+                raise HTTPException(400, "لا يمكن جعل أحد الحسابات الفرعية أباً لحسابه الأصلي")
+            cur = await _get_tenant_account(db, tid, cur.parent_id)
+
+
 @router.post("/chart", status_code=201)
 async def create_account(data: AccountIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
+    await _validate_parent(db, tid, data.parent_id)
 
     exists = await db.scalar(
         select(ChartOfAccount.id).where(ChartOfAccount.code == data.code, ChartOfAccount.tenant_id == tid)
@@ -237,9 +363,16 @@ async def create_account(data: AccountIn, db: AsyncSession = Depends(get_db)):
 
 @router.put("/chart/{acc_id}")
 async def update_account(acc_id: int, data: AccountIn, db: AsyncSession = Depends(get_db)):
-    acc = await db.get(ChartOfAccount, acc_id)
+    tid = _ctid.get() or 1
+    acc = await _get_tenant_account(db, tid, acc_id)
     if not acc:
-        raise HTTPException(404)
+        raise HTTPException(404, "الحساب غير موجود")
+    await _validate_parent(db, tid, data.parent_id, self_id=acc_id)
+    if data.code != acc.code and acc.code in _SYSTEM_ACCOUNT_CODES:
+        raise HTTPException(
+            400,
+            f"لا يمكن تغيير كود الحساب {acc.code} — حساب نظام تعتمد عليه القيود التلقائية (يمكن تعديل الاسم فقط)",
+        )
     if data.code != acc.code:
         # منع كودين لنفس الحساب لنفس الـ tenant — كود مكرر يخلي _get_account_id/
         # trial-balance يلقوا حسابين بنفس الكود وده بيكسر ربط القيود التلقائية بحساب محدد
@@ -271,6 +404,7 @@ async def list_entries(
 ):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
+    _check_date_range(from_date, to_date)
     q = select(AccountingEntry).options(selectinload(AccountingEntry.lines)).where(AccountingEntry.tenant_id == tid)
     if from_date:
         q = q.where(AccountingEntry.entry_date >= from_date)
@@ -303,6 +437,16 @@ async def create_entry(data: EntryIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
 
+    # إصلاح ثغرة عزل: التحقق من الحسابات كان بـ db.get من غير مقارنة tenant_id —
+    # ومكانه كان بعد إنشاء رأس القيد. دلوقتي نتحقق من كل الحسابات الأول:
+    # لازم تكون موجودة، تابعة لنفس الورشة، ونشطة.
+    for ld in data.lines:
+        acc = await _get_tenant_account(db, tid, ld.account_id)
+        if not acc:
+            raise HTTPException(400, f"الحساب {ld.account_id} غير موجود")
+        if not acc.is_active:
+            raise HTTPException(400, f"الحساب {acc.code} غير نشط — لا يمكن القيد عليه")
+
     entry = AccountingEntry(
         tenant_id=tid,
         entry_date=data.entry_date,
@@ -310,14 +454,13 @@ async def create_entry(data: EntryIn, db: AsyncSession = Depends(get_db)):
         description=data.description,
         source=data.source,
         source_id=data.source_id,
+        period_year=data.entry_date.year,
+        period_month=data.entry_date.month,
     )
     db.add(entry)
     await db.flush()
 
     for ld in data.lines:
-        acc = await db.get(ChartOfAccount, ld.account_id)
-        if not acc:
-            raise HTTPException(400, f"الحساب {ld.account_id} غير موجود")
         db.add(AccountingEntryLine(
             entry_id=entry.id,
             account_id=ld.account_id,
@@ -336,11 +479,20 @@ async def create_entry(data: EntryIn, db: AsyncSession = Depends(get_db)):
 @router.patch("/entries/{entry_id}/post")
 async def post_entry(entry_id: int, db: AsyncSession = Depends(get_db)):
     """ترحيل القيد — بعد الترحيل لا يمكن التعديل"""
+    tid = _ctid.get() or 1
     e = await db.get(AccountingEntry, entry_id)
-    if not e:
-        raise HTTPException(404)
+    if not e or e.tenant_id != tid:
+        raise HTTPException(404, "القيد غير موجود")
     if e.posted:
         raise HTTPException(400, "القيد مرحّل بالفعل")
+    # دفاع إضافي: لا نرحّل قيداً غير متوازن أو بلا سطور (قيود قديمة قبل التحقق)
+    lines = (await db.execute(
+        select(AccountingEntryLine).where(AccountingEntryLine.entry_id == entry_id)
+    )).scalars().all()
+    deb = sum((l.amount for l in lines if l.side == "debit"), Decimal("0"))
+    cre = sum((l.amount for l in lines if l.side == "credit"), Decimal("0"))
+    if not lines or deb <= 0 or abs(deb - cre) > Decimal("0.01"):
+        raise HTTPException(400, "لا يمكن ترحيل قيد فارغ أو غير متوازن")
     e.posted = True
     await db.commit()
     return {"id": entry_id, "posted": True}
@@ -363,6 +515,7 @@ async def trial_balance(
     from app.core.database import current_tenant_id
     from app.models.models import JournalEntry
     tid = current_tenant_id.get() or 1
+    _check_date_range(from_date, to_date)
 
     # 1. من القيود الجديدة (accounting_entry_lines)
     q = (
@@ -452,7 +605,7 @@ async def allocate_payment(
     tid = current_tenant_id.get() or 1
 
     payment = await db.get(CustomerPayment, payment_id)
-    if not payment:
+    if not payment or payment.tenant_id != tid:
         raise HTTPException(404, "الدفعة غير موجودة")
 
     # المبالغ المخصصة مسبقاً
@@ -470,8 +623,14 @@ async def allocate_payment(
     results = []
     for alloc in allocations:
         inv = await db.get(Invoice, alloc.invoice_id)
-        if not inv:
+        if not inv or inv.tenant_id != tid:
             raise HTTPException(404, f"الفاتورة {alloc.invoice_id} غير موجودة")
+        # إصلاح ثغرة تحقق: دفعة عميل كانت تتخصص على فاتورة عميل تاني — فتتقفل
+        # فاتورة عميل ب بفلوس عميل أ ويختل رصيد/كشف حساب الاتنين
+        if inv.customer_id != payment.customer_id:
+            raise HTTPException(400, f"الفاتورة {inv.code} لا تخص عميل هذه الدفعة")
+        if (inv.status or "") == "cancelled":
+            raise HTTPException(400, f"الفاتورة {inv.code} ملغاة — لا يمكن التخصيص عليها")
 
         remaining_inv = inv.total - inv.paid_amount
         if alloc.amount > remaining_inv + Decimal("0.01"):
@@ -504,6 +663,10 @@ async def allocate_payment(
 
 @router.get("/payments/{payment_id}/allocations")
 async def get_allocations(payment_id: int, db: AsyncSession = Depends(get_db)):
+    tid = _ctid.get() or 1
+    payment = await db.get(CustomerPayment, payment_id)
+    if not payment or payment.tenant_id != tid:
+        raise HTTPException(404, "الدفعة غير موجودة")
     res = await db.execute(
         select(CustomerPaymentAllocation)
         .options(selectinload(CustomerPaymentAllocation.invoice))
@@ -532,6 +695,7 @@ async def income_statement(
     """قائمة دخل مبسطة من accounting_entries"""
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
+    _check_date_range(from_date, to_date)
 
     q = (
         select(
@@ -690,6 +854,8 @@ async def vat_return(
     """
     from app.models.models import Invoice, PurchaseInvoice
     from sqlalchemy import extract
+    _check_date_range(from_date, to_date)
+    tid = _ctid.get() or 1
 
     q_sales = select(
         func.coalesce(func.sum(Invoice.tax_amount), 0).label("output_vat"),
@@ -714,6 +880,12 @@ async def vat_return(
     # Only invoices with actual tax
     q_sales = q_sales.where(Invoice.tax_amount > 0)
     q_pur   = q_pur.where(PurchaseInvoice.tax_amount > 0)
+
+    # إصلاح ثغرة عزل/صحة: الاستعلام كان بلا فلتر tenant صريح (بيعتمد بس على
+    # الفلتر العام) وبيحسب الفواتير الملغاة ضمن ضريبة المخرجات/المدخلات —
+    # فاتورة ملغاة (قيدها معكوس) كانت بتضخّم الضريبة المستحقة للمصلحة.
+    q_sales = q_sales.where(Invoice.tenant_id == tid, func.coalesce(Invoice.status, "") != "cancelled")
+    q_pur   = q_pur.where(PurchaseInvoice.tenant_id == tid, func.coalesce(PurchaseInvoice.status, "") != "cancelled")
 
     sales_row = (await db.execute(q_sales)).one()
     pur_row   = (await db.execute(q_pur)).one()
@@ -792,6 +964,9 @@ async def tax_summary(
     """
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
+    _check_date_range(from_date, to_date)
+    if not (0 <= income_tax_rate <= 1):
+        raise HTTPException(400, "income_tax_rate يجب أن يكون بين 0 و 1")
     as_of = to_date or date.today()
 
     vat = await vat_return(from_date, to_date, db)
@@ -851,6 +1026,32 @@ class TaxProvisionIn(BaseModel):
     notes: Optional[str] = None
 
 
+def _tax_amount(v: float) -> Decimal:
+    """تحويل آمن للمبلغ: يرفض NaN/Infinity (كانت بتعمل 500) ويقرّب لخانتين"""
+    try:
+        amount = Decimal(str(v))
+    except Exception:
+        raise HTTPException(400, "المبلغ غير صحيح")
+    if not amount.is_finite():
+        raise HTTPException(400, "المبلغ غير صحيح")
+    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if amount <= 0:
+        raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
+    return amount
+
+
+async def _require_active_account(db: AsyncSession, tid: int, code: str) -> ChartOfAccount:
+    acc = await db.scalar(
+        select(ChartOfAccount).where(
+            ChartOfAccount.tenant_id == tid, ChartOfAccount.code == code,
+            ChartOfAccount.is_active == True,
+        )
+    )
+    if not acc:
+        raise HTTPException(400, f"حساب {code} غير موجود في دليل الحسابات — رجاء عمل seed لدليل الحسابات أولاً")
+    return acc
+
+
 @router.post("/tax-payment")
 async def record_tax_payment(data: TaxPaymentIn, db: AsyncSession = Depends(get_db)):
     """تسجيل سداد ضريبة لمصلحة الضرائب: مدين حساب الضريبة المستحقة، دائن الصندوق/البنك"""
@@ -858,22 +1059,29 @@ async def record_tax_payment(data: TaxPaymentIn, db: AsyncSession = Depends(get_
 
     if data.tax_type not in TAX_TYPE_ACCOUNTS:
         raise HTTPException(400, "نوع الضريبة غير صحيح")
-    amount = Decimal(str(data.amount))
-    if amount <= 0:
-        raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
+    amount = _tax_amount(data.amount)
 
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
     pay_date = data.payment_date or date.today()
     tax_account = TAX_TYPE_ACCOUNTS[data.tax_type]
 
+    # إصلاح ثغرة: لو حساب الضريبة أو حساب الدفع مش موجود (أو كود غلط)،
+    # _post_entry كانت بتتخطى القيد بصمت والـ endpoint يرجع ok=True — المستخدم
+    # يفتكر إن السداد اتسجّل وهو ماتسجلش. كمان حساب الدفع لازم يكون حساب أصول
+    # (صندوق/بنك) مش أي حساب (مثلاً إيراد أو نفس حساب الضريبة).
+    await _require_active_account(db, tid, tax_account)
+    cash_acc = await _require_active_account(db, tid, (data.cash_account_code or "").strip())
+    if cash_acc.account_type != "asset" or cash_acc.code in ("1400", "1410"):
+        raise HTTPException(400, "حساب السداد يجب أن يكون حساب نقدية/بنك (أصول متداولة)")
+
     await _post_entry(
         db, tid, pay_date,
-        data.notes or f"سداد ضريبة ({data.tax_type}) لمصلحة الضرائب",
+        (data.notes or f"سداد ضريبة ({data.tax_type}) لمصلحة الضرائب")[:400],
         f"tax-payment-{data.tax_type}", "tax_payment", 0,
         [
             {"account_code": tax_account, "side": "debit", "amount": amount},
-            {"account_code": data.cash_account_code, "side": "credit", "amount": amount},
+            {"account_id": cash_acc.id, "side": "credit", "amount": amount},
         ],
     )
     await db.commit()
@@ -885,17 +1093,18 @@ async def record_tax_provision(data: TaxProvisionIn, db: AsyncSession = Depends(
     """تسجيل مخصص ضريبة الدخل التقديري: مدين مصروف ضريبة الدخل، دائن ضريبة الدخل المستحقة"""
     from app.services.auto_journal import _post_entry
 
-    amount = Decimal(str(data.amount))
-    if amount <= 0:
-        raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
+    amount = _tax_amount(data.amount)
 
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get() or 1
     prov_date = data.provision_date or date.today()
+    # نفس إصلاح tax-payment: لا نرجّع ok=True لو القيد اتخطّى بصمت
+    await _require_active_account(db, tid, "5800")
+    await _require_active_account(db, tid, "2330")
 
     await _post_entry(
         db, tid, prov_date,
-        data.notes or "مخصص ضريبة الدخل التقديري",
+        (data.notes or "مخصص ضريبة الدخل التقديري")[:400],
         "tax-provision", "tax_provision", 0,
         [
             {"account_code": "5800", "side": "debit", "amount": amount},

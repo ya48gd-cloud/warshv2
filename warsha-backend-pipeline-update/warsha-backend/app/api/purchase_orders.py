@@ -6,7 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -14,13 +14,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from app.services.analytics import log_event, Events
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, get_current_user
 from app.models.models import (
     PurchaseOrder, PurchaseOrderLine, Supplier,
     Material, StockMovement, PurchaseInvoice, PurchaseInvoiceLine,
 )
 
-router = APIRouter(prefix="/purchase-orders", tags=["purchase_orders"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر ينشئ/يعتمد/يستلم/
+    يحذف أوامر شراء بطلب API مباشر رغم إن الواجهة مخبية الأزرار."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
+router = APIRouter(prefix="/purchase-orders", tags=["purchase_orders"],
+                   dependencies=[Depends(require_any), Depends(_block_viewer_writes)])
 print_router = APIRouter(prefix="/purchase-orders", tags=["purchase_orders_print"], dependencies=[Depends(require_any)])
 
 
@@ -87,15 +99,45 @@ async def _tenant_po_query(po_id: int):
     return q
 
 
+async def _po_code_exists_globally(db: AsyncSession, code: str) -> bool:
+    """purchase_orders.code عليه unique=True على مستوى الجدول كله (مش لكل tenant)،
+    بينما الفلتر التلقائي (tenant_events) كان بيحصر فحص التكرار في الـ tenant
+    الحالي بس — فـ tenant تاني يعمل أول أمر شراء له ياخد PO-0001 المستخدم عند
+    tenant تاني → IntegrityError (500). الفحص لازم يكون على نطاق القيد الفعلي.
+    (الإصلاح الجذري = قيد (tenant_id, code) — محتاج migration.)"""
+    return bool(await db.scalar(
+        select(PurchaseOrder.id).where(PurchaseOrder.code == code).limit(1)
+        .execution_options(skip_tenant_filter=True)
+    ))
+
+
 async def _next_po_code(db: AsyncSession) -> str:
     count = await db.scalar(select(func.count()).select_from(PurchaseOrder))
     n = (count or 0) + 1
     while True:
         code = f"PO-{n:04d}"
-        exists = await db.scalar(select(PurchaseOrder.id).where(PurchaseOrder.code == code))
-        if not exists:
+        if not await _po_code_exists_globally(db, code):
             return code
         n += 1
+
+
+def _validate_po_header(data) -> None:
+    """الضريبة/الخصم: كان ممكن tax_pct سالب أو خصم أكبر من قيمة البنود فيطلع
+    إجمالي أمر الشراء سالب."""
+    if data.tax_pct is not None and (data.tax_pct < 0 or data.tax_pct > 100):
+        raise HTTPException(400, "نسبة الضريبة يجب أن تكون بين 0 و 100")
+    if data.discount_amt is not None and data.discount_amt < 0:
+        raise HTTPException(400, "الخصم لا يمكن أن يكون سالباً")
+    subtotal = sum(Decimal(str(l.ordered_qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
+    if Decimal(str(data.discount_amt or 0)) > subtotal:
+        raise HTTPException(400, "الخصم لا يمكن أن يتجاوز إجمالي البنود")
+    for l in data.lines:
+        if not (l.description or "").strip():
+            raise HTTPException(400, "وصف البند مطلوب")
+        if len(l.description) > 300:
+            raise HTTPException(400, "وصف البند طويل جداً (الحد 300 حرف)")
+        if l.unit and len(l.unit) > 20:
+            raise HTTPException(400, "الوحدة طويلة جداً (الحد 20 حرف)")
 
 
 def po_dict(po: PurchaseOrder) -> dict:
@@ -176,11 +218,13 @@ async def create_purchase_order(data: POIn, db: AsyncSession = Depends(get_db)):
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
     if data.order_date and data.expected_date and data.expected_date < data.order_date:
         raise HTTPException(400, "تاريخ التوريد المتوقع يجب أن يكون بعد تاريخ الأمر")
+    _validate_po_header(data)
     from app.core.database import current_tenant_id as _ctid_po
     _tid_po = _ctid_po.get() or 1
-    code = data.code or await _next_po_code(db)
-    exists = await db.scalar(select(PurchaseOrder.id).where(PurchaseOrder.code == code))
-    if exists:
+    code = (data.code or "").strip() or await _next_po_code(db)
+    if len(code) > 50:
+        raise HTTPException(400, "كود أمر الشراء طويل جداً (الحد 50 حرف)")
+    if await _po_code_exists_globally(db, code):
         raise HTTPException(400, f"كود {code} مستخدم من قبل")
     if data.supplier_id:
         sup_check = await db.get(Supplier, data.supplier_id)
@@ -280,6 +324,7 @@ async def update_purchase_order(po_id: int, data: POIn, db: AsyncSession = Depen
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
     if data.order_date and data.expected_date and data.expected_date < data.order_date:
         raise HTTPException(400, "تاريخ التوريد المتوقع يجب أن يكون بعد تاريخ الأمر")
+    _validate_po_header(data)
 
     from app.core.database import current_tenant_id as _ctid_upo
     _tid_upo = _ctid_upo.get() or 1
@@ -337,15 +382,24 @@ async def update_purchase_order(po_id: int, data: POIn, db: AsyncSession = Depen
 
 
 @router.patch("/{po_id}/approve")
-async def approve_purchase_order(po_id: int, db: AsyncSession = Depends(get_db)):
+async def approve_purchase_order(po_id: int, db: AsyncSession = Depends(get_db),
+                                 current_user: dict = Depends(get_current_user)):
     """موافقة على أمر الشراء — ينتقل من draft إلى approved"""
-    po = (await db.execute(await _tenant_po_query(po_id))).scalar_one_or_none()
+    po = (await db.execute((await _tenant_po_query(po_id)).with_for_update())).scalar_one_or_none()
     if not po:
         raise HTTPException(404)
     if po.status != "draft":
         raise HTTPException(400, f"لا يمكن الموافقة على أمر بحالة '{po.status}'")
+    # أمر بدون مورد لو اتعتمد واستُلم بيولّد فاتورة شراء ودائنين (2110) من غير
+    # أي مورد يتسجل عليه الرصيد — الواجهة أصلاً بتمنع إنشاء أمر بدون مورد.
+    if not po.supplier_id:
+        raise HTTPException(400, "لا يمكن اعتماد أمر شراء بدون مورد")
     po.status = "approved"
     po.approved_at = datetime.utcnow()
+    try:
+        po.approved_by = int(current_user.get("sub", 0)) or None
+    except (TypeError, ValueError):
+        pass
     await db.commit()
     return {"id": po_id, "status": "approved"}
 
@@ -373,11 +427,14 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
     استلام (كلي أو جزئي) لأمر الشراء.
     يحدّث الكميات المستلمة، يرفع المخزون، وينشئ فاتورة شراء اختياريًا.
     """
+    if not data.lines:
+        raise HTTPException(400, "حدد بنداً واحداً على الأقل للاستلام")
+    # قفل صف الأمر (Postgres) — استلامين متزامنين كانوا ممكن يتخطوا الكمية المطلوبة
     res = await db.execute(
         (await _tenant_po_query(po_id)).options(
             selectinload(PurchaseOrder.lines),
             selectinload(PurchaseOrder.supplier),
-        )
+        ).with_for_update(of=PurchaseOrder)
     )
     po = res.scalar_one_or_none()
     if not po:
@@ -386,6 +443,8 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
         raise HTTPException(400, "الأمر ملغي")
     if po.status == "received":
         raise HTTPException(400, "الأمر مستلم بالكامل بالفعل")
+    if po.order_date and data.receive_date < po.order_date:
+        raise HTTPException(400, "تاريخ الاستلام لا يمكن أن يكون قبل تاريخ أمر الشراء")
     if po.status == "draft":
         # كان ممكن تستلم أمر شراء لسه "مسودة" — يعني تتخطى خطوة الموافقة
         # بالكامل (approve كان اختياري فعلياً رغم وجوده كخطوة في الـ workflow).
@@ -450,21 +509,41 @@ async def receive_purchase_order(po_id: int, data: ReceiveIn, db: AsyncSession =
     invoice_id = None
     if data.create_invoice and invoice_lines_data:
         tax_amount = total_received_value * po.tax_pct / 100
-        inv_total = total_received_value + tax_amount
+        # خصم أمر الشراء كان بيتجاهَل تماماً في الفاتورة المُنشأة عند الاستلام
+        # (discount_amt=0 دايماً) — فالمورد بيتسجل عليه/له أكتر من قيمة الأمر
+        # المعتمد. نوزّع الخصم نسبياً على قيمة الكمية المستلمة في كل دفعة استلام
+        # (نفس أساس حساب الضريبة: نسبة من قيمة البنود المستلمة).
+        disc_share = Decimal("0")
+        po_disc = Decimal(str(po.discount_amt or 0))
+        if po_disc > 0 and po.subtotal and Decimal(str(po.subtotal)) > 0:
+            disc_share = po_disc * total_received_value / Decimal(str(po.subtotal))
+            disc_share = min(disc_share, total_received_value).quantize(Decimal("0.01"))
+        inv_total = total_received_value - disc_share + tax_amount
 
-        # توليد كود فاتورة
+        # توليد كود فاتورة — العدّ كان على كل الفواتير (من غير ضمان تفرّد):
+        # بعد حذف فاتورة ممكن يطلع كود مكرر لنفس الـ tenant → IntegrityError (500)
         pi_count = await db.scalar(select(func.count()).select_from(PurchaseInvoice))
-        inv_code = f"PI-{po.code}-{(pi_count or 0) + 1:03d}"
+        _n = (pi_count or 0) + 1
+        while True:
+            inv_code = f"PI-{po.code}-{_n:03d}"
+            if not await db.scalar(select(PurchaseInvoice.id).where(
+                    PurchaseInvoice.tenant_id == _tid_recv, PurchaseInvoice.code == inv_code).limit(1)):
+                break
+            _n += 1
+        from app.api.purchases import _next_internal_code
+        _internal = await _next_internal_code(db, _tid_recv)
 
         inv = PurchaseInvoice(
             tenant_id=_tid_recv,
             code=inv_code,
+            internal_code=_internal,
             supplier_id=po.supplier_id,
             supplier_name=po.supplier_name or (po.supplier.name if po.supplier else None),
             date=data.receive_date,
+            due_date=None,
             tax_pct=po.tax_pct,
             tax_amount=tax_amount,
-            discount_amt=Decimal("0"),
+            discount_amt=disc_share,
             subtotal=total_received_value,
             total=inv_total,
             notes=f"تم إنشاؤها تلقائياً من أمر الشراء: {po.code}",
@@ -590,7 +669,7 @@ async def _po_company(db: AsyncSession) -> dict:
                 "footer": "شكراً لتعاملكم معنا", "logo_html": ""}
     phone = prof.mobile or prof.phone or ""
     logo_html = (
-        f'<img src="{prof.logo_data}" alt="logo" '
+        f'<img src="{_po_esc(prof.logo_data)}" alt="logo" '
         'style="max-height:80px;max-width:170px;object-fit:contain;display:block;"/>'
         if prof.logo_data else ""
     )

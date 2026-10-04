@@ -29,8 +29,14 @@ async def _run_once(db: AsyncSession) -> dict:
     """
     today = date.today()
 
+    # عزل المستأجرين: لو اتنادت من طلب ورشة (POST /sales/admin/run-installment-scheduler)
+    # الـ UPDATE الجماعي ماكانش بيتفلتر تلقائياً (فلتر الـ tenant على SELECT بس) فكان
+    # أدمن ورشة يعدّل أقساط كل الورش. الـ background loop (بدون tenant) يفضل شامل.
+    from app.core.database import current_tenant_id as _ctid_sched
+    tid = _ctid_sched.get()
+
     # 1. حدّث status الأقساط التي تجاوزت تاريخ الاستحقاق
-    r1 = await db.execute(
+    upd = (
         sa_update(InvoicePaymentSchedule)
         .where(
             InvoicePaymentSchedule.due_date < today,
@@ -38,6 +44,9 @@ async def _run_once(db: AsyncSession) -> dict:
         )
         .values(status="overdue")
     )
+    if tid is not None:
+        upd = upd.where(InvoicePaymentSchedule.tenant_id == tid)
+    r1 = await db.execute(upd)
     updated_installments = r1.rowcount
 
     # 2. حدّث Invoice.status لكل فاتورة عندها أقساط مفتوحة
@@ -47,6 +56,8 @@ async def _run_once(db: AsyncSession) -> dict:
     inv_q = select(Invoice).where(
         Invoice.status.in_(["unpaid", "partial", "overdue"])
     )
+    if tid is not None:
+        inv_q = inv_q.where(Invoice.tenant_id == tid)
     invoices = (await db.execute(inv_q)).scalars().all()
 
     # expire الـ cache عشان paid_amount يتحمل من الـ DB مش من الـ session القديم

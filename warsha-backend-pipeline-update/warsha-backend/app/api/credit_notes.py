@@ -20,10 +20,23 @@ from app.models.models import (
     CreditNote, CreditNoteLine, Customer, Invoice, InvoiceLine, WorkOrder, Material,
 )
 
+from fastapi import Request as _Request
+
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: _Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر ينشئ/يصدر/يلغي
+    إشعارات دائنة (بتأثر على رصيد العميل والمخزون ودفتر الأستاذ) بطلب API مباشر."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
 router = APIRouter(
     prefix="/credit-notes",
     tags=["credit_notes"],
-    dependencies=[Depends(require_any)],
+    dependencies=[Depends(require_any), Depends(_block_viewer_writes)],
 )
 print_router = APIRouter(prefix="/credit-notes", tags=["credit_notes_print"], dependencies=[Depends(require_any)])
 
@@ -56,6 +69,103 @@ class CNIn(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+_VALID_RETURN_TYPES = {"full", "partial"}
+
+
+def _validate_cn_input(data: "CNIn") -> tuple:
+    """تحقق مدخلات الإشعار ويرجّع (subtotal, tax_amount, total).
+    قبل الإصلاح: نسبة ضريبة سالبة/فوق 100، خصم سالب أو أكبر من المجموع،
+    أو return_type عشوائي كانوا بيعدّوا — وإجمالي صفر/سالب كان بيتسجّل
+    ويزوّد رصيد العميل بدل ما يخفّضه عند الإصدار."""
+    if not data.lines:
+        raise HTTPException(400, "أضف بنداً واحداً على الأقل")
+    if data.return_type not in _VALID_RETURN_TYPES:
+        raise HTTPException(400, f"نوع المرتجع غير صالح. القيم المسموحة: {sorted(_VALID_RETURN_TYPES)}")
+    for l in data.lines:
+        if l.qty is None or l.qty <= 0:
+            raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
+        if l.unit_price is None or l.unit_price < 0:
+            raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+        if l.invoice_line_id is not None and data.invoice_id is None:
+            raise HTTPException(400, "لا يمكن ربط بند ببند فاتورة من غير تحديد الفاتورة المرجعية")
+    tax_pct = Decimal(str(data.tax_pct or 0))
+    disc = Decimal(str(data.discount_amt or 0))
+    if tax_pct < 0 or tax_pct > 100:
+        raise HTTPException(400, "نسبة الضريبة يجب أن تكون بين 0 و100")
+    subtotal = sum((Decimal(str(l.qty)) * Decimal(str(l.unit_price)) for l in data.lines), Decimal("0"))
+    if disc < 0 or disc > subtotal:
+        raise HTTPException(400, "الخصم يجب أن يكون بين صفر ومجموع البنود")
+    tax_amount = subtotal * tax_pct / 100
+    total = subtotal - disc + tax_amount
+    if total <= 0:
+        raise HTTPException(400, "إجمالي الإشعار الدائن يجب أن يكون أكبر من صفر")
+    return subtotal, tax_amount, total
+
+
+async def _check_invoice_credit_room(
+    db: AsyncSession, invoice_id: int, lines, total: Decimal, exclude_cn_id: Optional[int] = None,
+) -> None:
+    """إصلاح ثغرة تحقق (over-return): مفيش أي حد كان بيمنع إصدار إشعارات
+    دائنة على نفس الفاتورة بمجموع أكبر من قيمتها، أو إرجاع كمية أكبر من
+    المباعة فعلاً في بند الفاتورة. بنقارن بالإشعارات *الصادرة* بس (المسودات
+    ممكن تتلغي/تتحذف)، وبنعيد الفحص وقت الإصدار نفسه."""
+    inv = await db.get(Invoice, invoice_id)
+    if not inv:
+        raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
+    q = select(func.coalesce(func.sum(CreditNote.total), 0)).where(
+        CreditNote.invoice_id == invoice_id, CreditNote.status == "issued")
+    if exclude_cn_id is not None:
+        q = q.where(CreditNote.id != exclude_cn_id)
+    issued_total = Decimal(str(await db.scalar(q) or 0))
+    if issued_total + Decimal(str(total)) > Decimal(str(inv.total)) + Decimal("0.01"):
+        raise HTTPException(
+            400,
+            f"إجمالي الإشعارات الدائنة على الفاتورة {inv.code} ({float(issued_total + Decimal(str(total))):,.2f}) "
+            f"سيتجاوز قيمة الفاتورة ({float(inv.total):,.2f})",
+        )
+    per_line: dict = {}
+    for l in lines or []:
+        if l.invoice_line_id is None:
+            continue
+        per_line[l.invoice_line_id] = per_line.get(l.invoice_line_id, Decimal("0")) + Decimal(str(l.qty))
+    for lid, qty in per_line.items():
+        il = await db.get(InvoiceLine, lid)
+        if not il or il.invoice_id != invoice_id:
+            raise HTTPException(400, f"بند الفاتورة #{lid} لا يخص الفاتورة المرجعية")
+        lq = (select(func.coalesce(func.sum(CreditNoteLine.qty), 0))
+              .join(CreditNote, CreditNote.id == CreditNoteLine.credit_note_id)
+              .where(CreditNoteLine.invoice_line_id == lid, CreditNote.status == "issued"))
+        if exclude_cn_id is not None:
+            lq = lq.where(CreditNote.id != exclude_cn_id)
+        already = Decimal(str(await db.scalar(lq) or 0))
+        if already + qty > Decimal(str(il.qty)):
+            raise HTTPException(
+                400,
+                f"الكمية المرتجعة للبند '{il.description}' ({float(already + qty):g}) "
+                f"أكبر من الكمية المباعة ({float(il.qty):g})",
+            )
+
+
+async def _fg_net_sold_qty(db: AsyncSession, fg_mat_id: int) -> Decimal:
+    """صافي الكمية اللي خرجت فعلاً من مخزون FG لمادة معيّنة بسبب بيع
+    (فاتورة أمر إنتاج / أمر تسليم) ولسه مارجعتش بمرتجع — ده الحد الأقصى
+    اللي ينفع يرجع للمخزون بمرتجع جديد (منع مخزون وهمي)."""
+    from app.models.models import StockMovement as _SM
+
+    async def _sum(mtype, types):
+        v = await db.scalar(
+            select(func.coalesce(func.sum(_SM.qty), 0)).where(
+                _SM.material_id == fg_mat_id, _SM.movement_type == mtype,
+                _SM.source_doc_type.in_(types),
+            )
+        )
+        return Decimal(str(v or 0))
+
+    sold = await _sum("out", ("sales_invoice", "delivery", "credit_note_cancel"))
+    back = await _sum("in", ("credit_note_return", "sales_invoice_delete"))
+    return max(sold - back, Decimal("0"))
+
+
 async def _restock_qty_for_wo_invoice(db: AsyncSession, cn: CreditNote, inv: Invoice) -> Decimal:
     """
     لو الفاتورة صادرة مباشرة من أمر إنتاج (work_order_to_invoice)، بترجّع
@@ -83,7 +193,13 @@ async def _next_code(db: AsyncSession) -> str:
     n = (count or 0) + 1
     while True:
         code = f"CN-{n:04d}"
-        exists = await db.scalar(select(CreditNote.id).where(CreditNote.code == code))
+        # إصلاح: CreditNote.code عليه UNIQUE على مستوى الجدول كله (مش لكل tenant)،
+        # والفحص كان بيتفلتر بالـ tenant تلقائيًا — فورشة تانية بتولّد CN-0001
+        # الموجود عند ورشة أولى وتقع في IntegrityError (500). نفحص عبر كل الورش.
+        exists = await db.scalar(
+            select(CreditNote.id).where(CreditNote.code == code)
+            .execution_options(skip_tenant_filter=True)
+        )
         if not exists:
             return code
         n += 1
@@ -173,13 +289,7 @@ async def get_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("", status_code=201)
 async def create_credit_note(data: CNIn, db: AsyncSession = Depends(get_db)):
-    if not data.lines:
-        raise HTTPException(400, "أضف بنداً واحداً على الأقل")
-    for l in data.lines:
-        if l.qty is None or l.qty <= 0:
-            raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
-        if l.unit_price is not None and l.unit_price < 0:
-            raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    _validate_cn_input(data)
     # إصلاح ثغرة تحقق: إنشاء إشعار دائن لعميل رقمه غير موجود (أو تابع لـ
     # tenant تاني) كان ينجح بصمت — الإشعار يتسجل بمرجع عميل يتيم، ورصيده
     # لا يُخفَّض فعليًا عند الإصدار لأنه ببساطة مش موجود.
@@ -191,6 +301,8 @@ async def create_credit_note(data: CNIn, db: AsyncSession = Depends(get_db)):
             raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
         if inv_check.customer_id != data.customer_id:
             raise HTTPException(400, "الفاتورة المرجعية لا تخص هذا العميل")
+        _st, _tx, _tot = _validate_cn_input(data)
+        await _check_invoice_credit_room(db, data.invoice_id, data.lines, _tot)
     code = await _next_code(db)
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
@@ -260,6 +372,7 @@ async def update_credit_note(cn_id: int, data: CNIn, db: AsyncSession = Depends(
         raise HTTPException(404)
     if cn.status != "draft":
         raise HTTPException(400, "لا يمكن تعديل إشعار دائن بعد إصداره أو إلغائه")
+    _validate_cn_input(data)
     if not await db.get(Customer, data.customer_id):
         raise HTTPException(404, "العميل غير موجود")
     if data.invoice_id is not None:
@@ -268,6 +381,8 @@ async def update_credit_note(cn_id: int, data: CNIn, db: AsyncSession = Depends(
             raise HTTPException(404, "الفاتورة المرجعية غير موجودة")
         if inv_check.customer_id != data.customer_id:
             raise HTTPException(400, "الفاتورة المرجعية لا تخص هذا العميل")
+        _st, _tx, _tot = _validate_cn_input(data)
+        await _check_invoice_credit_room(db, data.invoice_id, data.lines, _tot, exclude_cn_id=cn_id)
 
     subtotal = sum(Decimal(str(l.qty)) * Decimal(str(l.unit_price)) for l in data.lines)
     tax_amount = subtotal * Decimal(str(data.tax_pct)) / 100
@@ -339,6 +454,21 @@ async def credit_note_from_invoice(invoice_id: int, db: AsyncSession = Depends(g
     )
     if (existing or 0) > 0:
         raise HTTPException(400, "يوجد إشعار دائن كامل مُصدر لهذه الفاتورة مسبقاً")
+    # إصلاح ثغرة over-return: مرتجع كامل بعد مرتجعات جزئية صادرة كان بيرجّع
+    # قيمة الفاتورة كلها تاني (إجمالي المرتجعات > قيمة الفاتورة)، ومسودة
+    # "كاملة" تانية كانت بتتعمل عادي فوق مسودة موجودة.
+    other_cn = await db.scalar(
+        select(CreditNote.code).where(
+            CreditNote.invoice_id == invoice_id,
+            CreditNote.status.in_(("draft", "issued")),
+        ).limit(1)
+    )
+    if other_cn:
+        raise HTTPException(
+            400,
+            f"يوجد إشعار دائن آخر ({other_cn}) على هذه الفاتورة — لا يمكن إنشاء مرتجع كامل. "
+            f"أنشئ مرتجعاً جزئياً بالكمية المتبقية بدلاً من ذلك.",
+        )
 
     from app.core.database import current_tenant_id
     tid = current_tenant_id.get()
@@ -403,6 +533,12 @@ async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404)
     if cn.status != "draft":
         raise HTTPException(400, "يمكن إصدار المسودات فقط")
+    if not cn.lines or Decimal(str(cn.total or 0)) <= 0:
+        raise HTTPException(400, "لا يمكن إصدار إشعار دائن بدون بنود أو بإجمالي صفر")
+    if cn.invoice_id:
+        # إعادة فحص الحد وقت الإصدار (مسودتين ممكن يتعملوا قبل ما أي واحدة تتصدر)
+        await _check_invoice_credit_room(db, cn.invoice_id, cn.lines, Decimal(str(cn.total)),
+                                         exclude_cn_id=cn.id)
 
     # خفّض رصيد العميل
     cust = await db.get(Customer, cn.customer_id)
@@ -456,6 +592,11 @@ async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
                     )
                 )).scalar_one_or_none()
                 if fg_mat:
+                    # إصلاح ثغرة (مخزون وهمي): الكمية المرتجعة كانت بتدخل FG حتى لو
+                    # البضاعة عمرها ما خرجت من المخزون أصلاً (مثلاً فاتورة يدوية
+                    # مربوطة بأمر إنتاج من غير خصم FG). نحدّها بصافي المُباع فعلاً.
+                    restock_qty = min(restock_qty, await _fg_net_sold_qty(db, fg_mat.id))
+                if fg_mat and restock_qty > 0:
                     unit_cost = fg_mat.unit_cost or Decimal("0")
                     fg_bin = await get_or_create_warehouse_bin(db, _ctid_cni.get() or 1, "FG")
                     await post_receipt(
@@ -501,7 +642,16 @@ async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
         if cn.invoice_id:
             inv = await db.get(Invoice, cn.invoice_id)
             if inv:
-                reverse_amt = min(Decimal(str(cn.total)), inv.paid_amount)
+                # إصلاح: الإصدار بيطبّق على الفاتورة min(total, المتبقي) بس — لو
+                # الفاتورة كانت متسددة كاش بالكامل مفيش حاجة اتطبّقت، والإلغاء كان
+                # بيخصم قيمة الإشعار كلها من paid_amount (يمسح دفعات كاش حقيقية).
+                # الجزء المطبّق من إشعارات = paid_amount - مجموع تخصيصات الدفعات.
+                from app.models.models import CustomerPaymentAllocation as _CPA
+                cash_alloc = Decimal(str(await db.scalar(
+                    select(func.coalesce(func.sum(_CPA.amount), 0)).where(_CPA.invoice_id == inv.id)
+                ) or 0))
+                non_cash_paid = max(Decimal(str(inv.paid_amount)) - cash_alloc, Decimal("0"))
+                reverse_amt = min(Decimal(str(cn.total)), non_cash_paid)
                 if reverse_amt > 0:
                     inv.paid_amount = inv.paid_amount - reverse_amt
                     if inv.paid_amount >= inv.total:
@@ -524,7 +674,15 @@ async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
         if cn.is_return and cn.invoice_id:
             inv = await db.get(Invoice, cn.invoice_id)
             if inv and inv.work_order_id:
-                restock_qty = await _restock_qty_for_wo_invoice(db, cn, inv)
+                # نسحب بالظبط الكمية اللي رجعت فعلاً بالإشعار ده وقت الإصدار (من
+                # سجل الحركات)، مش إعادة حساب من البنود — ممكن تكون اتحدّت وقتها.
+                from app.models.models import StockMovement as _SM
+                restock_qty = Decimal(str(await db.scalar(
+                    select(func.coalesce(func.sum(_SM.qty), 0)).where(
+                        _SM.source_doc_type == "credit_note_return", _SM.source_doc_id == cn.id,
+                        _SM.movement_type == "in",
+                    )
+                ) or 0))
                 if restock_qty > 0:
                     from app.services.inventory_ledger import get_or_create_warehouse_bin, post_issue
                     wo = await db.get(WorkOrder, inv.work_order_id)
@@ -534,7 +692,16 @@ async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
                             Material.code == f"FG-{wo.code}",
                         )
                     )).scalar_one_or_none()
-                    if fg_mat and (fg_mat.stock_qty or Decimal("0")) >= restock_qty:
+                    if not fg_mat or (fg_mat.stock_qty or Decimal("0")) < restock_qty:
+                        # كان بيتخطى السحب بصمت ويكمل الإلغاء — فيفضل المخزون زايد
+                        # بكمية المرتجع رغم إن الإشعار اتلغى وقيد التكلفة اترجع.
+                        raise HTTPException(
+                            400,
+                            f"لا يمكن إلغاء الإشعار — رصيد تام الصنع الحالي "
+                            f"({float(fg_mat.stock_qty or 0) if fg_mat else 0:g}) أقل من الكمية "
+                            f"المرتجعة ({float(restock_qty):g}) اللي لازم تتسحب تاني",
+                        )
+                    if fg_mat:
                         unit_cost = fg_mat.unit_cost or Decimal("0")
                         fg_bin = await get_or_create_warehouse_bin(db, _ctid_cnc.get() or 1, "FG")
                         await post_issue(
@@ -688,7 +855,9 @@ def _cn_html(cn: CreditNote, company: dict) -> str:
         f"العنوان: {caddr}" if caddr else "",
         legal_h,
     ]))
-    js_code = _j.dumps(code_v)
+    # الكود بيتحط جوه onclick="..." — json.dumps بيرجّع "..." اللي كانت بتقفل
+    # الـ attribute وتكسر زرار الطباعة؛ نهرّبه كـ HTML attribute.
+    js_code = _esc(_j.dumps(cn.code or ""))
 
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">

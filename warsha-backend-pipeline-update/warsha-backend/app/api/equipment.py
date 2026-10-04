@@ -1,6 +1,7 @@
 from datetime import date as _date
 from decimal import Decimal
-from fastapi import APIRouter, Depends, HTTPException
+from html import escape as _esc
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -12,7 +13,27 @@ from app.services.equipment import EquipmentService
 from app.schemas.schemas import EquipmentCreate, BOMLineCreate, EquipmentCostLineCreate
 from app.models.models import Equipment, BOMLine, EquipmentDimension, CADFile, EquipmentCostLine, EquipmentCategory
 
-router = APIRouter(prefix="/equipment", tags=["equipment"], dependencies=[Depends(require_any)])
+# ── RBAC للكتابة ──────────────────────────────────────────────────────────
+# الراوتر كان محمي بـ require_any بس — يعني "viewer" يقدر ينشئ/يعدّل/يمسح
+# معدات وبنود BOM بطلب API مباشر. الواجهة بتربط الكتابة بـ canWrite('inventory')
+# (admin/production) فنطبّق نفس القاعدة هنا. القراءة مفتوحة لأي مستخدم مسجّل.
+EQUIPMENT_WRITE_ROLES = ("admin", "production")
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def require_equipment_write(request: Request, user: dict = Depends(require_any)) -> dict:
+    if request.method.upper() in _READ_METHODS:
+        return user
+    if user.get("role") not in EQUIPMENT_WRITE_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=f"صلاحية '{user.get('role')}' غير كافية لتعديل المعدات. مطلوب: {list(EQUIPMENT_WRITE_ROLES)}",
+        )
+    return user
+
+
+router = APIRouter(prefix="/equipment", tags=["equipment"],
+                   dependencies=[Depends(require_any), Depends(require_equipment_write)])
 print_router = APIRouter(prefix="/equipment", tags=["equipment-print"], dependencies=[Depends(require_any)])
 
 
@@ -47,6 +68,13 @@ def _eq_dict(eq: Equipment, include_dims: bool = False, dims: list = None) -> di
     }
 
 
+async def _eq_or_404(db: AsyncSession, eq_id: int) -> Equipment:
+    eq = await EquipmentService.get_tenant_equipment(db, eq_id)
+    if eq is None:
+        raise HTTPException(404, "Equipment not found")
+    return eq
+
+
 def _egp(v) -> str:
     try:
         return f"{float(v):,.2f} ج"
@@ -72,7 +100,7 @@ async def create_equipment(data: EquipmentCreate, db: AsyncSession = Depends(get
 async def duplicate_equipment(eq_id: int, data: dict, db: AsyncSession = Depends(get_db)):
     """نسخ معدة مع كل فرعياتها وبنود BOM الخاصة بكل مستوى، بكود جديد"""
     new_code = (data or {}).get("code")
-    if not new_code:
+    if not isinstance(new_code, str) or not new_code.strip():
         raise HTTPException(400, "أدخل كوداً جديداً للمعدة المنسوخة")
     try:
         eq = await EquipmentService.duplicate_equipment(db, eq_id, new_code, (data or {}).get("name_ar"))
@@ -103,8 +131,8 @@ async def list_all_equipment(db: AsyncSession = Depends(get_db)):
              "category_id": e.category_id,
              "calc_unit": getattr(e, "calc_unit", "piece"),
              "base_qty": float(e.base_qty) if getattr(e, "base_qty", None) else 1.0,
-             "length_min": float(e.length_min) if getattr(e, "length_min", None) else None,
-             "length_max": float(e.length_max) if getattr(e, "length_max", None) else None,
+             "length_min": float(e.length_min) if getattr(e, "length_min", None) is not None else None,
+             "length_max": float(e.length_max) if getattr(e, "length_max", None) is not None else None,
              "is_active": e.is_active} for e in eqs]
 
 
@@ -121,7 +149,8 @@ async def list_equipment_categories(db: AsyncSession = Depends(get_db)):
     cats = result.scalars().all()
     out = []
     for c in cats:
-        cnt = await db.execute(select(func.count()).select_from(Equipment).where(Equipment.category_id == c.id))
+        cnt = await db.execute(select(func.count()).select_from(Equipment)
+                               .where(Equipment.category_id == c.id, Equipment.tenant_id == tid))
         out.append({"id": c.id, "name_ar": c.name_ar, "name_en": c.name_en, "equipment_count": cnt.scalar() or 0})
     return out
 
@@ -132,13 +161,16 @@ async def create_equipment_category(data: dict, db: AsyncSession = Depends(get_d
     name_ar = (data.get("name_ar") or "").strip()
     if not name_ar:
         raise HTTPException(400, "اسم التصنيف مطلوب")
+    name_en_in = data.get("name_en")
+    if len(name_ar) > 120 or (isinstance(name_en_in, str) and len(name_en_in.strip()) > 120):
+        raise HTTPException(400, "اسم التصنيف أطول من المسموح (120 حرف)")
     tid = current_tenant_id.get() or 1
     existing = await db.execute(
         select(EquipmentCategory).where(EquipmentCategory.name_ar == name_ar, EquipmentCategory.tenant_id == tid)
     )
     if existing.scalar_one_or_none():
         raise HTTPException(409, "التصنيف موجود بالفعل")
-    cat = EquipmentCategory(tenant_id=tid, name_ar=name_ar, name_en=(data.get("name_en") or name_ar).strip())
+    cat = EquipmentCategory(tenant_id=tid, name_ar=name_ar, name_en=(str(data.get("name_en") or "").strip() or name_ar))
     db.add(cat)
     await db.commit()
     await db.refresh(cat)
@@ -152,7 +184,8 @@ async def delete_equipment_category(category_id: int, db: AsyncSession = Depends
     cat = await db.get(EquipmentCategory, category_id)
     if not cat or cat.tenant_id != (_ctid_dec.get() or 1):
         raise HTTPException(404, "التصنيف غير موجود")
-    cnt = await db.execute(select(func.count()).select_from(Equipment).where(Equipment.category_id == category_id))
+    cnt = await db.execute(select(func.count()).select_from(Equipment)
+                           .where(Equipment.category_id == category_id, Equipment.tenant_id == cat.tenant_id))
     if (cnt.scalar() or 0) > 0:
         raise HTTPException(409, "لا يمكن حذف التصنيف لأنه يحتوي على معدات. نقل المعدات أولاً.")
     await db.delete(cat)
@@ -187,16 +220,22 @@ async def update_equipment(eq_id: int, data: EquipmentCreate, db: AsyncSession =
     if not eq or eq.tenant_id != (_ctid_ue.get() or 1):
         raise HTTPException(404, "Equipment not found")
     try:
-        payload = data.model_dump(exclude_unset=False)
+        # الحقول اللي ما اتبعتتش تفضل بقيمتها الحالية (بدل ما تتمسح لـ default
+        # الـ schema) — نبني payload كامل من القيم الحالية + المُرسَل فقط.
+        sent = data.model_dump(exclude_unset=True)
+        payload = {k: getattr(eq, k, None) for k in EquipmentCreate.model_fields}
+        payload.update(sent)
         if not payload.get("code"):
             payload["code"] = eq.code  # حافظ على الكود الموجود لو لم يُرسَل
-        # لا نسمح للفرونت بتغيير الـ level مباشرة — نحسبه من الأب
-        if payload.get("parent_id"):
-            parent = await db.get(Equipment, payload["parent_id"])
-            if parent:
-                payload["level"] = (parent.level or 0) + 1
-        else:
-            payload["level"] = 0
+        old_parent_id = eq.parent_id
+        # تحقق: أب من نفس الـ tenant وبدون حلقة، تصنيف صالح، قيم غير سالبة.
+        # الـ level لا يُقبل من الفرونت — يُحسب من الأب.
+        try:
+            await EquipmentService.validate_equipment_payload(db, payload, eq.tenant_id, eq_id=eq.id, existing=eq)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not payload.get("name_en"):
+            payload["name_en"] = payload.get("name_ar", "")
 
         # محطة 23: نفس منطق الإنشاء — الفاتورة المرتبطة هي مصدر الحقيقة
         if payload.get("purchase_invoice_id"):
@@ -210,6 +249,8 @@ async def update_equipment(eq_id: int, data: EquipmentCreate, db: AsyncSession =
         for key, value in payload.items():
             if hasattr(eq, key):
                 setattr(eq, key, value)
+        if eq.parent_id != old_parent_id:
+            await EquipmentService.refresh_descendant_levels(db, eq)
         await db.commit()
         await db.refresh(eq)
     except IntegrityError:
@@ -224,7 +265,10 @@ async def update_equipment_description(eq_id: int, body: dict, db: AsyncSession 
     eq = await db.get(Equipment, eq_id)
     if not eq or eq.tenant_id != (_ctid_ued.get() or 1):
         raise HTTPException(404, "Equipment not found")
-    eq.description = body.get("description") or None
+    desc = (body or {}).get("description")
+    if desc is not None and not isinstance(desc, str):
+        raise HTTPException(400, "الوصف يجب أن يكون نصاً")
+    eq.description = desc or None
     await db.commit()
     return {"id": eq.id, "description": eq.description}
 
@@ -237,30 +281,67 @@ async def delete_equipment(eq_id: int, db: AsyncSession = Depends(get_db)):
     eq = await db.get(Equipment, eq_id)
     if not eq or eq.tenant_id != (_ctid_de.get() or 1):
         raise HTTPException(404, "Equipment not found")
+    tid = eq.tenant_id
 
-    # Delete CAD files from disk
-    try:
-        cad_result = await db.execute(select(CADFile).where(CADFile.equipment_id == eq_id))
-        cad_files = cad_result.scalars().all()
-        upload_dir = Path(os.getenv("ERP_UPLOAD_DIR", "/app/uploads")) / "cad"
-        for cf in cad_files:
-            fp = upload_dir / cf.stored_name
-            if fp.exists():
-                fp.unlink()
-            await db.delete(cf)
-    except Exception:
-        pass
+    # ممنوع حذف معدة ليها فرعيات (كانت بتتيتّم وتختفي من الشجرة) أو مستخدمة
+    # في مستندات (أوامر شغل/طلبيات/أصول عملاء/أذون تسليم/مشاريع/كتالوج أسعار).
+    from sqlalchemy import func as _f
+    from app.models.models import (
+        WorkOrder, CustomerOrder, CustomerOrderLine, CustomerAsset,
+        DeliveryOrderLine, ExtProject, PriceCatalogItem,
+    )
+    kids = await db.scalar(select(_f.count()).select_from(Equipment)
+                           .where(Equipment.parent_id == eq_id, Equipment.tenant_id == tid))
+    if kids:
+        raise HTTPException(409, f"لا يمكن حذف المعدة لأنها تحتوي على {kids} معدة فرعية — احذف الفرعيات أو انقلها أولاً")
+    dependents = [
+        (WorkOrder, WorkOrder.equipment_id, "أوامر شغل"),
+        (CustomerOrder, CustomerOrder.equipment_id, "طلبيات عملاء"),
+        (CustomerOrderLine, CustomerOrderLine.equipment_id, "بنود طلبيات"),
+        (CustomerAsset, CustomerAsset.equipment_id, "أصول عملاء"),
+        (DeliveryOrderLine, DeliveryOrderLine.equipment_id, "أذون تسليم"),
+        (ExtProject, ExtProject.equipment_id, "مشاريع خارجية"),
+    ]
+    for Model, col, label in dependents:
+        conds = [col == eq_id]
+        if hasattr(Model, "tenant_id"):  # DeliveryOrderLine مفيهاش tenant_id (equipment_id نفسه فريد عالمياً)
+            conds.append(Model.tenant_id == tid)
+        n = await db.scalar(select(_f.count()).select_from(Model).where(*conds))
+        if n:
+            raise HTTPException(409, f"لا يمكن حذف المعدة لأنها مستخدمة في {n} من {label}")
+    n = await db.scalar(select(_f.count()).select_from(PriceCatalogItem).where(
+        PriceCatalogItem.source_type == "equipment", PriceCatalogItem.source_id == eq_id,
+        PriceCatalogItem.tenant_id == tid))
+    if n:
+        raise HTTPException(409, f"لا يمكن حذف المعدة لأنها مربوطة بـ {n} من بنود كتالوج الأسعار")
+
+    cad_result = await db.execute(select(CADFile).where(CADFile.equipment_id == eq_id, CADFile.tenant_id == tid))
+    cad_files = cad_result.scalars().all()
+    stored_names = [cf.stored_name for cf in cad_files if cf.stored_name]
+    for cf in cad_files:
+        await db.delete(cf)
 
     # Delete dimensions, BOM lines, cost lines
     for Model, col in [(EquipmentDimension, EquipmentDimension.equipment_id),
                        (BOMLine, BOMLine.equipment_id),
                        (EquipmentCostLine, EquipmentCostLine.equipment_id)]:
-        res = await db.execute(select(Model).where(col == eq_id))
+        res = await db.execute(select(Model).where(col == eq_id, Model.tenant_id == tid))
         for obj in res.scalars().all():
             await db.delete(obj)
 
     await db.delete(eq)
     await db.commit()
+
+    # حذف ملفات CAD من الـ disk بعد نجاح الـ commit فقط (مش قبله)، وباسم
+    # الملف فقط — بدون أي مسار — عشان مفيش path traversal من stored_name.
+    upload_dir = (Path(os.getenv("ERP_UPLOAD_DIR", "/app/uploads")) / "cad").resolve()
+    for name in stored_names:
+        try:
+            fp = (upload_dir / Path(name).name).resolve()
+            if fp.parent == upload_dir and fp.is_file():
+                fp.unlink()
+        except Exception:
+            pass
     return {"message": "تم الحذف", "id": eq_id}
 
 
@@ -268,7 +349,11 @@ async def delete_equipment(eq_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{eq_id}/bom")
 async def get_bom(eq_id: int, db: AsyncSession = Depends(get_db)):
-    lines = await EquipmentService.get_bom(db, eq_id)
+    await _eq_or_404(db, eq_id)
+    try:
+        lines = await EquipmentService.get_bom(db, eq_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return [
         {
             "id": l.id, "equipment_id": l.equipment_id,
@@ -301,6 +386,7 @@ async def get_bom(eq_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/{eq_id}/bom/cost")
 async def bom_cost_breakdown(eq_id: int, db: AsyncSession = Depends(get_db)):
     """BOM cost for quantity=1 (standard)."""
+    await _eq_or_404(db, eq_id)
     try:
         return await EquipmentService.calculate_bom_cost(db, eq_id)
     except ValueError as e:
@@ -310,6 +396,9 @@ async def bom_cost_breakdown(eq_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/{eq_id}/bom/parametric")
 async def bom_parametric(eq_id: int, quantity: float = 1.0, db: AsyncSession = Depends(get_db)):
     """BOM cost multiplied by quantity — for parametric/variable equipment."""
+    await _eq_or_404(db, eq_id)
+    if quantity is None or quantity <= 0:
+        raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
     try:
         return await EquipmentService.calculate_bom_cost(db, eq_id, Decimal(str(quantity)))
     except ValueError as e:
@@ -319,6 +408,9 @@ async def bom_parametric(eq_id: int, quantity: float = 1.0, db: AsyncSession = D
 @router.get("/{eq_id}/bom/parametric-length")
 async def bom_parametric_length(eq_id: int, length: float, quantity: float = 1.0, db: AsyncSession = Depends(get_db)):
     """BOM cost for a chosen length L within [length_min, length_max] — معدات مترية (بريمات/سيور/كتاين)."""
+    await _eq_or_404(db, eq_id)
+    if quantity is None or quantity <= 0:
+        raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
     try:
         return await EquipmentService.calculate_bom_cost_for_length(db, eq_id, Decimal(str(length)), Decimal(str(quantity)))
     except ValueError as e:
@@ -341,14 +433,47 @@ async def add_bom_line(data: BOMLineCreate, db: AsyncSession = Depends(get_db)):
 
 @router.patch("/bom/{line_id}")
 async def update_bom_line(line_id: int, data: dict, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_ubl
     line = await db.get(BOMLine, line_id)
-    if not line:
+    if not line or line.tenant_id != (_ctid_ubl.get() or 1):
         raise HTTPException(404, "BOM line not found")
     allowed = {'qty', 'unit_cost', 'notes', 'bar_length_cm', 'dim_length_cm',
                'dim_width_cm', 'dim_count', 'line_type', 'scale_dim_length'}
-    for k, v in data.items():
-        if k in allowed and hasattr(line, k):
-            setattr(line, k, v if v is not None else None)
+    numeric = {'qty', 'unit_cost', 'bar_length_cm', 'dim_length_cm', 'dim_width_cm'}
+    clean = {}
+    for k, v in (data or {}).items():
+        if k not in allowed:
+            continue
+        if v is not None and k in numeric:
+            try:
+                v = Decimal(str(v))
+            except Exception:
+                raise HTTPException(400, f"قيمة {k} غير صالحة")
+            if not v.is_finite():
+                raise HTTPException(400, f"قيمة {k} غير صالحة")
+        elif v is not None and k == 'dim_count':
+            try:
+                v = int(v)
+            except Exception:
+                raise HTTPException(400, "العدد يجب أن يكون رقماً صحيحاً")
+        elif v is not None and k == 'scale_dim_length':
+            v = bool(v)
+        elif v is not None and k in ('notes', 'line_type') and not isinstance(v, str):
+            raise HTTPException(400, f"قيمة {k} يجب أن تكون نصاً")
+        clean[k] = v
+    if 'qty' in clean and (clean['qty'] is None or clean['qty'] <= 0):
+        raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
+    if 'unit_cost' in clean and clean['unit_cost'] is None:
+        raise HTTPException(400, "سعر الوحدة مطلوب")
+    if 'line_type' in clean and clean['line_type'] is None:
+        clean['line_type'] = 'fixed'
+    try:
+        EquipmentService.validate_bom_values(clean)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    for k, v in clean.items():
+        if hasattr(line, k):
+            setattr(line, k, v)
     from decimal import Decimal as D
     line.total_cost = D(str(line.qty or 0)) * D(str(line.unit_cost or 0))
     await db.commit()
@@ -359,8 +484,9 @@ async def update_bom_line(line_id: int, data: dict, db: AsyncSession = Depends(g
 
 @router.delete("/bom/{line_id}")
 async def delete_bom_line(line_id: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dbl
     line = await db.get(BOMLine, line_id)
-    if not line:
+    if not line or line.tenant_id != (_ctid_dbl.get() or 1):
         raise HTTPException(404, "BOM line not found")
     await db.delete(line)
     await db.commit()
@@ -372,13 +498,21 @@ async def delete_bom_line(line_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/{eq_id}/dimensions")
 async def add_dimension(eq_id: int, dim_key: str, dim_value: str, unit: str,
                         db: AsyncSession = Depends(get_db)):
-    return await EquipmentService.add_dimension(db, eq_id, dim_key, dim_value, unit)
+    try:
+        dim = await EquipmentService.add_dimension(db, eq_id, dim_key, dim_value, unit)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"id": dim.id, "equipment_id": dim.equipment_id, "dim_key": dim.dim_key,
+            "dim_value": dim.dim_value, "unit": dim.unit}
 
 
 @router.delete("/dimension/{dim_id}")
 async def delete_dimension(dim_id: int, db: AsyncSession = Depends(get_db)):
+    from app.core.database import current_tenant_id as _ctid_dd
     dim = await db.get(EquipmentDimension, dim_id)
-    if not dim:
+    if not dim or dim.tenant_id != (_ctid_dd.get() or 1):
         raise HTTPException(404, "Dimension not found")
     await db.delete(dim)
     await db.commit()
@@ -389,6 +523,7 @@ async def delete_dimension(dim_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/{eq_id}/cost-lines")
 async def list_cost_lines(eq_id: int, db: AsyncSession = Depends(get_db)):
+    await _eq_or_404(db, eq_id)
     lines = await EquipmentService.list_cost_lines(db, eq_id)
     return [
         {
@@ -435,9 +570,7 @@ async def delete_cost_line(line_id: int, db: AsyncSession = Depends(get_db)):
 
 @print_router.get("/{eq_id}/bom/print", response_class=HTMLResponse)
 async def print_bom(eq_id: int, length: float = None, db: AsyncSession = Depends(get_db)):
-    eq = await db.get(Equipment, eq_id)
-    if not eq:
-        raise HTTPException(404)
+    eq = await _eq_or_404(db, eq_id)
 
     try:
         if eq.length_min is not None and length is not None:
@@ -480,18 +613,18 @@ async def print_bom(eq_id: int, length: float = None, db: AsyncSession = Depends
         info = grp["info"]
         sections_html += f"""
         <tr class="eq-row">
-          <td colspan="8">{'— ' * (info.get('level') or 0)}<b>{info.get('code', '—')}</b> — {info.get('name_ar', '—')}</td>
+          <td colspan="8">{'— ' * (info.get('level') or 0)}<b>{_esc(str(info.get('code') or '—'))}</b> — {_esc(str(info.get('name_ar') or '—'))}</td>
         </tr>"""
         for l in grp["rows"]:
             mat = l.get("material") or {}
             line_type_lbl = 'متغير/م' if l.get("line_type") == 'variable' else 'ثابت'
             sections_html += f"""
         <tr>
-          <td class="font-mono">{mat.get('code', '—')}</td>
-          <td>{mat.get('name_ar', '—')}</td>
+          <td class="font-mono">{_esc(str(mat.get('code') or '—'))}</td>
+          <td>{_esc(str(mat.get('name_ar') or '—'))}</td>
           <td style="text-align:center">{round(l.get('qty', 0), 3)}</td>
-          <td style="text-align:center">{mat.get('unit', '—')}</td>
-          <td style="text-align:center">{_dims_html(l)}</td>
+          <td style="text-align:center">{_esc(str(mat.get('unit') or '—'))}</td>
+          <td style="text-align:center">{_esc(_dims_html(l))}</td>
           <td>{_egp(l.get('unit_cost', 0))}</td>
           <td class="font-bold">{_egp(l.get('total_cost', 0))}</td>
           <td style="text-align:center">{line_type_lbl}</td>
@@ -501,22 +634,22 @@ async def print_bom(eq_id: int, length: float = None, db: AsyncSession = Depends
 
     summary_rows_html = ""
     for s in materials_summary:
-        warn = f'<div style="color:#b91c1c;font-size:9px;margin-top:2px">⚠ {s["oversized_warning"]}</div>' if s.get("oversized_warning") else ''
+        warn = f'<div style="color:#b91c1c;font-size:9px;margin-top:2px">⚠ {_esc(str(s["oversized_warning"]))}</div>' if s.get("oversized_warning") else ''
         frac = f' ({s["fraction_pct"]}%)' if s.get("fraction_pct") else ''
         summary_rows_html += f"""
         <tr>
-          <td class="font-mono">{s['material_code']}</td>
-          <td>{s['material_name']}</td>
-          <td class="font-bold">{s['count']} {s['unit_label']}{frac}{warn}</td>
+          <td class="font-mono">{_esc(str(s['material_code'] or ''))}</td>
+          <td>{_esc(str(s['material_name'] or ''))}</td>
+          <td class="font-bold">{s['count']} {_esc(str(s['unit_label'] or ''))}{frac}{warn}</td>
         </tr>"""
 
-    length_badge = f'<div class="sub">عند طول مُختار: {length} {eq.calc_unit or ""}</div>' if length is not None else ''
+    length_badge = f'<div class="sub">عند طول مُختار: {length} {_esc(eq.calc_unit or "")}</div>' if length is not None else ''
 
     html = f"""<!DOCTYPE html>
 <html dir="rtl" lang="ar">
 <head>
 <meta charset="UTF-8">
-<title>تقرير تصنيع — {eq.name_ar}</title>
+<title>تقرير تصنيع — {_esc(eq.name_ar or '')}</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   @page {{ size: A4 landscape; margin: 12mm }}
@@ -544,7 +677,7 @@ async def print_bom(eq_id: int, length: float = None, db: AsyncSession = Depends
 <div class="header">
   <div>
     <h1>تقرير تصنيع تفصيلي</h1>
-    <div class="sub">{eq.code} — {eq.name_ar}</div>
+    <div class="sub">{_esc(eq.code or '')} — {_esc(eq.name_ar or '')}</div>
     {length_badge}
   </div>
   <div style="text-align:left;font-size:11px;opacity:.85">تاريخ الطباعة: {_date.today().strftime('%Y/%m/%d')}</div>

@@ -6,6 +6,7 @@ CAD Files API
 - DELETE /cad/{file_id}            ← حذف ملف
 """
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,18 @@ ALLOWED_TYPES = {
 MAX_SIZE = 50 * 1024 * 1024  # 50 MB
 
 
+def _safe_stored_path(stored_name: str):
+    """مسار الملف على الـdisk — مع ضمان إنه جوه UPLOAD_DIR (حماية من path traversal)."""
+    if not stored_name or "/" in stored_name or "\\" in stored_name or stored_name in (".", ".."):
+        return None
+    p = (UPLOAD_DIR / stored_name).resolve()
+    try:
+        p.relative_to(UPLOAD_DIR.resolve())
+    except ValueError:
+        return None
+    return p
+
+
 @router.post("/upload/{equipment_id}", dependencies=[Depends(require_admin_production)])
 async def upload_cad_file(
     equipment_id: int,
@@ -55,9 +68,11 @@ async def upload_cad_file(
     if not eq:
         raise HTTPException(404, f"Equipment {equipment_id} not found")
 
-    # اقرأ الملف
-    content = await file.read()
+    # اقرأ الملف — بحد أقصى MAX_SIZE+1 بايت (بدل تحميل ملف ضخم كامل في الذاكرة)
+    content = await file.read(MAX_SIZE + 1)
     file_size = len(content)
+    if file_size == 0:
+        raise HTTPException(400, "الملف فارغ")
 
     if file_size > MAX_SIZE:
         raise HTTPException(400, f"الملف أكبر من 50MB — الحجم: {file_size//1024//1024}MB")
@@ -70,6 +85,10 @@ async def upload_cad_file(
 
     # اسم فريد للتخزين
     ext = Path(file.filename).suffix.lower() if file.filename else ".bin"
+    # الامتداد جاي من اسم ملف المستخدم — نقصره على حروف/أرقام فقط (بدون
+    # فواصل مسار أو رموز) عشان stored_name يفضل آمن تمامًا على الـdisk
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext or ""):
+        ext = ".bin"
     stored_name = f"eq{equipment_id}_{uuid.uuid4().hex}{ext}"
     stored_path = UPLOAD_DIR / stored_name
 
@@ -79,14 +98,17 @@ async def upload_cad_file(
 
     # احفظ في الـ DB
     from app.core.database import current_tenant_id as _ctid_cad
+    # اسم العرض: الاسم الأساسي فقط (بدون أي مسار) + بدون محارف تحكم، وبحد طول العمود
+    _display_name = Path((file.filename or stored_name).replace("\\", "/")).name
+    _display_name = re.sub(r'[\x00-\x1f\x7f"]', "_", _display_name)[:255] or stored_name
     cad = CADFile(
         tenant_id=_ctid_cad.get() or 1,
         equipment_id=equipment_id,
-        filename=file.filename or stored_name,
+        filename=_display_name,
         stored_name=stored_name,
         file_size=file_size,
-        mime_type=file.content_type or "application/octet-stream",
-        revision=revision.strip() or "Rev1",
+        mime_type=content_type[:100],
+        revision=(revision.strip() or "Rev1")[:20],
         notes=notes.strip() or None,
     )
     db.add(cad)
@@ -133,15 +155,17 @@ async def download_cad_file(file_id: int, db: AsyncSession = Depends(get_db)):
     if not cad:
         raise HTTPException(404, "الملف غير موجود")
 
-    stored_path = UPLOAD_DIR / cad.stored_name
-    if not stored_path.exists():
+    stored_path = _safe_stored_path(cad.stored_name)
+    if stored_path is None or not stored_path.exists():
         raise HTTPException(404, "الملف غير موجود على الـ server")
 
+    # FileResponse(filename=...) بيبني Content-Disposition صح بنفسه (RFC 5987
+    # لأسماء عربية/غير ASCII). الهيدر اليدوي القديم كان بيكسر أي اسم ملف عربي
+    # (ترميز latin-1 → 500) ويسمح بحقن هيدر عبر علامات تنصيص في اسم الملف.
     return FileResponse(
         path=str(stored_path),
         filename=cad.filename,
         media_type=cad.mime_type or "application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{cad.filename}"'},
     )
 
 
@@ -152,9 +176,12 @@ async def delete_cad_file(file_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "الملف غير موجود")
 
     # احذف من الـ disk
-    stored_path = UPLOAD_DIR / cad.stored_name
-    if stored_path.exists():
-        stored_path.unlink()
+    stored_path = _safe_stored_path(cad.stored_name)
+    if stored_path is not None and stored_path.exists():
+        try:
+            stored_path.unlink()
+        except OSError:
+            pass
 
     # احذف من الـ DB
     await db.delete(cad)

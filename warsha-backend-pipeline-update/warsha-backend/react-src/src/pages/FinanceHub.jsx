@@ -17,7 +17,7 @@ export default function FinanceHub() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex gap-1 border-b border-erp-border pb-0">
+      <div className="flex flex-wrap gap-1 border-b border-erp-border pb-0">
         {TABS.map(tab => (
           <button
             key={tab.key}

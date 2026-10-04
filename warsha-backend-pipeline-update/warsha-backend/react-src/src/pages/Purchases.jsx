@@ -65,7 +65,9 @@ export default function Purchases() {
   }
 
   const openEdit = async (inv) => {
-    const detail = await api.purchases.getInvoice(inv.id)
+    let detail
+    try { detail = await api.purchases.getInvoice(inv.id) }
+    catch (e) { toast(e.message || 'خطأ في تحميل الفاتورة', 'error'); return }
     setEditingId(detail.id)
     setForm({
       supplier_id: detail.supplier_id,
@@ -90,7 +92,9 @@ export default function Purchases() {
   }
 
   const openView = async (inv) => {
-    const detail = await api.purchases.getInvoice(inv.id)
+    let detail
+    try { detail = await api.purchases.getInvoice(inv.id) }
+    catch (e) { toast(e.message || 'خطأ في تحميل الفاتورة', 'error'); return }
     setViewInv(detail)
     setModal('view')
   }
@@ -104,9 +108,25 @@ export default function Purchases() {
     if (!lines.some(l => l.description && l.qty && l.unit_cost)) {
       toast('أضف سطراً واحداً على الأقل', 'error'); return
     }
+    // سطر ناقص (فيه بيانات لكن ناقص وصف/كمية/سعر) كان بيتشال بصمت من الفاتورة
+    const partial = lines.findIndex(l => (l.description || l.qty || l.unit_cost || l.material_id) && !(l.description && l.qty && l.unit_cost))
+    if (partial !== -1) { toast(`السطر ${partial + 1} ناقص — أكمل الوصف والكمية والسعر أو احذفه`, 'error'); return }
+    for (const [i, l] of lines.entries()) {
+      if (!(l.description && l.qty && l.unit_cost)) continue
+      if (!(+l.qty > 0)) { toast(`كمية السطر ${i + 1} يجب أن تكون أكبر من صفر`, 'error'); return }
+      if (!(+l.unit_cost >= 0)) { toast(`سعر الوحدة في السطر ${i + 1} لا يمكن أن يكون سالباً`, 'error'); return }
+    }
+    const taxN = +form.tax_pct || 0, discN = +form.discount_amt || 0
+    if (taxN < 0 || taxN > 100) { toast('نسبة الضريبة يجب أن تكون بين 0 و 100', 'error'); return }
+    if (discN < 0) { toast('الخصم لا يمكن أن يكون سالباً', 'error'); return }
+    if (discN > subtotal + 1e-9) { toast('الخصم لا يمكن أن يتجاوز إجمالي البنود', 'error'); return }
+    if (form.due_date && (form.date || today()) && form.due_date < (form.date || today())) {
+      toast('تاريخ الاستحقاق يجب أن يكون بعد تاريخ الفاتورة', 'error'); return
+    }
     const payload = {
       ...form,
       supplier_id: +form.supplier_id,
+      date: form.date || today(),
       due_date: form.due_date || null,
       tax_pct: +form.tax_pct || 0,
       discount_amt: +form.discount_amt || 0,
@@ -126,7 +146,13 @@ export default function Purchases() {
     }
 
     if (fileRef.current?.files?.length) {
-      await api.purchases.uploadAttachment(inv.id, fileRef.current.files[0])
+      // الفاتورة اتحفظت فعلاً — فشل رفع المرفق مايسيبش المودال مفتوح
+      // (كان المستخدم يعيد الحفظ فتتنشئ فاتورة مكررة).
+      try {
+        await api.purchases.uploadAttachment(inv.id, fileRef.current.files[0])
+      } catch (e) {
+        toast(`تم حفظ الفاتورة، لكن فشل رفع المرفق: ${e.message}`, 'error')
+      }
     }
 
     toast(editingId ? 'تم تحديث فاتورة الشراء ✅' : 'تم حفظ فاتورة الشراء ✅')
@@ -138,6 +164,11 @@ export default function Purchases() {
 
   const [pay, paying] = useAction(async () => {
     if (!payForm.amount) { toast('أدخل المبلغ', 'error'); return }
+    const amt = +payForm.amount, wht = +payForm.wht_amount || 0
+    const rem = (viewInv?.total || 0) - (viewInv?.paid_amount || 0)
+    if (!(amt > 0)) { toast('المبلغ يجب أن يكون أكبر من صفر', 'error'); return }
+    if (amt > rem + 0.005) { toast(`المبلغ أكبر من المتبقي (${egp(rem)})`, 'error'); return }
+    if (wht < 0 || wht > amt) { toast('ضريبة الخصم تحت الحساب غير صحيحة', 'error'); return }
     const res = await api.purchases.recordPayment(viewInv.id, {
       amount: +payForm.amount,
       payment_date: payForm.payment_date || today(),
@@ -290,18 +321,19 @@ export default function Purchases() {
                               }}
                             >💰 دفع</button>
                           )}
-                          <label className="btn btn-sm text-xs cursor-pointer" title="رفع مرفق">
+                          <label className="btn btn-sm text-xs cursor-pointer" title="رفع مرفق" style={uploading ? { opacity: 0.5, pointerEvents: 'none' } : undefined}>
                             📎
                             <input
                               type="file"
                               className="hidden"
                               accept="image/*"
-                              onChange={e => e.target.files[0] && uploadAtt(inv.id, e.target.files[0])}
+                              onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; if (f) uploadAtt(inv.id, f) }}
                             />
                           </label>
                           <button
                             className="btn btn-sm text-xs btn-danger"
                             title="حذف"
+                            disabled={deleting}
                             onClick={() => setConfirmDelete(inv.id)}
                           >🗑️</button>
                         </div>
@@ -337,6 +369,7 @@ export default function Purchases() {
             <Input
               label="تاريخ الاستحقاق"
               type="date"
+              min={form.date || undefined}
               value={form.due_date || ''}
               onChange={e => setForm(f => ({ ...f, due_date: e.target.value }))}
             />
@@ -351,6 +384,8 @@ export default function Purchases() {
             <Input
               label="ضريبة %"
               type="number"
+              min="0"
+              max="100"
               step="0.1"
               value={form.tax_pct || '0'}
               onChange={e => setForm(f => ({ ...f, tax_pct: e.target.value }))}
@@ -358,6 +393,7 @@ export default function Purchases() {
             <Input
               label="خصم (ج)"
               type="number"
+              min="0"
               value={form.discount_amt || '0'}
               onChange={e => setForm(f => ({ ...f, discount_amt: e.target.value }))}
             />
@@ -420,6 +456,7 @@ export default function Purchases() {
                         <input
                           className="erp-input text-xs w-20"
                           type="number"
+                          min="0"
                           step="0.01"
                           value={l.qty}
                           onChange={e => updateLine(i, 'qty', e.target.value)}
@@ -436,6 +473,7 @@ export default function Purchases() {
                         <input
                           className="erp-input text-xs w-24"
                           type="number"
+                          min="0"
                           step="0.01"
                           value={l.unit_cost}
                           onChange={e => updateLine(i, 'unit_cost', e.target.value)}
@@ -461,7 +499,10 @@ export default function Purchases() {
                       </td>
                       <td>
                         <button
+                          type="button"
                           className="text-erp-muted hover:text-red text-xs"
+                          title="حذف السطر"
+                          disabled={lines.length <= 1}
                           onClick={() => removeLine(i)}
                         >✕</button>
                       </td>
@@ -499,7 +540,7 @@ export default function Purchases() {
 
           {/* File attachment */}
           <div>
-            <div className="text-xs font-medium text-erp-muted mb-1">إرفاق صورة/PDF الفاتورة (اختياري)</div>
+            <div className="text-xs font-medium text-erp-muted mb-1">إرفاق صورة الفاتورة (اختياري — صور فقط)</div>
             <input ref={fileRef} type="file" accept="image/*" className="text-xs" />
           </div>
 
@@ -522,7 +563,7 @@ export default function Purchases() {
       <Modal
         open={modal === 'view'}
         onClose={() => setModal(null)}
-        title={`فاتورة شراء — ${viewInv?.internal_code || viewInv?.code}`}
+        title={`فاتورة شراء — ${viewInv?.internal_code || viewInv?.code || ''}`}
         size="lg"
       >
         {viewInv && (
@@ -614,9 +655,15 @@ export default function Purchases() {
       {/* ── Payment Modal ── */}
       <Modal open={modal === 'payment'} onClose={() => setModal(null)} title="تسجيل دفعة" size="sm">
         <div className="flex flex-col gap-3">
+          {viewInv && (
+            <div className="text-xs text-erp-muted">
+              المتبقي على الفاتورة: <span className="font-bold" style={{ color: 'var(--red)' }}>{egp((viewInv.total || 0) - (viewInv.paid_amount || 0))}</span>
+            </div>
+          )}
           <Input
             label="المبلغ (ج) *"
             type="number"
+            min="0.01"
             step="0.01"
             value={payForm.amount}
             onChange={e => setPayForm(f => ({ ...f, amount: e.target.value }))}
@@ -630,6 +677,7 @@ export default function Purchases() {
           <Input
             label="ضريبة الخصم تحت الحساب (WHT)"
             type="number"
+            min="0"
             step="0.01"
             value={payForm.wht_amount}
             onChange={e => setPayForm(f => ({ ...f, wht_amount: e.target.value }))}
@@ -655,7 +703,8 @@ export default function Purchases() {
 
       <ConfirmDialog
         open={!!confirmDelete}
-        message="هل تريد حذف هذه الفاتورة؟"
+        message="هل تريد حذف هذه الفاتورة؟ (يُسمح بحذف الفواتير غير المدفوعة فقط)"
+        danger
         onConfirm={() => { handleDelete(confirmDelete); setConfirmDelete(null) }}
         onCancel={() => setConfirmDelete(null)}
       />

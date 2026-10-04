@@ -324,3 +324,60 @@ async def test_order_status_terminal_states_cannot_be_reversed(cli):
     # محاولة الرجوع لأي حالة تانية بعد الإلغاء لازم تترفض
     r_back = await cli.put(f"{BASE}/orders/{oid}", params={"status": "pending"})
     assert r_back.status_code == 400
+
+
+
+# ════════════════ ROUND 3: CUSTOMERS VALIDATION / GAP FIXES ═════════════
+
+@pytest.mark.asyncio
+async def test_payment_rejects_other_tenant_customer(cli, cli2):
+    other = (await cli2.post(BASE, json=_cust("tenant2 customer"))).json()["id"]
+    r = await cli.post(f"{BASE}/payments", json={
+        "customer_id": other, "amount": 100, "payment_date": str(date.today())})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_order_rejects_negative_qty_and_bad_status(cli):
+    cid = (await cli.post(BASE, json=_cust())).json()["id"]
+    base = {"customer_id": cid, "order_date": str(date.today()), "status": "pending",
+            "quantity": 1, "unit_price": 100}
+    assert (await cli.post(f"{BASE}/orders", json={**base, "quantity": -2})).status_code == 400
+    assert (await cli.post(f"{BASE}/orders", json={**base, "unit_price": -5})).status_code == 400
+    assert (await cli.post(f"{BASE}/orders", json={**base, "status": "hacked"})).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_duplicate_customer_code_returns_400(cli):
+    assert (await cli.post(BASE, json={**_cust(), "code": "C-DUP"})).status_code == 201
+    assert (await cli.post(BASE, json={**_cust("second"), "code": "C-DUP"})).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_delete_customer_blocked_when_has_payments(cli):
+    cid = (await cli.post(BASE, json=_cust())).json()["id"]
+    await cli.post(f"{BASE}/payments", json={"customer_id": cid, "amount": 50,
+                                               "payment_date": str(date.today())})
+    assert (await cli.delete(f"{BASE}/{cid}")).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_ledger_includes_issued_credit_notes(cli):
+    cid = (await cli.post(BASE, json=_cust())).json()["id"]
+    await cli.post(f"{SALES_BASE}/invoices", json={
+        "customer_id": cid, "date": str(date.today()),
+        "lines": [{"description": "x", "qty": 1, "unit_price": 500}]})
+    cn = (await cli.post("/api/v1/credit-notes", json={
+        "customer_id": cid, "date": str(date.today()),
+        "lines": [{"description": "x", "qty": 1, "unit_price": 100}]})).json()["id"]
+    await cli.patch(f"/api/v1/credit-notes/{cn}/issue")
+    led = (await cli.get(f"{BASE}/{cid}/ledger")).json()
+    assert led["balance"] == 400.0
+    assert any(r["type"] == "credit_note" for r in led["rows"])
+
+
+@pytest.mark.asyncio
+async def test_print_statement_escapes_customer_name(cli):
+    cid = (await cli.post(BASE, json=_cust("<script>alert(1)</script>"))).json()["id"]
+    html = (await cli.get(f"{BASE}/{cid}/print-statement")).text
+    assert "<script>alert(1)</script>" not in html

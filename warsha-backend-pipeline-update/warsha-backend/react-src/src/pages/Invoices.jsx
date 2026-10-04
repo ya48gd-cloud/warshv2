@@ -92,12 +92,31 @@ function InvoiceForm({ customers, onSave, onCancel, initial }) {
     if (form.date && form.due_date && form.due_date < form.date) {
       toast('تاريخ الاستحقاق لازم يكون بعد تاريخ الفاتورة', 'error'); return
     }
+    // نفس قواعد الباك إند (_validate_doc_lines): كمية موجبة، سعر غير سالب، نسب 0-100
+    if (lines.some(l => !(Number(l.qty) > 0))) { toast('كمية كل بند يجب أن تكون أكبر من صفر', 'error'); return }
+    if (lines.some(l => l.unit_price === '' || l.unit_price == null || isNaN(Number(l.unit_price)) || Number(l.unit_price) < 0)) {
+      toast('سعر الوحدة لازم يكون رقم صفر أو أكثر لكل البنود', 'error'); return
+    }
+    for (const [name, v] of [['الضريبة', form.tax_pct], ['الخصم', form.discount_pct]]) {
+      const n = Number(v) || 0
+      if (n < 0 || n > 100) { toast(`نسبة ${name} يجب أن تكون بين 0 و100`, 'error'); return }
+    }
+    if (initial && Number(initial.paid_amount || 0) > 0 && total + 0.005 < Number(initial.paid_amount)) {
+      toast(`الإجمالي الجديد (${egp(total)}) أقل من المبلغ المسدد على الفاتورة (${egp(initial.paid_amount)})`, 'error'); return
+    }
+    if (saving) return
     setSaving(true)
     try {
       await onSave({
         code:         form.code,
         customer_id:  Number(form.customer_id),
         location_id:  form.location_id ? Number(form.location_id) : null,
+        // الحفاظ على روابط الفاتورة الأصلية عند التعديل — الباك إند بيكتب
+        // quotation_id من الطلب مباشرة، فإرسالها فاضية كان بيقطع ربط عرض السعر
+        ...(initial ? {
+          quotation_id:  initial.quotation_id ?? null,
+          work_order_id: initial.work_order_id ?? null,
+        } : {}),
         date:         form.date || today(),        // fixed: was issue_date spread via ...form
         due_date:     form.due_date || null,
         tax_pct:      Number(form.tax_pct) || 0,
@@ -113,6 +132,8 @@ function InvoiceForm({ customers, onSave, onCancel, initial }) {
           unit_price:  Number(l.unit_price) || 0,
           notes:       l.notes || null,
           sort_order:  i,
+          // الحفاظ على صورة البند (لو موجودة) عند التعديل بدل ما تتمسح
+          ...(l.image_data ? { image_data: l.image_data } : {}),
         })),
       })
     } finally {
@@ -279,7 +300,7 @@ function InvoiceForm({ customers, onSave, onCancel, initial }) {
 }
 
 // ── Invoices list ──────────────────────────────────────────────
-export default function Invoices() {
+export default function Invoices({ highlightId = null } = {}) {
   const { canWrite } = useAuth()
   const write = canWrite('sales')
   const toast = useToast()
@@ -300,6 +321,13 @@ export default function Invoices() {
   const [scheduleExisting, setScheduleExisting] = useState(null) // الخطة الحالية (لو موجودة) — null = بيتحمّل، [] = مفيش
   const [scheduleRows, setScheduleRows] = useState([])           // صفوف التعديل/الإنشاء
   const [scheduleMode, setScheduleMode] = useState('view')       // 'view' | 'edit'
+
+  // لما نيجي من شاشة الأقساط على فاتورة معينة، نفلتر القائمة عليها مباشرة
+  useEffect(() => {
+    if (!highlightId || !Array.isArray(invoices)) return
+    const target = invoices.find(i => String(i.id) === String(highlightId))
+    if (target?.code) setQ(target.code)
+  }, [highlightId, invoices])
 
   const filtered = useMemo(() => {
     if (!invoices) return []
@@ -375,7 +403,7 @@ export default function Invoices() {
   }
 
   const [recordPay, paying] = useAction(async () => {
-    if (!payForm.amount || Number(payForm.amount) <= 0) { toast('أدخل المبلغ', 'error'); return }
+    if (!payForm.amount || !(Number(payForm.amount) > 0)) { toast('أدخل مبلغ صحيح أكبر من صفر', 'error'); return }
     const outstanding = Number(payModal?.total || 0) - Number(payModal?.paid_amount || 0)
     if (Number(payForm.amount) > outstanding + 0.01) {
       toast(`المبلغ (${egp(Number(payForm.amount))}) يتجاوز الرصيد المستحق (${egp(outstanding)})`, 'error'); return
@@ -438,6 +466,8 @@ export default function Invoices() {
 
   const [saveSchedule, savingSchedule] = useAction(async () => {
     if (scheduleRows.length === 0) { toast('أضف قسط واحد على الأقل', 'error'); return }
+    if (scheduleRows.some(r => !r.due_date)) { toast('حدد تاريخ استحقاق لكل قسط', 'error'); return }
+    if (scheduleRows.some(r => !(Number(r.amount) > 0))) { toast('مبلغ كل قسط لازم يكون أكبر من صفر', 'error'); return }
     const invTotal = Number(scheduleModal?.total || 0)
     if (Math.abs(scheduleRowsTotal - invTotal) > 0.02) {
       toast(`مجموع الأقساط (${egp(scheduleRowsTotal)}) لازم يساوي إجمالي الفاتورة (${egp(invTotal)})`, 'error')
@@ -534,6 +564,7 @@ export default function Invoices() {
                 partial: { label: 'جزئي',        cls: 'badge-amber' },
                 paid:    { label: 'مدفوعة',      cls: 'badge-green' },
                 overdue: { label: 'متأخرة',      cls: 'badge-red'   },
+                cancelled: { label: 'ملغية',     cls: 'badge-gray'  },
               }
               const st = statusMap[inv.status] || { label: inv.status, cls: 'badge-gray' }
               const outstanding = Number(inv.total || 0) - Number(inv.paid_amount || 0)
@@ -555,7 +586,7 @@ export default function Invoices() {
                           style={{ color: 'var(--green)', borderColor: 'var(--green-lt)' }}
                           onClick={() => {
                             setPayModal(inv)
-                            setPayForm({ amount: String(outstanding.toFixed(2)), payment_date: today() })
+                            setPayForm({ amount: String(outstanding.toFixed(2)), payment_date: today(), payment_type: 'cash', reference: '' })
                           }}>
                           💵 دفع
                         </button>
@@ -630,7 +661,8 @@ export default function Invoices() {
         </ModalFooter>
       </Modal>
 
-      <ConfirmDialog open={!!confirmDelete} message="هل تريد حذف هذه الفاتورة نهائياً؟"
+      <ConfirmDialog open={!!confirmDelete} title="حذف الفاتورة" confirmLabel="حذف" danger
+        message="هل تريد حذف هذه الفاتورة نهائياً؟"
         onConfirm={() => { handleDelete(confirmDelete); setConfirmDelete(null) }}
         onCancel={() => setConfirmDelete(null)} />
 
@@ -672,7 +704,7 @@ export default function Invoices() {
                               onClick={() => {
                                 setScheduleModal(null)
                                 setPayModal(scheduleModal)
-                                setPayForm({ amount: String(row.remaining_amount.toFixed(2)), payment_date: today() })
+                                setPayForm({ amount: String(Number(row.remaining_amount || 0).toFixed(2)), payment_date: today(), payment_type: 'cash', reference: '' })
                                 if (!isOldestOpen) {
                                   toast(`هيتوزع تلقائيًا على أقدم قسط مستحق أولاً (${oldestOpen.label || 'قسط ' + oldestOpen.installment_no})، مش بالضرورة القسط ده مباشرة`, 'warn')
                                 }

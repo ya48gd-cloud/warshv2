@@ -31,6 +31,8 @@ def _ensure_logo_dir():
 
 ALLOWED_LOGO_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml"}
 MAX_LOGO_SIZE = 5 * 1024 * 1024  # 5 MB
+_EXT_BY_TYPE = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                "image/webp": ".webp", "image/svg+xml": ".svg"}
 
 
 class WorkshopProfileIn(BaseModel):
@@ -111,8 +113,23 @@ async def update_profile(
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
+    # VALIDATION (fixed): اسم فاضي/قيم أطول من الأعمدة/currency=null (عمود NOT NULL)
+    # كانت بتتقبل وتنتهي بـ 500 على Postgres أو بيانات فاسدة في الطباعة.
+    name = (data.name or "").strip()
+    if not name:
+        raise HTTPException(400, "اسم الورشة مطلوب")
+    _limits = {"name": 200, "description": 300, "phone": 50, "mobile": 50,
+               "email": 120, "tax_id": 50, "commercial_reg": 50, "currency": 10}
+    payload = data.model_dump()
+    payload["name"] = name
+    for _k, _max in _limits.items():
+        _v = payload.get(_k)
+        if isinstance(_v, str) and len(_v) > _max:
+            raise HTTPException(400, f"الحقل {_k} طويل جداً ({_max} حرف كحد أقصى)")
+    if not (payload.get("currency") or "").strip():
+        payload["currency"] = "ج.م"
     prof = await _get_or_create(db)
-    for k, v in data.model_dump().items():
+    for k, v in payload.items():
         setattr(prof, k, v)
     await db.commit()
     await db.refresh(prof)
@@ -143,7 +160,12 @@ async def upload_logo(
             except OSError:
                 pass
 
-    ext = Path(file.filename).suffix.lower() if file.filename else ".png"
+    if not content:
+        raise HTTPException(400, "الملف فارغ")
+    # SECURITY (fixed): الامتداد كان بيتاخد من اسم الملف اللي بعته العميل (مثلاً
+    # logo.html مع content-type=image/png) → FileResponse بيخدمه كـ text/html من نفس
+    # الـ origin = stored XSS. دلوقتي الامتداد مشتق من النوع المسموح فقط.
+    ext = _EXT_BY_TYPE.get(file.content_type, ".png")
     stored_name = f"logo_{uuid.uuid4().hex}{ext}"
     with open(LOGO_DIR / stored_name, "wb") as f:
         f.write(content)
@@ -171,9 +193,18 @@ async def get_logo(db: AsyncSession = Depends(get_db)):
     if not prof or not prof.logo_stored_name:
         raise HTTPException(404, "لا يوجد لوجو")
     path = LOGO_DIR / prof.logo_stored_name
+    # حماية من path traversal لو اسم مخزّن فاسد
+    try:
+        path.resolve().relative_to(LOGO_DIR.resolve())
+    except ValueError:
+        raise HTTPException(404, "ملف اللوجو غير موجود")
     if not path.exists():
         raise HTTPException(404, "ملف اللوجو غير موجود")
-    return FileResponse(path)
+    # SVG ممكن يحتوي سكربت — نمنع تنفيذه لو اتفتح مباشرةً في المتصفح
+    return FileResponse(path, headers={
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox",
+    })
 
 
 @router.delete("/profile/logo")

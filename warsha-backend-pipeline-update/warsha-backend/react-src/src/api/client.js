@@ -17,10 +17,12 @@ const VALIDATION_MSG_MAP = [
   [/input should be a valid number/i, 'لازم يكون رقم'],
   [/input should be a valid string/i, 'لازم يكون نص'],
   [/input should be a valid email address|value is not a valid email address/i, 'بريد إلكتروني غير صحيح'],
-  [/input should be greater than (.+)/i, 'لازم يكون أكبر من $1'],
+  // ترتيب مهم: صيغة "or equal to" لازم تيجي قبل الصيغة الأقصر، وإلا
+  // "greater than (.+)" بتلتقطها وتطلع "أكبر من or equal to 0"
   [/input should be greater than or equal to (.+)/i, 'لازم يكون أكبر من أو يساوي $1'],
-  [/input should be less than (.+)/i, 'لازم يكون أقل من $1'],
+  [/input should be greater than (.+)/i, 'لازم يكون أكبر من $1'],
   [/input should be less than or equal to (.+)/i, 'لازم يكون أقل من أو يساوي $1'],
+  [/input should be less than (.+)/i, 'لازم يكون أقل من $1'],
   [/string should have at least (\d+) character/i, 'لازم يكون $1 حرف على الأقل'],
   [/string should have at most (\d+) character/i, 'أقصى طول $1 حرف'],
   [/input should be a valid date/i, 'تاريخ غير صحيح'],
@@ -33,10 +35,44 @@ function translateValidationMsg(rawMsg) {
   return rawMsg // ما لقيناش ترجمة معروفة — نسيبها زي ما هي بدل ما نخفي السبب
 }
 
+// رسائل عربية افتراضية حسب كود الحالة — تُستخدم فقط لما الخادم ما يرجّعش
+// detail مفهوم (مثلاً صفحة HTML من البروكسي أو 500 بدون جسم JSON)
+const STATUS_MSG = {
+  400: 'طلب غير صالح',
+  401: 'غير مسموح — يرجى تسجيل الدخول',
+  403: 'ليس لديك صلاحية لتنفيذ هذا الإجراء',
+  404: 'العنصر المطلوب غير موجود',
+  409: 'تعارض مع بيانات موجودة',
+  413: 'حجم الملف/البيانات أكبر من المسموح',
+  422: 'بيانات غير صالحة',
+  429: 'طلبات كثيرة — حاول بعد قليل',
+  500: 'خطأ داخلي في الخادم',
+  502: 'الخادم غير متاح حالياً',
+  503: 'الخادم غير متاح حالياً',
+  504: 'انتهت مهلة الاتصال بالخادم',
+}
+
+// استخراج رسالة خطأ مقروءة من جسم استجابة الخادم (أي شكل) — بدون ما نرمي
+export function extractErrorMessage(data, status) {
+  const d = data && typeof data === 'object' ? data.detail : undefined
+  if (typeof d === 'string' && d.trim()) return d
+  if (Array.isArray(d) && d.length) return formatValidationErrors(d)
+  if (d && typeof d === 'object') {
+    const inner = d.message || d.msg || d.detail || d.error
+    if (typeof inner === 'string' && inner.trim()) return inner
+  }
+  if (data && typeof data === 'object') {
+    if (typeof data.message === 'string' && data.message.trim()) return data.message
+    if (typeof data.error === 'string' && data.error.trim()) return data.error
+  }
+  return STATUS_MSG[status] || 'خطأ في الخادم'
+}
+
 function formatValidationErrors(detailArray) {
   return detailArray.map(e => {
-    const fieldPath = Array.isArray(e.loc) ? e.loc.filter(p => p !== 'body').join(' → ') : ''
-    const msg = translateValidationMsg(e.msg || JSON.stringify(e))
+    if (typeof e === 'string') return translateValidationMsg(e)
+    const fieldPath = Array.isArray(e?.loc) ? e.loc.filter(p => p !== 'body').join(' → ') : ''
+    const msg = translateValidationMsg(String(e?.msg || JSON.stringify(e)))
     return fieldPath ? `${fieldPath}: ${msg}` : msg
   }).join('، ')
 }
@@ -53,22 +89,22 @@ async function request(method, path, body = null) {
         headers,
         body: body ? JSON.stringify(body) : undefined,
       })
+      // 204 No Content (مثلاً DELETE /inventory/sheet-stock/{id}) ليس لها جسم JSON —
+      // كانت تُعامَل كـ "استجابة غير صالحة" رغم نجاح العملية فعلياً على الخادم.
+      if (res.status === 204) return null
       let data
       try { data = await res.json() }
       catch { if (res.ok) throw Object.assign(new Error('استجابة غير صالحة من الخادم'), { status: 502 }); data = {} }
       if (!res.ok) {
         // انتهت الجلسة — نُسجّل خروج تلقائي (ليس من /auth/me نفسه — ذلك يُعالَج في auth.jsx)
-        if (res.status === 401 && !path.endsWith('/auth/me')) {
+        // (ولا من /auth/login — 401 هناك معناه بيانات دخول خاطئة، مش جلسة منتهية)
+        if (res.status === 401 && !path.endsWith('/auth/me') && !path.startsWith('/auth/login')) {
           sessionStorage.removeItem('erp_token')
           window.__ERP_FORCE_LOGOUT__ = true
           window.dispatchEvent(new CustomEvent('erp:session-expired'))
         }
-        // استخراج رسالة الخطأ بشكل آمن
-        const msg = typeof data.detail === 'string'
-          ? data.detail
-          : Array.isArray(data.detail)
-            ? formatValidationErrors(data.detail)
-            : data.message || 'خطأ في الخادم'
+        // استخراج رسالة الخطأ بشكل آمن (detail نصي / قائمة validation / كائن / حسب كود الحالة)
+        const msg = extractErrorMessage(data, res.status)
         throw Object.assign(new Error(msg), { status: res.status, data })
       }
       return data
@@ -77,7 +113,7 @@ async function request(method, path, body = null) {
       // network error — try next base
     }
   }
-  throw new Error('تعذر الاتصال بالخادم')
+  throw Object.assign(new Error('تعذر الاتصال بالخادم — تحقق من الاتصال بالشبكة'), { network: true })
 }
 
 // ── جلب استجابة خام بمصادقة (يحافظ على ترويسة Authorization) ───────────
@@ -95,7 +131,13 @@ async function authedFetch(path, opts = {}) {
         window.dispatchEvent(new CustomEvent('erp:session-expired'))
         throw Object.assign(new Error('غير مسموح — يرجى تسجيل الدخول'), { status: 401 })
       }
-      if (!res.ok) throw Object.assign(new Error('فشل الطلب من الخادم'), { status: res.status })
+      if (!res.ok) {
+        // نحاول نقرأ detail من الخادم (مثلاً 404 "الفاتورة غير موجودة") بدل رسالة عامة
+        let data = null
+        try { data = await res.clone().json() } catch { /* ليس JSON */ }
+        const msg = data ? extractErrorMessage(data, res.status) : (STATUS_MSG[res.status] || 'فشل الطلب من الخادم')
+        throw Object.assign(new Error(msg), { status: res.status, data })
+      }
       return res
     } catch (err) {
       if (err.status) throw err
@@ -144,6 +186,11 @@ export async function download(path, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+// تهريب نص قبل كتابته كـ HTML في نافذة منبثقة (رسائل الخطأ قد تحتوي بيانات مستخدم)
+function escapeHtml(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+
 // ── طباعة في نافذة منبثقة (popup) — تجلب HTML بمصادقة ثم تعرضه ─────────
 export async function printPopup(path) {
   // نفتح النافذة فوراً داخل حدث الضغط (قبل await) حتى لا يحجبها مانع النوافذ المنبثقة
@@ -166,7 +213,7 @@ export async function printPopup(path) {
     w.document.close()
   } catch (err) {
     w.document.open()
-    w.document.write('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;direction:rtl;padding:24px;color:#b00">' + (err.message || 'فشل تحميل صفحة الطباعة') + '</body>')
+    w.document.write('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;direction:rtl;padding:24px;color:#b00">' + escapeHtml(err.message || 'فشل تحميل صفحة الطباعة') + '</body>')
     w.document.close()
   }
 }
@@ -181,7 +228,8 @@ export async function openFile(path) {
     if (w) w.location = url
     setTimeout(() => URL.revokeObjectURL(url), 60000)
   } catch (err) {
-    if (w) { w.document.write('<body style="font-family:sans-serif;direction:rtl;padding:24px;color:#b00">' + (err.message || 'فشل فتح الملف') + '</body>'); w.document.close() }
+    if (!w) window.dispatchEvent(new CustomEvent('erp:toast', { detail: { msg: err.message || 'فشل فتح الملف', type: 'error' } }))
+    if (w) { w.document.write('<body style="font-family:sans-serif;direction:rtl;padding:24px;color:#b00">' + escapeHtml(err.message || 'فشل فتح الملف') + '</body>'); w.document.close() }
   }
 }
 
@@ -232,9 +280,14 @@ export const api = {
     categories: ()      => request('GET',    '/inventory/categories'),
     createCat:  (b)     => request('POST',   '/inventory/categories', b),
     deleteCat:  (id)    => request('DELETE', `/inventory/categories/${id}`),
-    movements:     (id)    => request('GET',    `/inventory/movements/${id}`),
+    movements:     (id, wh) => request('GET',    `/inventory/movements/${id}${wh ? `?warehouse_id=${wh}` : ''}`),
+    // كل حركات مخزن معيّن (كل المواد) — الأحدث أولاً
+    warehouseMovements: (wh) => request('GET', `/inventory/warehouse-movements/${wh}`),
     createMov:     (b)     => request('POST',   '/inventory/movements', b),
     deleteMovement:(id)    => request('DELETE', `/inventory/movements/${id}`),
+    quants:        (id)    => request('GET',    `/inventory/materials/${id}/quants`),
+    warehouseDistribution: () => request('GET', '/inventory/warehouse-distribution'),
+    transfer:      (b)     => request('POST',   '/inventory/movements/transfer', b),
     alerts:        ()      => request('GET',    '/inventory/alerts/low-stock'),
     cuttingPlan:   (b)     => request('POST',   '/inventory/cutting-plan', b),
     barCuttingPlan: (b)    => request('POST',   '/inventory/bar-cutting-plan', b),
@@ -314,7 +367,8 @@ export const api = {
     create:      (b)      => request('POST',   '/fixed-assets', b),
     update:      (id, b)  => request('PATCH',  `/fixed-assets/${id}`, b),
     delete:      (id)     => request('DELETE', `/fixed-assets/${id}`),
-    dispose:     (id)     => request('PATCH',  `/fixed-assets/${id}/dispose`),
+    // body اختياري: { sale_amount, cash_account_code, disposal_date } — بدونه = إعدام بدون عائد (نفس السلوك القديم)
+    dispose:     (id, b)  => request('PATCH',  `/fixed-assets/${id}/dispose`, b || {}),
     depreciate:  (id, b)  => request('POST',   `/fixed-assets/${id}/depreciate`, b),
   },
 
@@ -496,8 +550,12 @@ export const api = {
     reservations: (id)   => request('GET',  `/production/${id}/reservations`),
     cancelReservation: (id) => request('DELETE', `/production/reservations/${id}`),
     stockCounts:  ()     => request('GET',  '/production/stock-count'),
-    startCount:   ()     => request('POST', '/production/stock-count', {}),
+    stockCount:   (id)   => request('GET',  `/production/stock-count/${id}`),
+    // b: { warehouse_id, notes } — من غير مخزن = جرد قديم على كل المخازن
+    startCount:   (b)    => request('POST', '/production/stock-count', b || {}),
     scanLine:     (id,b) => request('POST', `/production/stock-count/${id}/scan`, b),
+    unscanLine:   (id,m) => request('DELETE', `/production/stock-count/${id}/scan/${m}`),
+    cancelCount:  (id)   => request('POST', `/production/stock-count/${id}/cancel`, {}),
     closeCount:   (id)   => request('POST', `/production/stock-count/${id}/close`, {}),
     team: {
       list:   (woId)        => request('GET',    `/production/work-orders/${woId}/team`),
@@ -604,6 +662,8 @@ api.purchaseOrders = {
 api.accounts = {
   chart:          ()    => request('GET',  '/accounts/chart'),
   seed:           ()    => request('POST', '/accounts/chart/seed'),
+  createAccount:  (b)   => request('POST', '/accounts/chart', b),
+  updateAccount:  (id,b)=> request('PUT',  `/accounts/chart/${id}`, b),
   entries:        (p)   => request('GET',  `/accounts/entries${p ? '?'+new URLSearchParams(p) : ''}`),
   createEntry:    (b)   => request('POST', '/accounts/entries', b),
   postEntry:      (id)  => request('PATCH', `/accounts/entries/${id}/post`),
@@ -662,6 +722,8 @@ api.warehouses = {
   update:       (id, b)            => request('PUT',    `/warehouses/${id}`, b),
   remove:       (id)                => request('DELETE', `/warehouses/${id}`),
   toggleActive: (id)                => request('POST',   `/warehouses/${id}/toggle-active`),
+  stockSummary: (includeInactive) => request('GET',    `/warehouses/stock-summary${includeInactive ? '?include_inactive=true' : ''}`),
+  stock:        (id)                => request('GET',    `/warehouses/${id}/stock`),
 }
 
 api.creditNotes = {

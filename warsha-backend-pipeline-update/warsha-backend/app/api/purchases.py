@@ -8,12 +8,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+import re
+import html as _html_mod
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.core.database import get_db
 from app.api.auth import require_any, get_current_user
@@ -26,7 +29,20 @@ from app.models.models import (
     FileAttachment, Material, WorkshopProfile, BarStockItem,
 )
 
-router = APIRouter(prefix="/purchases", tags=["purchases"], dependencies=[Depends(require_any)])
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: مستخدم "مشاهد" (viewer) كان يقدر ينشئ/يعدّل/يحذف
+    موردين وفواتير شراء ويسجّل دفعات ويرفع/يحذف مرفقات بطلب API مباشر رغم إن
+    الواجهة مخبية الأزرار (ROLE_WRITE['viewer'] = []). نفس نمط customers/sales."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
+router = APIRouter(prefix="/purchases", tags=["purchases"],
+                   dependencies=[Depends(require_any), Depends(_block_viewer_writes)])
 print_router = APIRouter(prefix="/purchases", tags=["purchases_print"], dependencies=[Depends(require_any)])
 
 
@@ -59,11 +75,62 @@ async def _next_internal_code(db: AsyncSession, tid: int) -> str:
         .where(PurchaseInvoice.tenant_id == tid)
     )
     n = (count or 0) + 1
-    return f"PI-{year}-{n:04d}"
+    # العدّ وحده بيولّد كود مكرر بعد حذف أي فاتورة (مثلاً فاتورتين، اتحذفت
+    # الأولى → العدد 1 → PI-YYYY-0002 تاني) فيقع الإنشاء بـ IntegrityError
+    # (500) على uq_purchaseinvoice_tenant_code لو الكود اتستخدم كـ code.
+    # نتخطى أي كود مستخدم فعلاً (كـ code أو internal_code) لنفس الـ tenant.
+    while True:
+        candidate = f"PI-{year}-{n:04d}"
+        taken = await db.scalar(
+            select(PurchaseInvoice.id).where(
+                PurchaseInvoice.tenant_id == tid,
+                (PurchaseInvoice.code == candidate) | (PurchaseInvoice.internal_code == candidate),
+            ).limit(1)
+        )
+        if not taken:
+            return candidate
+        n += 1
+
+
+async def _invoice_code_taken(db: AsyncSession, tid: int, code: str, exclude_id: Optional[int] = None) -> bool:
+    """هل كود فاتورة الشراء مستخدم لنفس الـ tenant؟ (uq_purchaseinvoice_tenant_code)
+    — بدل ما التكرار يوصل للـ DB ويرجع 500 IntegrityError."""
+    q = select(PurchaseInvoice.id).where(
+        PurchaseInvoice.tenant_id == tid, PurchaseInvoice.code == code,
+    )
+    if exclude_id is not None:
+        q = q.where(PurchaseInvoice.id != exclude_id)
+    return bool(await db.scalar(q.limit(1)))
+
+
+def _validate_invoice_header(data) -> None:
+    """تحقق من رأس فاتورة الشراء: الضريبة والخصم والتواريخ.
+    كان ممكن تمرير tax_pct سالب أو خصم أكبر من الإجمالي، فيطلع total سالب
+    ويتسجل قيد محاسبي معكوس ويقل رصيد المورد بدل ما يزيد."""
+    if data.tax_pct is not None and (data.tax_pct < 0 or data.tax_pct > 100):
+        raise HTTPException(400, "نسبة الضريبة يجب أن تكون بين 0 و 100")
+    if data.discount_amt is not None and data.discount_amt < 0:
+        raise HTTPException(400, "الخصم لا يمكن أن يكون سالباً")
+    if data.due_date and data.date and data.due_date < data.date:
+        raise HTTPException(400, "تاريخ الاستحقاق يجب أن يكون بعد تاريخ الفاتورة")
+    subtotal = sum(Decimal(str(l.qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
+    if Decimal(str(data.discount_amt or 0)) > subtotal:
+        raise HTTPException(400, "الخصم لا يمكن أن يتجاوز إجمالي البنود")
 
 UPLOAD_DIR = Path(os.getenv("ERP_UPLOAD_DIR", "/app/uploads")) / "attachments"
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024  # 15MB — حد أقصى لحجم المرفق (منع استنزاف القرص/الذاكرة)
+# entity_type بيدخل في اسم الملف على القرص — لازم يكون معرّف بسيط (حروف/أرقام/_)
+# عشان مايبقاش فيه path traversal (مثلاً entity_type=../../x كان بيكتب ملف برا مجلد المرفقات)
+_ENTITY_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,49}$")
+
+
+def _check_attachment_size(content: bytes) -> None:
+    if not content:
+        raise HTTPException(400, "الملف فارغ")
+    if len(content) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(400, "حجم الملف أكبر من الحد المسموح (15 ميجابايت)")
 
 
 def _validate_image_attachment(file: UploadFile) -> str:
@@ -92,6 +159,38 @@ class SupplierIn(BaseModel):
     is_import: Optional[bool] = None  # محطة 21: تصنيف صريح، له الأولوية على heuristic كلمات supplier_type
     notes: Optional[str] = None
 
+    @field_validator("name")
+    @classmethod
+    def _name_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("اسم المورد مطلوب")
+        if len(v) > 200:
+            raise ValueError("اسم المورد طويل جداً (الحد 200 حرف)")
+        return v
+
+    @field_validator("code")
+    @classmethod
+    def _code_len(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if len(v) > 30:
+            raise ValueError("كود المورد طويل جداً (الحد 30 حرف)")
+        return v or None
+
+    @field_validator("phone", "email", "contact_person", "tax_id", "payment_terms",
+                     "bank_account", "iban", "supplier_type")
+    @classmethod
+    def _max_lengths(cls, v: Optional[str], info) -> Optional[str]:
+        # نفس أطوال أعمدة جدول suppliers — على Postgres القيمة الأطول كانت
+        # بترجع 500 (StringDataRightTruncation) بدل رسالة واضحة.
+        limits = {"phone": 30, "email": 200, "contact_person": 200, "tax_id": 50,
+                  "payment_terms": 100, "bank_account": 200, "iban": 50, "supplier_type": 30}
+        if v is not None and len(v) > limits[info.field_name]:
+            raise ValueError(f"الحقل {info.field_name} أطول من المسموح ({limits[info.field_name]} حرف)")
+        return v
+
 
 class PurchaseLineIn(BaseModel):
     material_id: Optional[int] = None
@@ -115,7 +214,36 @@ class PurchaseInvoiceIn(BaseModel):
     lines: List[PurchaseLineIn] = []
 
 
-class PaymentIn(BaseModel):
+def _check_finite(v):
+    """json.loads بيقبل NaN/Infinity — Decimal('NaN') كان بيوقع المقارنة بـ 500."""
+    import math
+    if v is not None and not math.isfinite(float(v)):
+        raise ValueError("قيمة رقمية غير صالحة")
+    return v
+
+
+class _PaymentFieldsMixin:
+    @field_validator("amount", "wht_amount", check_fields=False)
+    @classmethod
+    def _finite(cls, v):
+        return _check_finite(v)
+
+    @field_validator("payment_method", check_fields=False)
+    @classmethod
+    def _pm_len(cls, v):
+        if v is not None and len(v) > 30:
+            raise ValueError("طريقة الدفع غير صالحة")
+        return v
+
+    @field_validator("reference", check_fields=False)
+    @classmethod
+    def _ref_len(cls, v):
+        if v is not None and len(v) > 100:
+            raise ValueError("المرجع طويل جداً (الحد 100 حرف)")
+        return v
+
+
+class PaymentIn(_PaymentFieldsMixin, BaseModel):
     amount: float
     payment_date: Optional[date] = None
     payment_method: Optional[str] = None   # cash | transfer | cheque | bill
@@ -124,7 +252,7 @@ class PaymentIn(BaseModel):
     wht_amount: float = 0                  # ضريبة الخصم تحت الحساب المستقطعة من الدفعة
 
 
-class SupplierPaymentIn(BaseModel):
+class SupplierPaymentIn(_PaymentFieldsMixin, BaseModel):
     supplier_id: int
     invoice_id: Optional[int] = None
     amount: float
@@ -213,6 +341,10 @@ async def create_supplier(data: SupplierIn, db: AsyncSession = Depends(get_db)):
     d = data.model_dump()
     d['code'] = d.get('code') or await _next_supplier_code(db, _ctid_sup.get())
     d['tenant_id'] = _ctid_sup.get() or 1
+    # كود مكرر لنفس الـ tenant كان بيوصل للـ DB ويرجع 500 IntegrityError
+    if await db.scalar(select(Supplier.id).where(
+            Supplier.tenant_id == d['tenant_id'], Supplier.code == d['code']).limit(1)):
+        raise HTTPException(400, f"كود المورد {d['code']} مستخدم من قبل")
     s = Supplier(**d)
     db.add(s)
     await db.commit()
@@ -246,6 +378,10 @@ async def update_supplier(sid: int, data: SupplierIn, db: AsyncSession = Depends
     d = data.model_dump()
     if not d.get("code"):
         d["code"] = s.code  # حافظ على الكود الموجود لو لم يُرسَل
+    elif d["code"] != s.code and await db.scalar(select(Supplier.id).where(
+            Supplier.tenant_id == s.tenant_id, Supplier.code == d["code"],
+            Supplier.id != s.id).limit(1)):
+        raise HTTPException(400, f"كود المورد {d['code']} مستخدم من قبل")
     for k, v in d.items():
         setattr(s, k, v)
     await db.commit()
@@ -416,10 +552,17 @@ async def create_purchase_invoice(data: PurchaseInvoiceIn, db: AsyncSession = De
             raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
         if l.unit_cost is not None and l.unit_cost < 0:
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    _validate_invoice_header(data)
 
     from app.core.database import current_tenant_id as _ctid_pi
     _tid_pi = _ctid_pi.get() or 1
     internal_code = await _next_internal_code(db, _tid_pi)
+    if data.code:
+        data.code = data.code.strip()
+        if len(data.code) > 50:
+            raise HTTPException(400, "رقم الفاتورة طويل جداً (الحد 50 حرف)")
+    if data.code and await _invoice_code_taken(db, _tid_pi, data.code):
+        raise HTTPException(400, f"رقم فاتورة الشراء {data.code} مستخدم من قبل")
 
     # محطة 15 (الروادماب الأصلي): تحديد الموقع الفعلي (RAW/IMPORTED) مرة واحدة
     # لكل الفاتورة، بدل ما نعدّل stock_qty يدويًا من غير أي أثر في StockQuant
@@ -436,6 +579,11 @@ async def create_purchase_invoice(data: PurchaseInvoiceIn, db: AsyncSession = De
     # مورد حقيقي. الإصلاح: نتحقق من عدم وجود المورد أصلاً بدل مقارنة tenant_id.
     if not supplier_for_loc:
         raise HTTPException(400, "المورد غير موجود")
+    # أي بند مربوط بمادة (حتى لو update_stock=False) لازم المادة تكون تابعة لنفس
+    # الـ tenant — كان ممكن يتسجل بند بـ material_id "يتيم" تابع لـ tenant تاني.
+    for l in data.lines:
+        if l.material_id and not await db.get(Material, l.material_id):
+            raise HTTPException(400, "المادة غير موجودة")
     wh_code = "IMPORTED" if is_import_supplier(supplier_for_loc) else "RAW"
 
     subtotal = sum(Decimal(str(l.qty)) * Decimal(str(l.unit_cost)) for l in data.lines)
@@ -589,9 +737,23 @@ async def update_purchase_invoice(iid: int, data: PurchaseInvoiceIn, db: AsyncSe
             raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
         if l.unit_cost is not None and l.unit_cost < 0:
             raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    _validate_invoice_header(data)
 
     from app.core.database import current_tenant_id as _ctid_upd
     _tid_upd = _ctid_upd.get() or 1
+    if data.code:
+        data.code = data.code.strip()
+        if len(data.code) > 50:
+            raise HTTPException(400, "رقم الفاتورة طويل جداً (الحد 50 حرف)")
+    if data.code and data.code != inv.code and await _invoice_code_taken(db, _tid_upd, data.code, exclude_id=inv.id):
+        raise HTTPException(400, f"رقم فاتورة الشراء {data.code} مستخدم من قبل")
+    # فاتورة كان ليها مورد — مايتشالش المورد منها في التعديل (نفس شرط الإنشاء:
+    # "المورد مطلوب")؛ من غير كده الفاتورة بتبقى بدين في 2110 من غير أي مورد.
+    if inv.supplier_id and not data.supplier_id:
+        raise HTTPException(400, "المورد مطلوب — يرجى اختيار مورد")
+    for l in data.lines:
+        if l.material_id and not await db.get(Material, l.material_id):
+            raise HTTPException(400, "المادة غير موجودة")
 
     # محطة 15 (الروادماب الأصلي): عكس تأثير البنود القديمة عبر post_issue()
     # فعليًا (بيحدّث StockQuant وMaterial.stock_qty مع بعض) — بدل التعديل
@@ -722,7 +884,9 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
     invoice_amount = Decimal("0")
     excess = amount
     if data.invoice_id:
-        inv = (await db.execute(await _tenant_invoice_query(data.invoice_id))).scalar_one_or_none()
+        # قفل صف الفاتورة (Postgres) — دفعتين متزامنتين كانوا ممكن يقروا نفس
+        # paid_amount ويتخطّوا المتبقي (سداد زائد). SQLite بيتجاهل FOR UPDATE.
+        inv = (await db.execute((await _tenant_invoice_query(data.invoice_id)).with_for_update())).scalar_one_or_none()
         if not inv:
             raise HTTPException(404, "فاتورة الشراء غير موجودة")
         # تحقق إن الفاتورة فعلاً تابعة لنفس المورد المحدد — من غيره كان ممكن
@@ -826,7 +990,8 @@ async def record_supplier_payment(data: SupplierPaymentIn, db: AsyncSession = De
 @router.post("/invoices/{iid}/payment")
 async def record_purchase_payment(iid: int, data: PaymentIn, db: AsyncSession = Depends(get_db),
                                   current_user: dict = Depends(get_current_user)):
-    inv = (await db.execute(await _tenant_invoice_query(iid))).scalar_one_or_none()
+    # قفل صف الفاتورة لمنع سداد زائد من دفعتين متزامنتين (Postgres)
+    inv = (await db.execute((await _tenant_invoice_query(iid)).with_for_update())).scalar_one_or_none()
     if not inv: raise HTTPException(404)
     amount = Decimal(str(data.amount))
     pay_date = data.payment_date or date.today()
@@ -910,6 +1075,17 @@ async def delete_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     # paid_amount > 0)، فالحذف لازم يتبع نفس القاعدة.
     if inv.paid_amount > 0:
         raise HTTPException(400, "لا يمكن حذف فاتورة تم تسجيل دفعات عليها")
+    # منع حذف فاتورة عليها سجلات تابعة (دفعات/تخصيصات/دفعات مخزون/معدات مربوطة)
+    # — كان الحذف بيكسر الـ FK (500 على Postgres) أو يسيب سجلات يتيمة على SQLite.
+    from app.models.models import SupplierPayment as _SP_d, SupplierPaymentAllocation as _SPA_d, StockBatch as _SB_d, Equipment as _EQ_d
+    for _model, _col, _label in (
+        (_SP_d, _SP_d.invoice_id, "دفعات مورد"),
+        (_SPA_d, _SPA_d.invoice_id, "تخصيصات دفعات"),
+        (_SB_d, _SB_d.purchase_invoice_id, "دفعات مخزون (Stock Batches)"),
+        (_EQ_d, _EQ_d.purchase_invoice_id, "معدات"),
+    ):
+        if await db.scalar(select(_model.id).where(_col == iid).limit(1)):
+            raise HTTPException(400, f"لا يمكن حذف الفاتورة — مرتبط بها {_label}")
 
     from app.core.database import current_tenant_id as _ctid_del
     _tid_del = _ctid_del.get() or 1
@@ -987,6 +1163,7 @@ async def upload_attachment(
     dest = UPLOAD_DIR / stored
 
     content = await file.read()
+    _check_attachment_size(content)
     dest.write_bytes(content)
 
     from app.core.database import current_tenant_id as _ctid_att1
@@ -994,10 +1171,10 @@ async def upload_attachment(
         tenant_id=_ctid_att1.get() or 1,
         entity_type="purchase_invoice",
         entity_id=iid,
-        original_name=file.filename,
+        original_name=(file.filename or "")[:300],
         stored_name=stored,
         file_size=len(content),
-        mime_type=file.content_type,
+        mime_type=(file.content_type or "")[:100] or None,
         notes=notes,
     )
     db.add(att)
@@ -1050,11 +1227,18 @@ async def upload_generic_attachment(
     db: AsyncSession = Depends(get_db),
 ):
     """رفع مرفق لأي كيان في النظام (فاتورة بيع، حركة مخزون، الخ) — صور فقط"""
+    # entity_type بيدخل في اسم الملف على القرص — منع path traversal
+    # (entity_type=../../x كان بيكتب الملف برا مجلد المرفقات)
+    if not _ENTITY_TYPE_RE.match(entity_type or ""):
+        raise HTTPException(400, "نوع الكيان غير صالح")
+    if entity_id <= 0:
+        raise HTTPException(400, "معرّف الكيان غير صالح")
     ext = _validate_image_attachment(file)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     stored = f"{entity_type}_{entity_id}_{uuid.uuid4().hex}{ext}"
     dest = UPLOAD_DIR / stored
     content = await file.read()
+    _check_attachment_size(content)
     dest.write_bytes(content)
 
     from app.core.database import current_tenant_id as _ctid_att2
@@ -1062,10 +1246,10 @@ async def upload_generic_attachment(
         tenant_id=_ctid_att2.get() or 1,
         entity_type=entity_type,
         entity_id=entity_id,
-        original_name=file.filename,
+        original_name=(file.filename or "")[:300],
         stored_name=stored,
         file_size=len(content),
-        mime_type=file.content_type,
+        mime_type=(file.content_type or "")[:100] or None,
         notes=notes,
     )
     db.add(att)
@@ -1113,12 +1297,13 @@ async def print_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     lines_html = ""
     for i, l in enumerate(inv.lines):
         bg = "#f9f9f7" if i % 2 == 0 else "#fff"
-        mat_info = f"{l.material.code} — {l.material.name_ar}" if l.material else l.description
+        # كل النصوص اللي بيدخلها المستخدم لازم تتعمل escape (منع XSS مخزّن في صفحة الطباعة)
+        mat_info = _html_mod.escape(f"{l.material.code} — {l.material.name_ar}" if l.material else str(l.description or ""))
         lines_html += f"""
         <tr style="background:{bg}">
           <td style="padding:9px 12px;text-align:center;color:#6b6a64;font-size:12px">{i+1}</td>
           <td style="padding:9px 12px">{mat_info}</td>
-          <td style="padding:9px 12px;text-align:center">{float(l.qty):.3f} {l.unit}</td>
+          <td style="padding:9px 12px;text-align:center">{float(l.qty):.3f} {_html_mod.escape(str(l.unit or ""))}</td>
           <td style="padding:9px 12px;text-align:left">{float(l.unit_cost):,.2f}</td>
           <td style="padding:9px 12px;text-align:left;font-weight:600">{float(l.total_cost):,.2f}</td>
         </tr>"""
@@ -1147,7 +1332,7 @@ async def print_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     company_creg    = _e((prof.commercial_reg if prof else None) or "")
     company_footer  = _e((prof.report_footer if prof else None) or "شكراً لتعاملكم معنا")
     logo_html = (
-        f'<img src="{prof.logo_data}" alt="logo" '
+        f'<img src="{_html_mod.escape(str(prof.logo_data), quote=True)}" alt="logo" '
         f'style="max-height:70px;max-width:180px;object-fit:contain;margin-bottom:10px"/>'
         if prof and prof.logo_data else ""
     )
@@ -1159,7 +1344,7 @@ async def print_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
 
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
-<head><meta charset="UTF-8"/><title>فاتورة شراء — {inv.code}</title>
+<head><meta charset="UTF-8"/><title>فاتورة شراء — {_html_mod.escape(str(inv.code or ""))}</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{font-family:'Segoe UI',Tahoma,Arial,sans-serif;font-size:13px;color:#1a1a18;background:#fff;direction:rtl}}
@@ -1183,7 +1368,7 @@ async def print_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     </div>
     <div style="text-align:left">
       <div style="font-size:20px;font-weight:700">فاتورة شراء</div>
-      <div style="color:#6b6a64">رقم: {inv.code}</div>
+      <div style="color:#6b6a64">رقم: {_html_mod.escape(str(inv.code or ""))}</div>
       <div style="color:#6b6a64">التاريخ: {inv.date}</div>
     </div>
   </div>
@@ -1211,7 +1396,7 @@ async def print_purchase_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     </tr></thead>
     <tbody>{lines_html}</tbody>
   </table>
-  {f'<div style="background:#f9f9f7;border-radius:8px;padding:14px;font-size:12px;color:#6b6a64"><b>ملاحظات:</b> {inv.notes}</div>' if inv.notes else ''}
+  {f'<div style="background:#f9f9f7;border-radius:8px;padding:14px;font-size:12px;color:#6b6a64"><b>ملاحظات:</b> {_html_mod.escape(str(inv.notes))}</div>' if inv.notes else ''}
   <div class="footer">{company_footer} — {company_name}</div>
 </div>
 <button class="btn no-print" style="left:24px" onclick="window.print()">🖨️ طباعة / تنزيل PDF</button>

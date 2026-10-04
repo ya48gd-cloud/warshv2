@@ -5,7 +5,7 @@ import sqlalchemy as sa
 from sqlalchemy import select, func, or_, String, Integer, Boolean, Text, DateTime
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional, List
 from decimal import Decimal
 from datetime import datetime
@@ -60,7 +60,9 @@ def _verify_sa(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Super Admin فقط")
     token = authorization.split(" ", 1)[1]
-    if token not in _sa_tokens:
+    # SECURITY: كان بيتأكد من وجود التوكن بس ويتجاهل وقت انتهائه
+    from app.api.super_admin import is_super_token_valid
+    if token not in _sa_tokens or not is_super_token_valid(token):
         raise HTTPException(401, "جلسة منتهية — سجل دخول مرة أخرى")
     return token
 
@@ -82,6 +84,21 @@ class CatalogItemIn(BaseModel):
     bar_length_cm: Optional[Decimal] = None
     bar_weight_kg: Optional[Decimal] = None
     weight_per_meter_kg: Optional[Decimal] = None
+
+    @validator("code", "name_ar", "unit")
+    def _required(cls, v):
+        if v is None or not v.strip():
+            raise ValueError("الكود والاسم والوحدة حقول مطلوبة")
+        return v.strip()
+
+    @validator("thickness_mm", "density_kg_m2", "plate_length_cm", "plate_width_cm",
+               "plate_weight_kg", "bar_length_cm", "bar_weight_kg", "weight_per_meter_kg")
+    def _not_negative(cls, v):
+        # المواصفات دي بتتنسخ كما هي لمخزون الورشة عند الاستيراد — قيمة
+        # سالبة كانت بتطلع كثافة/وزن متر سالب يقلب كميات الصرف هناك.
+        if v is not None and v < 0:
+            raise ValueError("المواصفات الهندسية لا يمكن أن تكون سالبة")
+        return v
 
 class ImportIn(BaseModel):
     unit_cost: Optional[Decimal] = Decimal("0")
@@ -108,8 +125,8 @@ async def get_categories(db: AsyncSession = Depends(get_db), _creds=Depends(_bea
 async def search_catalog(
     q: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
-    limit: int = Query(50, le=200),
-    offset: int = Query(0),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(GlobalCatalogItem).where(GlobalCatalogItem.is_active == True)
@@ -149,7 +166,10 @@ async def add_item(data: CatalogItemIn, db: AsyncSession = Depends(get_db), _=De
 @router.post("/bulk", status_code=201)
 async def bulk_import(data: BulkIn, db: AsyncSession = Depends(get_db), _=Depends(_verify_sa)):
     added = skipped = 0
+    seen: set = set()  # نفس الكود مكرر جوه نفس الطلب كان بيكسر الـ unique بـ 500
     for d in data.items:
+        if d.code in seen: skipped += 1; continue
+        seen.add(d.code)
         ex = await db.execute(select(GlobalCatalogItem).where(GlobalCatalogItem.code == d.code))
         if ex.scalar_one_or_none(): skipped += 1; continue
         db.add(GlobalCatalogItem(**d.model_dump())); added += 1
@@ -162,6 +182,10 @@ async def update_item(item_id: int, data: CatalogItemIn, db: AsyncSession = Depe
     result = await db.execute(select(GlobalCatalogItem).where(GlobalCatalogItem.id == item_id))
     item = result.scalar_one_or_none()
     if not item: raise HTTPException(404, "غير موجود")
+    if data.code != item.code:
+        dup = await db.scalar(select(GlobalCatalogItem.id).where(
+            GlobalCatalogItem.code == data.code, GlobalCatalogItem.id != item_id))
+        if dup: raise HTTPException(409, "الكود موجود بالفعل")
     for k, v in data.model_dump().items(): setattr(item, k, v)
     await db.commit()
     return {"message": "تم التحديث"}

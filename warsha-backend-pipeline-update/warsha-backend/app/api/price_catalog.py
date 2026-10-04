@@ -45,6 +45,79 @@ class CatalogItemIn(BaseModel):
             raise ValueError("سعر البيع لا يمكن أن يكون سالباً")
         return v
 
+    @validator("name")
+    def _name_required(cls, v):
+        if v is None or not v.strip():
+            raise ValueError("اسم الصنف مطلوب")
+        if len(v.strip()) > 300:
+            raise ValueError("اسم الصنف طويل جداً (الحد الأقصى 300 حرف)")
+        return v.strip()
+
+    @validator("code")
+    def _code_len(cls, v):
+        if v is not None and len(v) > 50:
+            raise ValueError("الكود طويل جداً (الحد الأقصى 50 حرف)")
+        return v
+
+    @validator("category")
+    def _category_len(cls, v):
+        if v is not None and len(v) > 100:
+            raise ValueError("التصنيف طويل جداً (الحد الأقصى 100 حرف)")
+        return v
+
+    @validator("unit")
+    def _unit_len(cls, v):
+        if v is None or not v.strip():
+            return "قطعة"
+        if len(v) > 20:
+            raise ValueError("الوحدة طويلة جداً (الحد الأقصى 20 حرف)")
+        return v
+
+    @validator("margin_pct")
+    def _margin_range(cls, v):
+        return _check_margin(v)
+
+    @validator("price_mode")
+    def _valid_price_mode(cls, v):
+        return _check_price_mode(v)
+
+    @validator("source_type", pre=True)
+    def _valid_source_type(cls, v):
+        if v in (None, ""):
+            return None
+        if v not in ("material", "equipment"):
+            raise ValueError("نوع المصدر يجب أن يكون 'material' أو 'equipment'")
+        return v
+
+
+def _check_margin(v):
+    # العمود Numeric(5,2) — أي قيمة ≥ 1000 كانت بتفشل على Postgres بـ 500؛
+    # وهامش أقل من -100% معناه سعر بيع سالب.
+    if v is None:
+        return Decimal("0")
+    if v < -100 or v >= 1000:
+        raise ValueError("نسبة الهامش يجب أن تكون بين -100% و 999.99%")
+    return v
+
+
+def _check_price_mode(v):
+    if v in (None, ""):
+        return "auto"
+    if v not in ("auto", "manual"):
+        raise ValueError("price_mode يجب أن يكون 'auto' أو 'manual'")
+    return v
+
+
+async def _verify_source(db: AsyncSession, source_type: Optional[str], source_id: Optional[int], tid: int):
+    """مصدر الربط (مادة/معدة) لازم يكون موجود وتابع لنفس الـ tenant — وإلا
+    الكتالوج كان بيسحب تكلفة حية من مادة/معدة ورشة تانية في list/refresh."""
+    if not source_type or source_id is None:
+        return
+    model = Material if source_type == "material" else Equipment
+    obj = await db.get(model, source_id)
+    if not obj or obj.tenant_id != tid:
+        raise HTTPException(400, "المادة/المعدة المرتبطة غير موجودة")
+
 
 class CatalogItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True, protected_namespaces=())
@@ -275,6 +348,7 @@ async def create_item(
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin","accountant"))
 ):
+    await _verify_source(db, body.source_type, body.source_id, _get_tenant(user))
     item = PriceCatalogItem(
         tenant_id     = _get_tenant(user),
         code          = body.code,
@@ -306,6 +380,8 @@ async def update_item(
     item = await db.get(PriceCatalogItem, item_id)
     if not item or item.tenant_id != _get_tenant(user):
         raise HTTPException(404, "not found")
+    if (body.source_type, body.source_id) != (item.source_type, item.source_id):
+        await _verify_source(db, body.source_type, body.source_id, _get_tenant(user))
     for k, v in body.model_dump().items():
         if k == "selling_price":
             continue  # نتعامل معاه تحت
@@ -330,6 +406,11 @@ async def update_price(
         raise HTTPException(404, "not found")
     if cost_price is not None and cost_price < 0:
         raise HTTPException(400, "سعر التكلفة لا يمكن أن يكون سالباً")
+    if margin_pct is not None:
+        try:
+            _check_margin(margin_pct)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     if cost_price is not None:
         item.cost_price = cost_price
     if margin_pct is not None:
@@ -428,6 +509,47 @@ class UpsertFromSource(BaseModel):
     selling_price: Optional[Decimal] = None
     price_mode: str = "auto"
 
+    @validator("kind")
+    def _valid_kind(cls, v):
+        # قبل كده أي قيمة غير "material" كانت بتتعامل كـ "equipment" بصمت
+        if v not in ("material", "equipment"):
+            raise ValueError("kind يجب أن يكون 'material' أو 'equipment'")
+        return v
+
+    @validator("cost_price")
+    def _cost_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("سعر التكلفة لا يمكن أن يكون سالباً")
+        return v
+
+    @validator("selling_price")
+    def _sell_not_negative(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("سعر البيع لا يمكن أن يكون سالباً")
+        return v
+
+    @validator("margin_pct")
+    def _margin_range(cls, v):
+        return _check_margin(v)
+
+    @validator("price_mode")
+    def _valid_price_mode(cls, v):
+        return _check_price_mode(v)
+
+    @validator("name")
+    def _name_required(cls, v):
+        if v is None or not v.strip():
+            raise ValueError("الاسم مطلوب")
+        return v.strip()[:300]
+
+    @validator("unit")
+    def _unit_len(cls, v):
+        if v is None or not v.strip():
+            return "قطعة"
+        if len(v) > 20:
+            raise ValueError("الوحدة طويلة جداً (الحد الأقصى 20 حرف)")
+        return v
+
 
 @router.post("/upsert-from-source")
 async def upsert_from_source(body: UpsertFromSource, db: AsyncSession = Depends(get_db),
@@ -435,6 +557,8 @@ async def upsert_from_source(body: UpsertFromSource, db: AsyncSession = Depends(
     """يحفظ سعر بيع لمادة/معدة كصنف كتالوج مربوط بالمصدر (يعمل/يحدّث)."""
     tid = _get_tenant(user)
     src_type = "material" if body.kind == "material" else "equipment"
+    # ref_id خام من العميل — لازم يكون مادة/معدة تابعة لنفس الورشة
+    await _verify_source(db, src_type, body.ref_id, tid)
     # ندوّر على صنف كتالوج موجود مربوط بنفس المصدر
     existing = (await db.execute(
         select(PriceCatalogItem).where(
@@ -446,6 +570,8 @@ async def upsert_from_source(body: UpsertFromSource, db: AsyncSession = Depends(
 
     sell = (Decimal(str(body.selling_price)) if (body.price_mode == "manual" and body.selling_price is not None)
             else _calc_selling(body.cost_price, body.margin_pct))
+    if sell < 0:
+        raise HTTPException(400, "سعر البيع الناتج لا يمكن أن يكون سالباً — راجع نسبة الهامش")
 
     if existing:
         existing.cost_price = body.cost_price

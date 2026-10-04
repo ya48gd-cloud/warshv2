@@ -256,3 +256,201 @@ async def test_transaction_edit_and_delete_keep_gl_in_sync(cli):
     assert not expense_rows3 or expense_rows3[0]["balance"] == 0.0, (
         "بعد حذف الحركة، صافي حساب المصروف لازم يرجع صفر (مايفضلش قيد يتيم)"
     )
+
+
+# ════════════════ VALIDATION HARDENING ═══════════════════════════════
+async def _balance(cli, tid):
+    return {a["id"]: a for a in (await cli.get(f"{BASE}/accounts")).json()}[tid]["balance"]
+
+
+@pytest.mark.asyncio
+async def test_transaction_rejects_mismatched_category_flow(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة فئة", opening=500.0))).json()["id"]
+    cid = (await cli.post(f"{BASE}/categories", json={"name": "إيراد فقط", "flow": "in"})).json()["id"]
+    r = await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "out", "amount": 10, "category_id": cid,
+    })
+    assert r.status_code == 400
+    assert await _balance(cli, tid) == 500.0
+
+
+@pytest.mark.asyncio
+async def test_transaction_rejects_unknown_treasury_and_category(cli):
+    r = await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": 999999, "direction": "in", "amount": 10,
+    })
+    assert r.status_code == 404
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة فئة مجهولة"))).json()["id"]
+    r2 = await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "in", "amount": 10, "category_id": 999999,
+    })
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_transaction_amount_rounded_to_cents(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة تقريب"))).json()["id"]
+    r = await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "in", "amount": "10.005",
+    })
+    assert r.status_code == 201
+    assert r.json()["amount"] == 10.01
+    assert await _balance(cli, tid) == 10.01
+
+
+@pytest.mark.asyncio
+async def test_inactive_treasury_rejects_new_transactions(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة معطلة", opening=100.0))).json()["id"]
+    u = await cli.put(f"{BASE}/accounts/{tid}", json={"name": "خزنة معطلة", "is_active": False})
+    assert u.status_code == 200 and u.json()["is_active"] is False
+    r = await cli.post(f"{BASE}/transactions", json={"treasury_id": tid, "direction": "in", "amount": 5})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_treasury_keeps_kind_when_omitted(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("بنك ثابت", kind="bank"))).json()["id"]
+    u = await cli.put(f"{BASE}/accounts/{tid}", json={"name": "بنك ثابت 2"})
+    assert u.status_code == 200
+    assert u.json()["kind"] == "bank"
+
+
+@pytest.mark.asyncio
+async def test_delete_category_in_use_blocked(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة فئة مستخدمة"))).json()["id"]
+    cid = (await cli.post(f"{BASE}/categories", json={"name": "فئة مستخدمة", "flow": "both"})).json()["id"]
+    await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "in", "amount": 5, "category_id": cid,
+    })
+    r = await cli.delete(f"{BASE}/categories/{cid}")
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_delete_transfer_leg_removes_both_legs(cli):
+    a = (await cli.post(f"{BASE}/accounts", json=_account("مصدر حذف", opening=1000.0))).json()["id"]
+    b = (await cli.post(f"{BASE}/accounts", json=_account("وجهة حذف", opening=0.0))).json()["id"]
+    r = await cli.post(f"{BASE}/transfer", json={"from_treasury_id": a, "to_treasury_id": b, "amount": 300})
+    assert r.status_code == 201
+    grp_txns = [t for t in (await cli.get(f"{BASE}/transactions")).json()
+                if t["source"] == "transfer" and t["treasury_id"] in (a, b)]
+    assert len(grp_txns) == 2
+    d = await cli.delete(f"{BASE}/transactions/{grp_txns[0]['id']}")
+    assert d.status_code == 204
+    left = [t for t in (await cli.get(f"{BASE}/transactions")).json()
+            if t["source"] == "transfer" and t["treasury_id"] in (a, b)]
+    assert left == []
+    assert await _balance(cli, a) == 1000.0
+    assert await _balance(cli, b) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_unknown_treasury_rejected(cli):
+    a = (await cli.post(f"{BASE}/accounts", json=_account("مصدر مجهول", opening=100.0))).json()["id"]
+    r = await cli.post(f"{BASE}/transfer", json={"from_treasury_id": a, "to_treasury_id": 999999, "amount": 10})
+    assert r.status_code == 404
+    assert await _balance(cli, a) == 100.0
+
+
+@pytest.mark.asyncio
+async def test_edit_cancelled_cheque_does_not_inflate_balance(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة شيك", opening=0.0))).json()["id"]
+    r = await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "in", "amount": 200, "payment_method": "cheque",
+        "cheque_number": "CH-1", "cheque_date": str(date.today()),
+    })
+    assert r.status_code == 201
+    xid = r.json()["id"]
+    c = await cli.patch(f"{BASE}/cheques/{xid}/status", json={"cheque_status": "cancelled"})
+    assert c.status_code == 200
+    assert await _balance(cli, tid) == 0.0
+    u = await cli.put(f"{BASE}/transactions/{xid}", json={
+        "treasury_id": tid, "direction": "in", "amount": 300,
+    })
+    assert u.status_code == 200
+    assert await _balance(cli, tid) == 0.0
+    s = (await cli.get(f"{BASE}/summary")).json()
+    assert all(t["balance"] >= 0 for t in s["treasuries"])
+
+
+# ════════════════ HARDENING ROUND 3 ══════════════════════════════════
+@pytest.mark.asyncio
+async def test_delete_in_txn_blocked_when_balance_would_go_negative(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة سالب"))).json()["id"]
+    rin = await cli.post(f"{BASE}/transactions", json={"treasury_id": tid, "direction": "in", "amount": 100})
+    assert rin.status_code == 201
+    rout = await cli.post(f"{BASE}/transactions", json={"treasury_id": tid, "direction": "out", "amount": 80})
+    assert rout.status_code == 201
+    d = await cli.delete(f"{BASE}/transactions/{rin.json()['id']}")
+    assert d.status_code == 409
+    assert await _balance(cli, tid) == 20.0
+    # حذف الصرف ثم القبض مسموح
+    assert (await cli.delete(f"{BASE}/transactions/{rout.json()['id']}")).status_code == 204
+    assert (await cli.delete(f"{BASE}/transactions/{rin.json()['id']}")).status_code == 204
+    assert await _balance(cli, tid) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_delete_transfer_blocked_when_destination_spent(cli):
+    a = (await cli.post(f"{BASE}/accounts", json=_account("مصدر سالب", opening=500.0))).json()["id"]
+    b = (await cli.post(f"{BASE}/accounts", json=_account("وجهة سالب"))).json()["id"]
+    assert (await cli.post(f"{BASE}/transfer", json={
+        "from_treasury_id": a, "to_treasury_id": b, "amount": 300})).status_code == 201
+    assert (await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": b, "direction": "out", "amount": 250})).status_code == 201
+    leg = [t for t in (await cli.get(f"{BASE}/transactions")).json()
+           if t["source"] == "transfer" and t["treasury_id"] == b][0]
+    d = await cli.delete(f"{BASE}/transactions/{leg['id']}")
+    assert d.status_code == 409
+    assert await _balance(cli, a) == 200.0
+    assert await _balance(cli, b) == 50.0
+
+
+@pytest.mark.asyncio
+async def test_edit_in_txn_blocked_when_balance_would_go_negative(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة تعديل سالب"))).json()["id"]
+    rin = await cli.post(f"{BASE}/transactions", json={"treasury_id": tid, "direction": "in", "amount": 100})
+    await cli.post(f"{BASE}/transactions", json={"treasury_id": tid, "direction": "out", "amount": 90})
+    u = await cli.put(f"{BASE}/transactions/{rin.json()['id']}", json={
+        "treasury_id": tid, "direction": "in", "amount": 50})
+    assert u.status_code == 409
+    assert await _balance(cli, tid) == 10.0
+
+
+@pytest.mark.asyncio
+async def test_category_flow_change_blocked_with_opposite_txns(cli):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة فئة مرنة"))).json()["id"]
+    cid = (await cli.post(f"{BASE}/categories", json={"name": "فئة مرنة", "flow": "both"})).json()["id"]
+    await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "in", "amount": 5, "category_id": cid})
+    r = await cli.put(f"{BASE}/categories/{cid}", json={"name": "فئة مرنة", "flow": "out"})
+    assert r.status_code == 409
+    r2 = await cli.put(f"{BASE}/categories/{cid}", json={"name": "فئة مرنة", "flow": "in"})
+    assert r2.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_treasury_tenant_isolation(cli, cli2):
+    tid = (await cli.post(f"{BASE}/accounts", json=_account("خزنة t1", opening=100.0))).json()["id"]
+    x = (await cli.post(f"{BASE}/transactions", json={
+        "treasury_id": tid, "direction": "in", "amount": 10})).json()["id"]
+    assert all(a["id"] != tid for a in (await cli2.get(f"{BASE}/accounts")).json())
+    assert all(t["id"] != x for t in (await cli2.get(f"{BASE}/transactions")).json())
+    assert (await cli2.put(f"{BASE}/transactions/{x}", json={
+        "treasury_id": tid, "direction": "in", "amount": 1})).status_code == 404
+    assert (await cli2.delete(f"{BASE}/transactions/{x}")).status_code == 404
+    assert (await cli2.get(f"{BASE}/transactions/{x}/print")).status_code == 404
+    assert await _balance(cli, tid) == 110.0
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_write_treasury(cli):
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.api.auth import create_token
+    tok = create_token(user_id=987654, username="viewer_tr", role="viewer", tenant_id=1)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {tok}"}) as v:
+        assert (await v.get(f"{BASE}/accounts")).status_code == 200
+        r = await v.post(f"{BASE}/accounts", json=_account("خزنة مشاهد"))
+        assert r.status_code == 403

@@ -31,9 +31,38 @@ from app.schemas.schemas import (
     WorkOrderToInvoiceRequest, OrderAdvancePaymentRequest,
 )
 
-router = APIRouter(prefix="/sales", tags=["sales"], dependencies=[Depends(require_any)])
+from fastapi import Request as _Request
+
+_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+async def _block_viewer_writes(request: _Request, user: dict = Depends(require_any)) -> dict:
+    """إصلاح ثغرة صلاحيات: كل مسارات المبيعات كانت محمية بـ require_any بس —
+    يعني مستخدم "مشاهد" (viewer) يقدر ينشئ/يعدّل/يحذف فواتير ويسجّل دفعات
+    بطلب API مباشر رغم إن الواجهة مخبية الأزرار (ROLE_WRITE['viewer'] = [])."""
+    if request.method.upper() not in _READ_METHODS and user.get("role") == "viewer":
+        raise HTTPException(403, "صلاحية 'viewer' (مشاهد) لا تسمح بالتعديل")
+    return user
+
+
+router = APIRouter(prefix="/sales", tags=["sales"],
+                   dependencies=[Depends(require_any), Depends(_block_viewer_writes)])
 # Print endpoints — no auth required (opened directly in browser)
 print_router = APIRouter(prefix="/sales", tags=["sales_print"], dependencies=[Depends(require_any)])
+
+
+def _validate_doc_lines(lines, tax_pct=None, discount_pct=None) -> None:
+    """تحقق مشترك لبنود المستند (عرض سعر/فاتورة): كمية موجبة، سعر غير سالب،
+    ونسب ضريبة/خصم بين 0 و100 — كانت القيم السالبة بتعدّي وتنتج إجمالي سالب
+    يتسجّل في رصيد العميل ودفتر الأستاذ."""
+    for l in lines or []:
+        if l.qty is None or Decimal(str(l.qty)) <= 0:
+            raise HTTPException(400, "كمية كل بند يجب أن تكون أكبر من صفر")
+        if l.unit_price is None or Decimal(str(l.unit_price)) < 0:
+            raise HTTPException(400, "سعر الوحدة لا يمكن أن يكون سالباً")
+    for name, v in (("الضريبة", tax_pct), ("الخصم", discount_pct)):
+        if v is not None and (Decimal(str(v)) < 0 or Decimal(str(v)) > 100):
+            raise HTTPException(400, f"نسبة {name} يجب أن تكون بين 0 و100")
 
 
 def _logo_to_b64(prof) -> str | None:
@@ -309,6 +338,11 @@ async def list_quotations(db: AsyncSession = Depends(get_db)):
 async def create_quotation(data: QuotationIn, db: AsyncSession = Depends(get_db)):
     if not data.lines:
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
+    _validate_doc_lines(data.lines, data.tax_pct, data.discount_pct)
+    if not (data.code or "").strip():
+        raise HTTPException(400, "رقم عرض السعر مطلوب")
+    if await db.scalar(select(Quotation.id).where(Quotation.code == data.code)):
+        raise HTTPException(400, f"رقم عرض السعر '{data.code}' مستخدم بالفعل")
     if data.date and data.valid_until and data.valid_until < data.date:
         raise HTTPException(400, "تاريخ صلاحية العرض يجب أن يكون بعد تاريخ الإصدار")
     # إصلاح ثغرة تحقق: كان ممكن تتبعت quotation لعميل رقمه مش موجود أصلاً
@@ -367,10 +401,19 @@ async def update_quotation(qid: int, data: QuotationIn, db: AsyncSession = Depen
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
     if data.date and data.valid_until and data.valid_until < data.date:
         raise HTTPException(400, "تاريخ صلاحية العرض يجب أن يكون بعد تاريخ الإصدار")
+    _validate_doc_lines(data.lines, data.tax_pct, data.discount_pct)
+    # نفس فحص create_quotation: عميل غير موجود/تابع لـ tenant تاني كان بيتقبل بصمت هنا
+    if not await db.get(Customer, data.customer_id):
+        raise HTTPException(404, "العميل غير موجود")
+    new_code = (data.code or "").strip() or q.code
+    if new_code != q.code and await db.scalar(
+        select(Quotation.id).where(Quotation.code == new_code, Quotation.id != qid)
+    ):
+        raise HTTPException(400, f"رقم عرض السعر '{new_code}' مستخدم بالفعل")
 
     subtotal, disc_amt, tax_amt, total = calc_totals(data.lines, data.tax_pct, data.discount_pct)
 
-    q.code          = data.code
+    q.code          = new_code
     q.customer_id   = data.customer_id
     q.location_id   = data.location_id
     q.date          = data.date
@@ -423,6 +466,12 @@ async def update_quotation_status(qid: int, status: str, db: AsyncSession = Depe
 async def delete_quotation(qid: int, db: AsyncSession = Depends(get_db)):
     q = await db.get(Quotation, qid)
     if not q: raise HTTPException(404)
+    # إصلاح ثغرة تكامل: حذف عرض سعر اتحوّل لفاتورة/طلب كان بيسيب مرجع يتيم
+    # (quotation_id) في الفاتورة/الطلب — ويكسر الـ FK على Postgres.
+    if await db.scalar(select(Invoice.id).where(Invoice.quotation_id == qid).limit(1)):
+        raise HTTPException(400, "لا يمكن حذف عرض سعر تم تحويله لفاتورة")
+    if await db.scalar(select(CustomerOrder.id).where(CustomerOrder.quotation_id == qid).limit(1)):
+        raise HTTPException(400, "لا يمكن حذف عرض سعر تم تحويله لطلب عميل")
     lines = (await db.execute(select(QuotationLine).where(QuotationLine.quotation_id==qid))).scalars().all()
     for l in lines: await db.delete(l)
     await db.execute(sa_delete(PaymentScheduleTemplate).where(
@@ -468,6 +517,18 @@ async def quotation_to_invoice(qid: int, invoice_code: str, db: AsyncSession = D
     )
     q = r.scalar_one_or_none()
     if not q: raise HTTPException(404)
+    if q.status == "rejected":
+        raise HTTPException(400, "لا يمكن تحويل عرض مرفوض")
+    invoice_code = (invoice_code or "").strip() or await _next_invoice_code(db)
+    # إصلاح ثغرة تكامل: نفس عرض السعر كان ممكن يتحوّل لفاتورة أكتر من مرة
+    # (أو يتحوّل لفاتورة بعد ما اتحوّل لطلب عميل هيتفوتر هو كمان) — فوترة
+    # مزدوجة لنفس البيع في رصيد العميل ودفتر الأستاذ.
+    prev_inv = await db.scalar(select(Invoice.code).where(Invoice.quotation_id == qid).limit(1))
+    if prev_inv:
+        raise HTTPException(400, f"تم تحويل هذا العرض لفاتورة مسبقاً — رقم الفاتورة: {prev_inv}")
+    prev_order = await db.scalar(select(CustomerOrder.code).where(CustomerOrder.quotation_id == qid).limit(1))
+    if prev_order:
+        raise HTTPException(400, f"تم تحويل هذا العرض لطلب عميل مسبقاً — رقم الطلب: {prev_order}")
     # تحقق من عدم تكرار الكود
     existing = await db.scalar(select(Invoice.id).where(Invoice.code == invoice_code))
     if existing:
@@ -531,6 +592,47 @@ async def get_next_invoice_code_ep(db: AsyncSession = Depends(get_db)):
     return {"code": await _next_invoice_code(db)}
 
 
+async def _issue_fg_for_wo_invoice(db: AsyncSession, tid: int, wo: WorkOrder, inv: Invoice, qty: Decimal) -> None:
+    """خصم المعدة من مخزون تام الصنع (FG-{wo.code}) + قيد COGS لفاتورة أمر إنتاج.
+
+    مشترك بين /work-orders/{id}/to-invoice وبين /invoices لما يتبعت
+    work_order_id (زرار "إنشاء فاتورة" في شاشة أمر الإنتاج بيستخدم التاني) —
+    قبل كده المسار التاني كان بيسجل الإيراد بس: المعدة تفضل في FG للأبد
+    ومفيش تكلفة بضاعة مباعة، فالربح بيطلع أعلى من الحقيقة بقيمة المعدة كلها.
+    """
+    from app.models.models import Material as _FGMat
+    from app.services.inventory_ledger import get_or_create_warehouse_bin as _get_fg_bin, post_issue as _post_fg_issue
+    fg_mat = (await db.execute(
+        select(_FGMat).where(_FGMat.tenant_id == tid, _FGMat.code == f"FG-{wo.code}")
+    )).scalar_one_or_none()
+    if not fg_mat:
+        raise HTTPException(
+            400,
+            f"لا يمكن إصدار فاتورة لأمر الإنتاج {wo.code} — المعدة لسه مش في مخزون تام الصنع. "
+            f"أنهِ أمر الإنتاج (الحالة: منتهي) الأول.",
+        )
+    # لو المعدة اتسلّمت بالفعل بأمر تسليم (وخرجت من FG هناك) منخصمهاش تاني
+    from app.services.inventory_ledger import fg_qty_to_release
+    qty = await fg_qty_to_release(db, wo, fg_mat, extra_invoiced=qty)
+    if qty <= 0:
+        return
+    if (fg_mat.stock_qty or Decimal("0")) < qty:
+        raise HTTPException(
+            400,
+            f"لا يمكن إصدار فاتورة لأمر الإنتاج {wo.code} — رصيد مخزون تام الصنع غير كافٍ "
+            f"(المتاح {fg_mat.stock_qty}، المطلوب {qty}). أنهِ أمر الإنتاج الأول.",
+        )
+    fg_unit_cost = fg_mat.unit_cost or Decimal("0")
+    fg_bin = await _get_fg_bin(db, tid, "FG")
+    await _post_fg_issue(
+        db, material=fg_mat, qty=qty, unit_cost=fg_unit_cost,
+        source_doc_type="sales_invoice", source_doc_id=inv.id,
+        source_location_id=fg_bin.id,
+        reference=inv.code, notes=f"فاتورة مبيعات من أمر الإنتاج — {inv.code}",
+    )
+    await journal_cogs(db, tid, inv.id, inv.code, qty * fg_unit_cost, date.today())
+
+
 @router.post("/invoices", status_code=201)
 async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db)):
     if not data.lines:
@@ -540,13 +642,28 @@ async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db)):
     # (وحد الائتمان) لا يتحدث لأنه ببساطة مش موجود، من غير ما ينتبه المستخدم.
     if not await db.get(Customer, data.customer_id):
         raise HTTPException(404, "العميل غير موجود")
+    _validate_doc_lines(data.lines, data.tax_pct, data.discount_pct)
     from app.core.database import current_tenant_id as _ctid
     _tid = _ctid.get() or 1
     code = (data.code or '').strip() or await _next_invoice_code(db)
+    if data.quotation_id is not None and not await db.get(Quotation, data.quotation_id):
+        raise HTTPException(404, "عرض السعر المرجعي غير موجود")
+    if data.work_order_id is not None:
+        # إصلاح ثغرة تكامل: ربط الفاتورة بأمر إنتاج غير موجود/تابع لـ tenant
+        # تاني، أو فوترة نفس أمر الإنتاج مرتين (نفس فحص work_order_to_invoice)
+        if not await db.get(WorkOrder, data.work_order_id):
+            raise HTTPException(404, "أمر الإنتاج المرتبط غير موجود")
+        dup_wo_inv = await db.scalar(select(Invoice.id).where(Invoice.work_order_id == data.work_order_id))
+        if dup_wo_inv:
+            raise HTTPException(400, f"تم إصدار فاتورة لأمر الإنتاج ده مسبقًا — رقم الفاتورة: {dup_wo_inv}")
     subtotal, disc_amt, tax_amt, total = calc_totals(data.lines, data.tax_pct, data.discount_pct)
 
     # ── تحقق حد الائتمان (credit_limit) ──
     await _check_credit_limit(db, data.customer_id, total)
+    # إصلاح ثغرة تحقق: رقم فاتورة مكرر كان بيوصل لقيد UNIQUE في الداتابيز
+    # فيرجع 500 بدل رسالة واضحة
+    if await db.scalar(select(Invoice.id).where(Invoice.code == code)):
+        raise HTTPException(400, f"رقم الفاتورة '{code}' مستخدم بالفعل")
     inv = Invoice(
         tenant_id=_tid,
         code=code, customer_id=data.customer_id, quotation_id=data.quotation_id,
@@ -572,6 +689,10 @@ async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db)):
     if cust:
         cust.balance = cust.balance + total
     await journal_sales_invoice_create(db, _tid, inv.id, inv.code, tax_amt, total, data.date)
+    if data.work_order_id is not None:
+        _wo_inv = await db.get(WorkOrder, data.work_order_id)
+        await _issue_fg_for_wo_invoice(
+            db, _tid, _wo_inv, inv, _wo_inv.quantity if _wo_inv.quantity else Decimal("1"))
     await db.commit()
     await db.refresh(inv)
     await log_event(Events.INVOICE_CREATED, tenant_id=_tid, entity_type="invoice",
@@ -596,6 +717,14 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
     if not inv: raise HTTPException(404)
     if not data.lines:
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
+    _validate_doc_lines(data.lines, data.tax_pct, data.discount_pct)
+    # إصلاح: code اختياري في InvoiceIn — التعديل من غير code كان بيكتب NULL
+    # على رقم الفاتورة. نحافظ على الرقم الحالي، ونمنع التكرار لو اتغيّر.
+    new_code = (data.code or "").strip() or inv.code
+    if new_code != inv.code and await db.scalar(
+        select(Invoice.id).where(Invoice.code == new_code, Invoice.id != iid)
+    ):
+        raise HTTPException(400, f"رقم الفاتورة '{new_code}' مستخدم بالفعل")
     # إصلاح ثغرة تحقق: نقل الفاتورة لعميل رقمه غير موجود (أو تابع لـ tenant
     # تاني) كان ينجح بصمت — الفاتورة تتحول لمرجع عميل يتيم ورصيده الجديد
     # لا يتحدث لأنه ببساطة مش موجود.
@@ -605,6 +734,18 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
     # أعد حساب الإجماليات الجديدة الأول (من غير أي تعديل فعلي بعد) عشان نتحقق
     # من عدم تعارضها مع خطة أقساط موجودة قبل ما نلمس أي حاجة في الداتابيز
     subtotal, disc_amt, tax_amt, new_total = calc_totals(data.lines, data.tax_pct, data.discount_pct)
+
+    # إصلاح ثغرة تحقق: تخفيض إجمالي الفاتورة لأقل من المبلغ المسدد فعلاً كان
+    # بيخليها "مدفوعة" بمبلغ مسدد أكبر من إجماليها (دفع زائد مخفي)
+    if new_total < (inv.paid_amount or Decimal("0")):
+        raise HTTPException(
+            400,
+            f"الإجمالي الجديد ({float(new_total):,.2f}) أقل من المبلغ المسدد على الفاتورة "
+            f"({float(inv.paid_amount):,.2f})",
+        )
+    # نقل فاتورة عليها دفعات لعميل تاني كان بيسيب الدفعات مسجّلة على العميل القديم
+    if data.customer_id != inv.customer_id and (inv.paid_amount or 0) > 0:
+        raise HTTPException(400, "لا يمكن نقل فاتورة عليها دفعات مسجّلة لعميل آخر")
 
     # إصلاح ثغرة تكامل (بعد تحليل المحطات 1-7): لو الفاتورة عندها خطة أقساط
     # بالفعل، وتعديل البنود هيغيّر الإجمالي، امنع التعديل بدل ما نسيب الخطة
@@ -651,7 +792,7 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
 
     # الإجماليات (اتحسبت فوق قبل أي تعديل عشان فحص خطة الأقساط)
     total = new_total
-    inv.code = data.code
+    inv.code = new_code
     inv.customer_id = data.customer_id
     inv.quotation_id = data.quotation_id
     inv.date = data.date
@@ -759,7 +900,10 @@ async def record_invoice_payment(iid: int, data: InvoicePaymentIn, db: AsyncSess
         txn_date=data.payment_date or date.today(),
     )
 
-    await journal_sales_invoice_payment(db, _tid2, inv.id, inv.code, amount, inv.date)
+    # القيد يتسجّل بتاريخ الدفعة الفعلي (زي حركة الخزنة فوق) مش تاريخ الفاتورة —
+    # وإلا التحصيل يظهر في فترة محاسبية غلط في ميزان المراجعة
+    await journal_sales_invoice_payment(db, _tid2, inv.id, inv.code, amount,
+                                        data.payment_date or date.today())
     await db.commit()
     await log_event(Events.PAYMENT_RECEIVED, tenant_id=_tid2, entity_type="invoice", entity_id=inv.id,
                      metadata={"amount": float(amount), "status": inv.status}, source_path=f"/api/v1/sales/invoices/{iid}/payment")
@@ -963,6 +1107,8 @@ async def create_payment_schedule(iid: int, data: PaymentScheduleIn, replace: bo
             raise HTTPException(400, "كل قسط لازم يكون له amount أو pct")
         if amt <= 0:
             raise HTTPException(400, "قيمة القسط يجب أن تكون أكبر من صفر")
+        if line.pct is not None and Decimal(str(line.pct)) > 100:
+            raise HTTPException(400, "نسبة القسط لا يمكن أن تتجاوز 100%")
         computed.append((line, amt))
         total_computed += amt
 
@@ -985,6 +1131,14 @@ async def create_payment_schedule(iid: int, data: PaymentScheduleIn, replace: bo
         )
         db.add(row)
         rows.append(row)
+
+    # إصلاح ثغرة تكامل: لو الفاتورة عليها دفعات مسجّلة قبل إنشاء الخطة، الأقساط
+    # الجديدة كانت بتتولد كلها "pending" — فالدفعات اللاحقة تتوزّع على أول
+    # الأقساط وآخرها يفضل مفتوح للأبد رغم إن الفاتورة نفسها اتقفلت مدفوعة.
+    # نوزّع المبلغ المسدد مسبقًا على الأقساط (FIFO) بنفس المنطق المركزي.
+    if (inv.paid_amount or Decimal("0")) > 0:
+        await db.flush()
+        await _allocate_payment_to_installments(db, iid, Decimal(str(inv.paid_amount)))
 
     await db.commit()
     for row in rows:
@@ -1024,6 +1178,11 @@ async def patch_installment(
     if data.amount_due is not None:
         if data.amount_due <= 0:
             raise HTTPException(400, "قيمة القسط يجب أن تكون أكبر من صفر")
+        if Decimal(str(data.amount_due)) < (ins.paid_amount or Decimal("0")):
+            raise HTTPException(
+                400,
+                f"قيمة القسط الجديدة أقل من المبلغ المسدد عليه بالفعل ({float(ins.paid_amount):,.2f})",
+            )
         # تحقق أن مجموع الأقساط لا يتجاوز إجمالي الفاتورة
         other_sum = (await db.execute(
             select(func.sum(InvoicePaymentSchedule.amount_due))
@@ -1102,7 +1261,7 @@ async def pay_installment(
     remaining_invoice = inv.total - inv.paid_amount
     if amount <= 0:
         raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
-    if amount > remaining_invoice + Decimal("0.01"):
+    if amount > remaining_invoice:
         raise HTTPException(
             400,
             f"المبلغ ({float(amount):,.2f}) أكبر من المتبقي على الفاتورة ({float(remaining_invoice):,.2f})"
@@ -1150,6 +1309,8 @@ async def pay_installment(
         source="customer_payment", linked_type="customer_payment",
         linked_id=pay_record.id, category_name="تحصيل من عملاء",
         description=f"سداد قسط {ins.installment_no} — فاتورة {inv.code}",
+        reference=data.reference,
+        txn_date=data.payment_date or date.today(),
     )
 
     # إصلاح ثغرة تكامل (رصدها فريق المحاسبة/الخزينة): هذا المسار بيستقبل
@@ -1157,7 +1318,8 @@ async def pay_installment(
     # record_invoice_payment، لكن كان ناقصه القيد المحاسبي المقابل في دفتر
     # الأستاذ — فيفضل رصيد الخزنة يزيد والـtrial balance واقف من غير ما
     # يعكس الكاش المُحصَّل عبر سداد الأقساط المباشر.
-    await journal_sales_invoice_payment(db, _tid_pi, inv.id, inv.code, amount, inv.date)
+    await journal_sales_invoice_payment(db, _tid_pi, inv.id, inv.code, amount,
+                                        data.payment_date or date.today())
 
     await db.commit()
     return {
@@ -1198,6 +1360,46 @@ async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db)):
             f"لا يمكن حذف الفاتورة — عليها مبلغ مسدد {float(inv.paid_amount):,.2f}. "
             f"يجب عكس/استرجاع الدفعات المسجّلة على هذه الفاتورة أولاً.",
         )
+    # إصلاح ثغرة تكامل: فاتورة عليها إشعارات دائنة (حتى لو مسودة) كان حذفها
+    # بيسيب الإشعار بمرجع فاتورة يتيم (ويكسر الـ FK على Postgres).
+    from app.models.models import CreditNote as _CN, StockMovement as _SM, Material as _Mat
+    cn_code = await db.scalar(
+        select(_CN.code).where(_CN.invoice_id == iid, _CN.status != "cancelled").limit(1)
+    )
+    if cn_code:
+        raise HTTPException(400, f"لا يمكن حذف الفاتورة — مرتبط بها إشعار دائن {cn_code}. ألغِه أو احذفه أولاً.")
+
+    from app.core.database import current_tenant_id as _ctid_del
+    _tid_del = _ctid_del.get() or 1
+
+    # إصلاح ثغرة تكامل: فاتورة أمر الإنتاج (work_order_to_invoice) بتخصم رصيد
+    # تام الصنع (FG) وتسجّل قيد COGS — حذفها كان بيعكس الإيراد بس ويسيب
+    # البضاعة "مباعة" في المخزون والتكلفة في دفتر الأستاذ للأبد. نرجّع نفس
+    # الكميات للمخزون ونعكس قيد التكلفة بنفس القيمة.
+    fg_issues = (await db.execute(
+        select(_SM).where(
+            _SM.source_doc_type == "sales_invoice", _SM.source_doc_id == iid,
+            _SM.movement_type == "out",
+        )
+    )).scalars().all()
+    if fg_issues:
+        from app.services.inventory_ledger import get_or_create_warehouse_bin, post_receipt
+        from app.services.auto_journal import journal_cogs_reversal
+        fg_bin = await get_or_create_warehouse_bin(db, _tid_del, "FG")
+        reversed_cost = Decimal("0")
+        for mv in fg_issues:
+            mat = await db.get(_Mat, mv.material_id)
+            if not mat:
+                continue
+            await post_receipt(
+                db, material=mat, qty=mv.qty, unit_cost=mv.unit_cost or Decimal("0"),
+                source_doc_type="sales_invoice_delete", source_doc_id=iid,
+                destination_location_id=fg_bin.id,
+                reference=inv.code, notes=f"إرجاع مخزون — حذف الفاتورة {inv.code}",
+            )
+            reversed_cost += Decimal(str(mv.qty)) * Decimal(str(mv.unit_cost or 0))
+        await journal_cogs_reversal(db, _tid_del, inv.id, inv.code, reversed_cost, date.today())
+
     lines = (await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==iid))).scalars().all()
     for l in lines: await db.delete(l)
     await db.execute(sa_delete(InvoicePaymentSchedule).where(InvoicePaymentSchedule.invoice_id == iid))
@@ -1208,8 +1410,6 @@ async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db)):
     if cust and unpaid > 0:
         cust.balance = cust.balance - unpaid
     # قيد عكسي في دفتر الأستاذ
-    from app.core.database import current_tenant_id as _ctid_del
-    _tid_del = _ctid_del.get() or 1
     await journal_sales_invoice_delete(db, _tid_del, inv.id, inv.code, inv.tax_amount, inv.total, inv.date)
     await db.delete(inv)
     await db.commit()
@@ -1271,6 +1471,9 @@ async def quotation_to_order(qid: int, data: QuotationToOrderRequest,
     ))
     if existing_order:
         raise HTTPException(400, f"تم تحويل هذا العرض مسبقاً — رقم الطلب: {existing_order}")
+    existing_inv = await db.scalar(select(Invoice.code).where(Invoice.quotation_id == qid).limit(1))
+    if existing_inv:
+        raise HTTPException(400, f"تم تحويل هذا العرض لفاتورة مسبقاً — رقم الفاتورة: {existing_inv}")
 
     code = await _next_order_code(db)
     order = CustomerOrder(
@@ -1354,6 +1557,12 @@ async def order_to_work_order(order_id: int, data: OrderToWorkOrderRequest,
     order = await db.get(CustomerOrder, order_id)
     if not order:
         raise HTTPException(404, "الطلب غير موجود")
+    if order.status in ("cancelled", "delivered"):
+        raise HTTPException(400, f"لا يمكن إنشاء أمر إنتاج لطلب حالته {order.status}")
+    if data.quantity is None or Decimal(str(data.quantity)) <= 0:
+        raise HTTPException(400, "كمية الإنتاج يجب أن تكون أكبر من صفر")
+    if data.start_date and data.planned_end_date and data.planned_end_date < data.start_date:
+        raise HTTPException(400, "تاريخ الانتهاء المخطط لا يمكن أن يكون قبل تاريخ البدء")
 
     eq = await db.get(Equipment, data.equipment_id)
     if not eq:
@@ -1423,6 +1632,11 @@ async def work_order_to_invoice(wo_id: int, data: WorkOrderToInvoiceRequest,
 
     if not wo.customer_order_id or not wo.customer_order:
         raise HTTPException(400, "أمر الإنتاج غير مرتبط بطلب عميل — لا يمكن إنشاء فاتورة تلقائية")
+    if wo.customer_order.status == "cancelled":
+        raise HTTPException(400, "طلب العميل المرتبط بأمر الإنتاج ملغي — لا يمكن فوترته")
+    for _nm, _v in (("الضريبة", data.tax_pct), ("الخصم", data.discount_pct)):
+        if _v is not None and (Decimal(str(_v)) < 0 or Decimal(str(_v)) > 100):
+            raise HTTPException(400, f"نسبة {_nm} يجب أن تكون بين 0 و100")
 
     # محطة 23: منع فوترة نفس أمر الإنتاج مرتين (كان مفيش أي تحقق قبل كده)
     existing_invoice = await db.scalar(
@@ -1496,27 +1710,7 @@ async def work_order_to_invoice(wo_id: int, data: WorkOrderToInvoiceRequest,
     # ده، فوترة أمر إنتاج كانت بتسجّل إيراد كامل من غير ما تخصم أي مخزون
     # ومن غير أي قيد تكلفة بضاعة مباعة — رصيد FG بيفضل واقف في المخزون للأبد
     # (مخزون وهمي) والربح المعروض بيبقى أعلى من الحقيقة بقيمة التكلفة كاملة.
-    from app.models.models import Material as _FGMat
-    from app.services.inventory_ledger import get_or_create_warehouse_bin as _get_fg_bin, post_issue as _post_fg_issue
-    fg_mat = (await db.execute(
-        select(_FGMat).where(_FGMat.tenant_id == tid, _FGMat.code == f"FG-{wo.code}")
-    )).scalar_one_or_none()
-    if not fg_mat or (fg_mat.stock_qty or Decimal("0")) < qty:
-        raise HTTPException(
-            400,
-            f"لا يمكن إصدار فاتورة لأمر الإنتاج {wo.code} — لسه معندوش رصيد كافٍ في مخزون "
-            f"تام الصنع (FG). لازم يتم إنهاء التصنيع (POST /production/complete/{{id}}) أولاً."
-        )
-    fg_unit_cost = fg_mat.unit_cost or Decimal("0")
-    cogs_amount = qty * fg_unit_cost
-    fg_bin = await _get_fg_bin(db, tid, "FG")
-    await _post_fg_issue(
-        db, material=fg_mat, qty=qty, unit_cost=fg_unit_cost,
-        source_doc_type="sales_invoice", source_doc_id=inv.id,
-        source_location_id=fg_bin.id,
-        reference=inv.code, notes=f"فاتورة مبيعات مباشرة من أمر الإنتاج — {inv.code}",
-    )
-    await journal_cogs(db, tid, inv.id, inv.code, cogs_amount, date.today())
+    await _issue_fg_for_wo_invoice(db, tid, wo, inv, qty)
 
     # محطة 23: ما بنلمسش wo.status هنا. كان بيتحط "billed" وده كان بيمسح
     # حالة "done" اللي تقارير كتير بتفلتر بيها (dashboard_new.py, reports.py,
@@ -1550,6 +1744,8 @@ async def order_advance_payment(order_id: int, data: OrderAdvancePaymentRequest,
     order = await db.get(CustomerOrder, order_id)
     if not order:
         raise HTTPException(404, "الطلب غير موجود")
+    if order.status == "cancelled":
+        raise HTTPException(400, "لا يمكن تسجيل دفعة مقدمة على طلب ملغي")
 
     amount = Decimal(str(data.amount))
     if amount <= 0:
@@ -1675,11 +1871,11 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
             notes_text = raw_notes[sep + 2:] if sep > 0 else ""
             # XSS: السماح فقط بـ data URIs للصور — رفض أي مصدر آخر
             if img_data.startswith("data:image/"):
-                img_html = f'<img src="{img_data}" class="row-img"/>'
+                img_html = f'<img src="{_esc(img_data)}" class="row-img"/>'
         if not img_html:
             line_img = line.get("image_data") or ""
             if line_img.startswith("data:image/"):
-                img_html = f'<img src="{line_img}" class="row-img"/>'
+                img_html = f'<img src="{_esc(line_img)}" class="row-img"/>'
         clean_notes = notes_text.split("تكلفة:")[0].strip() if notes_text else ""
 
         specs_lines = [_esc(t) for t in (desc or "").split("\n") if t.strip()]
@@ -1697,7 +1893,7 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
             f'<td class="col-name">{type_cell}</td>'
             f'<td>{model_cell or "—"}</td>'
             f'<td class="col-specs">{specs_html}</td>'
-            f'<td>{line["qty"]} {line["unit"]}</td>'
+            f'<td>{line["qty"]} {_esc(line["unit"])}</td>'
             f'<td>{line["unit_price"]:,.0f}</td>'
             f'<td class="price">{line["total_price"]:,.0f}</td>'
             '</tr>'
@@ -1716,11 +1912,15 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
 
     # JS vars — use json.dumps for safe embedding (handles backslashes, newlines, </script>, etc.)
     import json as _json
-    js_customer = _json.dumps(doc.get("customer_name") or "")
-    js_code     = _json.dumps(doc.get("code") or "")
-    js_total    = _json.dumps(f"{total:,.0f} {currency}")
-    js_company  = _json.dumps(company.get("name") or "")
-    js_date     = _json.dumps(str(doc.get("date") or ""))
+    # XSS: json.dumps لوحده مابيهربش "</script>" — نهرّب < > & كـ unicode escapes
+    def _jsd(v):
+        return (_json.dumps(v).replace("<", "\\u003c").replace(">", "\\u003e")
+                .replace("&", "\\u0026"))
+    js_customer = _jsd(doc.get("customer_name") or "")
+    js_code     = _jsd(doc.get("code") or "")
+    js_total    = _jsd(f"{total:,.0f} {currency}")
+    js_company  = _jsd(company.get("name") or "")
+    js_date     = _jsd(str(doc.get("date") or ""))
 
     totals_rows = (
         f'<div class="totals-row">'
@@ -1754,8 +1954,8 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
 
     # ── Legal / dates ─────────────────────────────────────────
     legal_parts = []
-    if company.get("tax_id"):         legal_parts.append(f'ب.ض: {company["tax_id"]}')
-    if company.get("commercial_reg"): legal_parts.append(f'س.ت: {company["commercial_reg"]}')
+    if company.get("tax_id"):         legal_parts.append(f'ب.ض: {_esc(company["tax_id"])}')
+    if company.get("commercial_reg"): legal_parts.append(f'س.ت: {_esc(company["commercial_reg"])}')
     legal_html = " | ".join(legal_parts)
 
     sub_date = ""
@@ -1827,10 +2027,10 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
                     if total > 0 else "")
 
     footer_items = " &nbsp;|&nbsp; ".join(filter(None, [
-        f'📞 {company.get("phone")}' if company.get("phone") else "",
-        f'✉️ {company.get("email")}' if company.get("email") else "",
-        f'🌐 {company.get("website")}' if company.get("website") else "",
-        f'📍 {company.get("address")}' if company.get("address") else "",
+        f'📞 {_esc(company.get("phone"))}' if company.get("phone") else "",
+        f'✉️ {_esc(company.get("email"))}' if company.get("email") else "",
+        f'🌐 {_esc(company.get("website"))}' if company.get("website") else "",
+        f'📍 {_esc(company.get("address"))}' if company.get("address") else "",
         legal_html,
     ]))
 
@@ -1919,7 +2119,7 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
     # ── Logo HTML — white-background box so any logo format works ──
     if logo_src:
         logo_html = (
-            f'<img src="{logo_src}" alt="logo" '
+            f'<img src="{_esc(logo_src)}" alt="logo" '
             f'style="max-height:90px;max-width:180px;object-fit:contain;display:block;"/>'
         )
     else:
@@ -1929,7 +2129,7 @@ def build_print_html(doc_type: str, doc: dict, company: dict, schedule: list = N
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8"/>
-<title>{title} — {js_code}</title>
+<title>{title} — {_esc(doc.get("code") or "")}</title>
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet"/>
 <style>
 :root{{--navy:#0C2340;--navy-dk:#081828;--gold:#C8A550;--gold-lt:rgba(200,165,80,.12);--gold-bd:rgba(200,165,80,.3);--surface:#F8F7F4;--border:#E8E6E0;--text:#1A1A2E;--muted:#7A7870;}}
@@ -2221,7 +2421,7 @@ async def print_agreement(qid: int, db: AsyncSession = Depends(get_db)):
     co_reg   = esc(co["commercial_reg"])
     logo_b64 = co.get("logo_b64")
     logo_html = (
-        f'<img src="{logo_b64}" alt="logo" style="max-height:80px;max-width:160px;object-fit:contain;"/>'
+        f'<img src="{esc(logo_b64)}" alt="logo" style="max-height:80px;max-width:160px;object-fit:contain;"/>'
         if logo_b64 else ""
     )
 
@@ -2244,7 +2444,7 @@ async def print_agreement(qid: int, db: AsyncSession = Depends(get_db)):
         if ln.startswith("IMG:"):
             sep = ln.find("||")
             b64 = ln[4:sep] if sep > 0 else ln[4:]
-            img_html = f'<img src="{b64}" style="width:60px;height:46px;object-fit:contain;border-radius:4px;vertical-align:middle;margin-left:6px;"/>'
+            img_html = "" if not b64.startswith("data:image/") else f'<img src="{esc(b64)}" style="width:60px;height:46px;object-fit:contain;border-radius:4px;vertical-align:middle;margin-left:6px;"/>'
         desc_text = esc(l.description)
         model_text = f"<br/><small style='color:#888;font-size:10px'>{esc(l.model_no)}</small>" if l.model_no else ""
         type_text  = f"<div style='font-size:10px;color:#555;margin-bottom:2px'>{esc(l.item_type)}</div>" if l.item_type else ""

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, block_viewer_writes
 from app.models.models import (
     ExtProject, ExtProjectMember, ExtProjectTool,
     ExtProjectMaterial, ExtProjectTrip, ExtProjectExpense,
@@ -22,7 +22,7 @@ from app.models.models import (
     CustomerAsset, AssetMovement,
 )
 
-router = APIRouter(prefix="/ext-projects", tags=["external-projects"], dependencies=[Depends(require_any)])
+router = APIRouter(prefix="/ext-projects", tags=["external-projects"], dependencies=[Depends(require_any), Depends(block_viewer_writes)])
 print_router = APIRouter(prefix="/ext-projects", tags=["ext-projects-print"], dependencies=[Depends(require_any)])
 
 
@@ -174,9 +174,19 @@ async def create_project(data: ProjectIn, db: AsyncSession = Depends(get_db)):
         raise HTTPException(400, "قيمة العقد لا يمكن أن تكون سالبة")
     from app.core.database import current_tenant_id as _ctid_ep
     _tid_ep = _ctid_ep.get() or 1
+    if data.warranty_months is not None and data.warranty_months < 0:
+        raise HTTPException(400, "مدة الضمان لا يمكن أن تكون سالبة")
+    if not (data.code or "").strip():
+        raise HTTPException(400, "كود المشروع مطلوب")
     client = await db.get(Customer, data.client_id)
     if not client or client.tenant_id != _tid_ep:
         raise HTTPException(404, "العميل غير موجود")
+    # كود المشروع فريد لكل tenant (uq_extproject_tenant_code) — كان التكرار
+    # بيوصل لـ IntegrityError ويرجع 500 بدل رسالة واضحة.
+    if await db.scalar(select(ExtProject.id).where(
+        ExtProject.code == data.code, ExtProject.tenant_id == _tid_ep,
+    )):
+        raise HTTPException(409, f"كود المشروع {data.code} مستخدم من قبل")
     _ep_data = data.model_dump()
     _ep_data['tenant_id'] = _tid_ep
     p = ExtProject(**_ep_data)
@@ -309,11 +319,26 @@ async def get_project(pid: int, db: AsyncSession = Depends(get_db)):
 @router.put("/{pid}")
 async def update_project(pid: int, data: ProjectIn, db: AsyncSession = Depends(get_db)):
     from app.core.database import current_tenant_id as _ctid_up
+    _tid_up = _ctid_up.get() or 1
     p = await db.get(ExtProject, pid)
-    if not p or p.tenant_id != (_ctid_up.get() or 1):
+    if not p or p.tenant_id != _tid_up:
         raise HTTPException(404)
     if data.planned_start and data.planned_end and data.planned_end < data.planned_start:
         raise HTTPException(400, "تاريخ الانتهاء المخطط يجب أن يكون بعد تاريخ البدء")
+    if data.contract_value is not None and data.contract_value < 0:
+        raise HTTPException(400, "قيمة العقد لا يمكن أن تكون سالبة")
+    if data.warranty_months is not None and data.warranty_months < 0:
+        raise HTTPException(400, "مدة الضمان لا يمكن أن تكون سالبة")
+    if not (data.code or "").strip():
+        raise HTTPException(400, "كود المشروع مطلوب")
+    if data.client_id != p.client_id:
+        client = await db.get(Customer, data.client_id)
+        if not client or client.tenant_id != _tid_up:
+            raise HTTPException(404, "العميل غير موجود")
+    if data.code != p.code and await db.scalar(select(ExtProject.id).where(
+        ExtProject.code == data.code, ExtProject.tenant_id == _tid_up, ExtProject.id != pid,
+    )):
+        raise HTTPException(409, f"كود المشروع {data.code} مستخدم من قبل")
     for k, v in data.model_dump().items():
         setattr(p, k, v)
     await db.commit()
@@ -372,6 +397,24 @@ async def delete_project(pid: int, db: AsyncSession = Depends(get_db)):
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != (_ctid_dp.get() or 1):
         raise HTTPException(404)
+    # الحذف بيعمل cascade لكل السطور التابعة — لو فيه تحصيل فعلي أو مواد/عدة
+    # اتصرفت من المخزون، الحذف كان بيمسح الأثر ده من غير أي عكس (رصيد مخزون
+    # ناقص للأبد، ومبالغ محصّلة بتختفي). امنع الحذف لحد ما تتسوّى الأول.
+    paid_cnt = await db.scalar(select(func.count(ExtProjectPayment.id)).where(
+        ExtProjectPayment.project_id == pid, ExtProjectPayment.paid_amount > 0,
+    ))
+    if paid_cnt:
+        raise HTTPException(409, "لا يمكن حذف مشروع عليه دفعات محصّلة — احذف/اعكس التحصيل أولاً")
+    stock_cnt = await db.scalar(select(func.count(ExtProjectMaterial.id)).where(
+        ExtProjectMaterial.project_id == pid, ExtProjectMaterial.source == "stock",
+        ExtProjectMaterial.material_id.isnot(None),
+    ))
+    tool_cnt = await db.scalar(select(func.count(ExtProjectTool.id)).where(
+        ExtProjectTool.project_id == pid, ExtProjectTool.material_id.isnot(None),
+        ExtProjectTool.status == "withdrawn",
+    ))
+    if stock_cnt or tool_cnt:
+        raise HTTPException(409, "لا يمكن حذف مشروع له مواد/عدة مصروفة من المخزون — احذفها أو أرجعها أولاً")
     await db.delete(p)
     await db.commit()
     return {"message": "تم الحذف"}
@@ -399,6 +442,8 @@ async def add_member(pid: int, data: MemberIn, db: AsyncSession = Depends(get_db
         raise HTTPException(404)
     if data.daily_rate is None or data.daily_rate <= 0:
         raise HTTPException(400, "الأجر اليومي يجب أن يكون أكبر من صفر")
+    if data.planned_days is not None and data.planned_days < 0:
+        raise HTTPException(400, "عدد الأيام المخططة لا يمكن أن يكون سالباً")
     worker = await db.get(Worker, data.worker_id)
     if not worker or worker.tenant_id != (_ctid_am.get() or 1):
         raise HTTPException(404, "العامل غير موجود")
@@ -437,6 +482,8 @@ async def add_site_advance(pid: int, mid: int, amount: Decimal, db: AsyncSession
     m = await db.get(ExtProjectMember, mid)
     if not m or m.project_id != pid or m.tenant_id != (_ctid_asa.get() or 1):
         raise HTTPException(404)
+    if amount is None or amount <= 0:
+        raise HTTPException(400, "مبلغ السلفة يجب أن يكون أكبر من صفر")
     m.site_advances = (m.site_advances or Decimal("0")) + amount
     await db.commit()
     return {"site_advances": float(m.site_advances)}
@@ -490,6 +537,23 @@ async def record_attendance(pid: int, data: AttBulkIn, db: AsyncSession = Depend
         if s == "half":
             return "half_project"
         return s  # absent | leave | ...
+
+    # تحقق من المدخلات قبل أي كتابة: worker_id لازم يكون موجود ورقمي ويخص نفس
+    # الـ tenant (كان rec["worker_id"] الناقص بيرمي KeyError → 500، وworker_id
+    # لعامل مش موجود كان بيتسجل له حضور يتيم)، والحالة من القيم المعروفة.
+    _allowed_att = {"present", "on_project", "half", "half_project", "absent", "leave"}
+    for rec in data.records:
+        if not isinstance(rec, dict) or rec.get("worker_id") is None:
+            raise HTTPException(400, "كل سجل حضور يجب أن يحتوي على worker_id")
+        try:
+            rec["worker_id"] = int(rec["worker_id"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "worker_id غير صالح")
+        if rec.get("status", "present") not in _allowed_att:
+            raise HTTPException(400, f"حالة حضور غير صالحة: {rec.get('status')}")
+        _w = await db.get(Worker, rec["worker_id"])
+        if not _w or _w.tenant_id != tid:
+            raise HTTPException(404, f"العامل #{rec['worker_id']} غير موجود")
 
     for rec in data.records:
         wid = rec["worker_id"]
@@ -600,6 +664,12 @@ async def add_tool(pid: int, data: ToolIn, db: AsyncSession = Depends(get_db)):
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != tid_ept:
         raise HTTPException(404, "المشروع غير موجود")
+    if data.quantity is None or data.quantity <= 0:
+        raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
+    if data.withdrawn_by:
+        _wb = await db.get(Worker, data.withdrawn_by)
+        if not _wb or _wb.tenant_id != tid_ept:
+            raise HTTPException(404, "العامل المستلم غير موجود")
     mat = None
     if data.material_id:
         mat = await db.get(Material, data.material_id)
@@ -608,6 +678,8 @@ async def add_tool(pid: int, data: ToolIn, db: AsyncSession = Depends(get_db)):
 
     _ept_data = data.model_dump()
     _ept_data['tenant_id'] = tid_ept
+    if not _ept_data.get('withdrawn_date'):
+        _ept_data['withdrawn_date'] = date.today()
     t = ExtProjectTool(project_id=pid, **_ept_data)
     db.add(t)
     await db.flush()
@@ -726,6 +798,16 @@ async def add_material(pid: int, data: MaterialIn, db: AsyncSession = Depends(ge
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != tid:
         raise HTTPException(404, "المشروع غير موجود")
+    if data.quantity is None or data.quantity <= 0:
+        raise HTTPException(400, "الكمية يجب أن تكون أكبر من صفر")
+    if data.unit_cost is not None and data.unit_cost < 0:
+        raise HTTPException(400, "تكلفة الوحدة لا يمكن أن تكون سالبة")
+    if data.source not in ("stock", "local_purchase"):
+        raise HTTPException(400, "مصدر المادة يجب أن يكون stock أو local_purchase")
+    if data.used_by:
+        _ub = await db.get(Worker, data.used_by)
+        if not _ub or _ub.tenant_id != tid:
+            raise HTTPException(404, "العامل غير موجود")
 
     payload = data.model_dump()
     payload["total_cost"] = float(data.quantity) * float(data.unit_cost)
@@ -737,7 +819,7 @@ async def add_material(pid: int, data: MaterialIn, db: AsyncSession = Depends(ge
         # تاني) يتخزن كما هو في ExtProjectMaterial من غير أي تحقق، فيفضل FK
         # يتيم يشاور على صف مايقدرش هذا المستأجر يشوفه أصلاً.
         mat = await db.get(Material, data.material_id)
-        if not mat:
+        if not mat or mat.tenant_id != tid:
             raise HTTPException(404, "المادة غير موجودة")
     if data.source == "stock" and mat:
         if float(data.unit_cost) == 0:
@@ -782,7 +864,7 @@ async def delete_material(pid: int, mid: int, db: AsyncSession = Depends(get_db)
     if not p or p.tenant_id != (_ctid_delmat.get() or 1):
         raise HTTPException(404, "المشروع غير موجود")
     m = await db.get(ExtProjectMaterial, mid)
-    if not m or m.project_id != pid:
+    if not m or m.project_id != pid or m.tenant_id != p.tenant_id:
         raise HTTPException(404)
 
     # محطة 25: لو كانت اتخصمت فعليًا من المخزون، نرجّعها عند الحذف (عكس متماثل)
@@ -829,6 +911,13 @@ async def add_trip(pid: int, data: TripIn, db: AsyncSession = Depends(get_db)):
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != tid_eptrip:
         raise HTTPException(404, "المشروع غير موجود")
+    for _v in (data.fuel_cost, data.toll_cost, data.rental_cost, data.other_cost):
+        if _v is not None and _v < 0:
+            raise HTTPException(400, "تكاليف الرحلة لا يمكن أن تكون سالبة")
+    if data.distance_km is not None and data.distance_km < 0:
+        raise HTTPException(400, "المسافة لا يمكن أن تكون سالبة")
+    if data.passengers is not None and data.passengers < 0:
+        raise HTTPException(400, "عدد الركاب لا يمكن أن يكون سالباً")
     payload = data.model_dump()
     payload["total_cost"] = (
         float(data.fuel_cost) + float(data.toll_cost) +
@@ -875,6 +964,14 @@ async def add_expense(pid: int, data: ExpenseIn, db: AsyncSession = Depends(get_
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != tid_epexp:
         raise HTTPException(404, "المشروع غير موجود")
+    if data.amount is None or data.amount <= 0:
+        raise HTTPException(400, "المبلغ يجب أن يكون أكبر من صفر")
+    if data.persons_count is not None and data.persons_count < 0:
+        raise HTTPException(400, "عدد الأفراد لا يمكن أن يكون سالباً")
+    if data.paid_by:
+        _pb = await db.get(Worker, data.paid_by)
+        if not _pb or _pb.tenant_id != tid_epexp:
+            raise HTTPException(404, "العامل غير موجود")
     _epexp_data = data.model_dump()
     _epexp_data['tenant_id'] = tid_epexp
     e = ExtProjectExpense(project_id=pid, **_epexp_data)
@@ -918,6 +1015,14 @@ async def add_progress(pid: int, data: ProgressIn, db: AsyncSession = Depends(ge
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != tid_epprog:
         raise HTTPException(404, "المشروع غير موجود")
+    if data.completion_pct is None or not (0 <= data.completion_pct <= 100):
+        raise HTTPException(400, "نسبة الإنجاز يجب أن تكون بين 0 و 100")
+    if data.workers_present is not None and data.workers_present < 0:
+        raise HTTPException(400, "عدد العمال الحاضرين لا يمكن أن يكون سالباً")
+    if data.reporter_id:
+        _rp = await db.get(Worker, data.reporter_id)
+        if not _rp or _rp.tenant_id != tid_epprog:
+            raise HTTPException(404, "العامل غير موجود")
     _epprog_data = data.model_dump()
     _epprog_data['tenant_id'] = tid_epprog
     r = ExtProjectProgress(project_id=pid, **_epprog_data)
@@ -964,6 +1069,12 @@ async def add_payment_milestone(pid: int, data: PaymentIn, db: AsyncSession = De
     p = await db.get(ExtProject, pid)
     if not p or p.tenant_id != tid_eppmil:
         raise HTTPException(404, "المشروع غير موجود")
+    if data.due_amount is None or data.due_amount <= 0:
+        raise HTTPException(400, "المبلغ المستحق يجب أن يكون أكبر من صفر")
+    if data.milestone_pct is not None and not (0 <= data.milestone_pct <= 100):
+        raise HTTPException(400, "نسبة المرحلة يجب أن تكون بين 0 و 100")
+    if not (data.milestone or "").strip():
+        raise HTTPException(400, "اسم المرحلة مطلوب")
     _eppmil_data = data.model_dump()
     _eppmil_data['tenant_id'] = tid_eppmil
     pay = ExtProjectPayment(project_id=pid, **_eppmil_data)
@@ -983,6 +1094,14 @@ async def receive_payment(pid: int, payid: int, data: PaymentReceiveIn,
     pay = await db.get(ExtProjectPayment, payid)
     if not pay or pay.project_id != pid or pay.tenant_id != (_ctid_recv.get() or 1):
         raise HTTPException(404)
+    # منع التحصيل الزائد: كان ممكن تسجل أي مبلغ فوق المستحق بلا حد، فيتضخم
+    # "المحصَّل" ويطلع "المتبقي" بالسالب في كل التقارير.
+    _remaining = (pay.due_amount or Decimal("0")) - (pay.paid_amount or Decimal("0"))
+    if data.paid_amount > _remaining + Decimal("0.01"):
+        raise HTTPException(
+            400,
+            f"المبلغ المحصَّل ({data.paid_amount}) أكبر من المتبقي على المرحلة ({_remaining})",
+        )
     pay.paid_amount = (pay.paid_amount or Decimal("0")) + data.paid_amount
     pay.payment_method = data.payment_method
     pay.reference = data.reference
@@ -1101,9 +1220,16 @@ def _egp(v) -> str:
         return "0.00"
 
 
+def _esc(s) -> str:
+    """HTML-escape لبيانات المستخدم داخل صفحة الطباعة (منع XSS مخزَّن)."""
+    import html as _h
+    return _h.escape(str(s if s is not None else ""))
+
+
 @print_router.get("/{pid}/print", response_class=HTMLResponse)
 async def print_project_report(pid: int, db: AsyncSession = Depends(get_db)):
     """طباعة تقرير المشروع الخارجي الشامل"""
+    from app.core.database import current_tenant_id as _ctid_pr
     p = (await db.execute(
         select(ExtProject).options(
             selectinload(ExtProject.client),
@@ -1113,7 +1239,7 @@ async def print_project_report(pid: int, db: AsyncSession = Depends(get_db)):
             selectinload(ExtProject.expenses),
             selectinload(ExtProject.payments),
             selectinload(ExtProject.progress_reports),
-        ).where(ExtProject.id == pid)
+        ).where(ExtProject.id == pid, ExtProject.tenant_id == (_ctid_pr.get() or 1))
     )).scalar_one_or_none()
     if not p:
         raise HTTPException(404)
@@ -1135,8 +1261,8 @@ async def print_project_report(pid: int, db: AsyncSession = Depends(get_db)):
     for i, m in enumerate(p.team_members, 1):
         gross = float(m.actual_days) * float(m.daily_rate)
         team_rows += (
-            f"<tr><td>{i}</td><td>{m.worker.name if m.worker else ''}</td>"
-            f"<td>{m.role or ''}</td><td>{float(m.actual_days):.1f}</td>"
+            f"<tr><td>{i}</td><td>{_esc(m.worker.name if m.worker else '')}</td>"
+            f"<td>{_esc(m.role or '')}</td><td>{float(m.actual_days):.1f}</td>"
             f"<td>{_egp(m.daily_rate)}</td><td style='font-weight:700'>{_egp(gross)}</td>"
             f"<td style='color:#E87722'>{_egp(m.site_advances)}</td></tr>"
         )
@@ -1146,9 +1272,9 @@ async def print_project_report(pid: int, db: AsyncSession = Depends(get_db)):
     for i, m in enumerate(p.materials, 1):
         src = "مخزن" if m.source == "stock" else "شراء محلي"
         mat_rows += (
-            f"<tr><td>{i}</td><td>{m.description or ''}</td>"
+            f"<tr><td>{i}</td><td>{_esc(m.description or '')}</td>"
             f"<td style='color:#64748B'>{src}</td>"
-            f"<td>{float(m.qty):.2f} {m.unit or ''}</td>"
+            f"<td>{float(m.quantity or 0):.2f} {_esc(m.unit or '')}</td>"
             f"<td style='font-weight:700'>{_egp(m.total_cost)}</td></tr>"
         )
 
@@ -1157,15 +1283,19 @@ async def print_project_report(pid: int, db: AsyncSession = Depends(get_db)):
     for i, pay in enumerate(p.payments, 1):
         status_ar = {"pending": "معلق", "partial": "جزئي", "paid": "مسدَّد"}.get(pay.status, pay.status)
         pay_rows += (
-            f"<tr><td>{i}</td><td>{pay.milestone or ''}</td>"
+            f"<tr><td>{i}</td><td>{_esc(pay.milestone or '')}</td>"
             f"<td style='color:var(--teal)'>{_egp(pay.due_amount)}</td>"
             f"<td style='color:#22C55E;font-weight:700'>{_egp(pay.paid_amount)}</td>"
             f"<td style='color:#EF4444'>{_egp(float(pay.due_amount)-float(pay.paid_amount))}</td>"
-            f"<td>{status_ar}</td></tr>"
+            f"<td>{_esc(status_ar)}</td></tr>"
         )
 
     status_map = {"planning": "تخطيط", "active": "جاري", "on_hold": "موقوف",
-                  "completed": "منتهي", "cancelled": "ملغي"}
+                  "completed": "منتهي", "cancelled": "ملغي",
+                  # الحالات الفعلية المستخدمة في _VALID_PROJECT_STATUSES
+                  "draft": "مسودة", "approved": "معتمد", "mobilizing": "تجهيز",
+                  "in_progress": "جاري التنفيذ", "testing": "اختبار", "handover": "تسليم",
+                  "warranty": "ضمان", "closed": "مغلق"}
     status_ar = status_map.get(p.status, p.status)
 
     last_prog = sorted(p.progress_reports, key=lambda x: x.report_date)
@@ -1175,7 +1305,7 @@ async def print_project_report(pid: int, db: AsyncSession = Depends(get_db)):
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8"/>
-<title>تقرير المشروع — {p.code}</title>
+<title>تقرير المشروع — {_esc(p.code)}</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -1207,12 +1337,12 @@ tr:nth-child(even){{background:#f8f9fa}}
 <body>
 <div class="page">
   <div class="header">
-    <div style="font-family:monospace;font-size:11px;opacity:.6;margin-bottom:4px">{p.code}</div>
-    <h1>{p.title}</h1>
+    <div style="font-family:monospace;font-size:11px;opacity:.6;margin-bottom:4px">{_esc(p.code)}</div>
+    <h1>{_esc(p.title)}</h1>
     <div class="sub">
-      🏢 {p.client.name if p.client else ''} &nbsp;|&nbsp; الحالة: {status_ar}
-      {f"&nbsp;|&nbsp; 📍 {p.city}" if p.city else ""}
-      {f"، {p.governorate}" if p.governorate else ""}
+      🏢 {_esc(p.client.name if p.client else '')} &nbsp;|&nbsp; الحالة: {_esc(status_ar)}
+      {f"&nbsp;|&nbsp; 📍 {_esc(p.city)}" if p.city else ""}
+      {f"، {_esc(p.governorate)}" if p.governorate else ""}
     </div>
   </div>
 
@@ -1237,7 +1367,7 @@ tr:nth-child(even){{background:#f8f9fa}}
       <div style="font-size:12px;color:#475569;margin-bottom:4px">نسبة الإنجاز: <b>{completion}%</b></div>
       <div class="progress-bar"><div class="progress-fill" style="width:{min(100,completion)}%"></div></div>
       <div style="height:8px"></div>
-      <div class="info-row"><span class="info-label">إجمالي المستحق:</span><span>{_egp(sum(float(p.due_amount) for p in p.payments))}</span></div>
+      <div class="info-row"><span class="info-label">إجمالي المستحق:</span><span>{_egp(sum(float(_pay.due_amount) for _pay in p.payments))}</span></div>
       <div class="info-row"><span class="info-label">المحصَّل:</span><span style="color:#22C55E;font-weight:700">{_egp(collected)}</span></div>
       <div class="info-row"><span class="info-label">المتبقي:</span><span style="color:#EF4444;font-weight:700">{_egp(outstanding)}</span></div>
     </div>

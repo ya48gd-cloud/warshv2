@@ -63,6 +63,11 @@ async def get_invoice_due_status(
         due = invoice.due_date or invoice.date
         days_overdue = (today - due).days if due else 0
         remaining = invoice.total - invoice.paid_amount
+        # إصلاح: فاتورة متسددة بالكامل (remaining <= 0) بعد تاريخ استحقاقها كانت
+        # بترجع is_overdue=True بمبلغ متأخر صفر/سالب — تنبيهات وهمية.
+        if remaining <= 0:
+            remaining = Decimal("0")
+            days_overdue = min(days_overdue, 0)
 
         return InvoiceDueStatus(
             invoice_id=invoice.id,

@@ -162,3 +162,46 @@ async def test_create_batch_rejects_supplier_from_another_tenant(cli, cli2):
     payload["supplier_id"] = foreign_supplier_id
     r = await cli.post(BATCH, json=payload)
     assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_reversing_batch_issue_restores_batch_remaining(cli):
+    """عكس حركة صرف من دُفعة كان بيرجّع رصيد المادة بس ويسيب qty_remaining للدُفعة ناقص."""
+    mid = await _make_material(cli, qty=0)
+    batch_id = (await cli.post(BATCH, json=_batch_payload(mid, lot="LOT-REV", qty=20))).json()["id"]
+    r = await cli.post(f"{BATCH}/{batch_id}/issue", json={"qty": 20})
+    assert r.status_code == 200 and r.json()["status"] == "consumed"
+
+    movs = (await cli.get(f"{INV}/movements/{mid}")).json()
+    issue_mov = next(m for m in movs if m["source_doc_type"] == "stock_batch_issue")
+    rev = await cli.delete(f"{INV}/movements/{issue_mov['id']}")
+    assert rev.status_code == 200, rev.text
+
+    b = (await cli.get(f"{BATCH}/{batch_id}")).json()
+    assert b["qty_remaining"] == 20.0
+    assert b["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_reversing_partially_consumed_batch_receipt_rejected(cli):
+    mid = await _make_material(cli, qty=0)
+    batch_id = (await cli.post(BATCH, json=_batch_payload(mid, lot="LOT-PART", qty=20))).json()["id"]
+    await cli.post(f"{BATCH}/{batch_id}/issue", json={"qty": 5})
+    movs = (await cli.get(f"{INV}/movements/{mid}")).json()
+    rcpt = next(m for m in movs if m["source_doc_type"] == "stock_batch")
+    r = await cli.delete(f"{INV}/movements/{rcpt['id']}")
+    assert r.status_code == 400
+    b = (await cli.get(f"{BATCH}/{batch_id}")).json()
+    assert b["qty_remaining"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_batch_rejects_blank_lot_and_non_positive_issue(cli):
+    mid = await _make_material(cli, qty=0)
+    r = await cli.post(BATCH, json=_batch_payload(mid, lot="   "))
+    assert r.status_code == 422
+    batch_id = (await cli.post(BATCH, json=_batch_payload(mid, lot="LOT-Z", qty=5))).json()["id"]
+    r = await cli.post(f"{BATCH}/{batch_id}/issue", json={"qty": 0})
+    assert r.status_code == 422
+    r = await cli.post(f"{BATCH}/{batch_id}/issue", json={"qty": -3})
+    assert r.status_code == 422

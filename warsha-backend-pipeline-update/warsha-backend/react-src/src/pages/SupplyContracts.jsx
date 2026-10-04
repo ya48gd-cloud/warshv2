@@ -10,8 +10,14 @@ import { PageSpinner } from '../components/ui/Spinner'
 const STATUS_AR    = { draft:'مسودة', active:'ساري', expired:'منتهي', cancelled:'ملغي' }
 const STATUS_COLOR = { draft:'var(--text-secondary)', active:'var(--teal)', expired:'#b45309', cancelled:'var(--red)' }
 
+// التاريخ المحلي (toISOString بيرجع UTC فممكن يطلع تاريخ امبارح/بكرة)
+const localToday = () => {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
 const EMPTY_FORM = {
-  customer_id: '', quotation_id: '', date: new Date().toISOString().slice(0,10),
+  customer_id: '', quotation_id: '', date: localToday(),
   valid_until: '', payment_terms: '', delivery_terms: '', warranty_months: '12', warranty_description: '',
   tax_pct: '0', discount_amt: '0', scope_of_work: '', special_terms: '', notes: '',
   lines: [],
@@ -36,8 +42,10 @@ export default function SupplyContracts({ onNavigate }) {
   const [scheduleData, setScheduleData]   = useState(null)   // { installments: [] }
   const [scheduleRows, setScheduleRows]   = useState([{ label: '', pct: '', days_offset: '0' }])
   const [deliverModal, setDeliverModal]   = useState(null)   // contract id
+  const [confirmCancel, setConfirmCancel] = useState(null)   // contract id — تأكيد إيقاف العقد
+  const [confirmDelSched, setConfirmDelSched] = useState(null) // contract id — تأكيد حذف خطة الأقساط
   const EMPTY_DELIVER = {
-    delivery_date: new Date().toISOString().slice(0,10),
+    delivery_date: localToday(),
     received_by: '', receiver_title: '', delivery_notes: '',
     vehicle_plate: '', vehicle_type: '', driver_name: '', driver_license: '', driver_phone: '',
   }
@@ -55,21 +63,43 @@ export default function SupplyContracts({ onNavigate }) {
     setDetail(id)
     setDetailData(null)
     setScheduleData(null)
-    const [d, sched] = await Promise.all([
-      api.supplyContracts.get(id),
-      api.supplyContracts.getScheduleTemplate(id).catch(() => null),
-    ])
-    setDetailData(d)
-    setScheduleData(sched)
+    // كان أي فشل هنا (404/شبكة) بيطلع unhandled rejection والمودال ميفتحش من غير أي رسالة
+    try {
+      const [d, sched] = await Promise.all([
+        api.supplyContracts.get(id),
+        api.supplyContracts.getScheduleTemplate(id).catch(() => null),
+      ])
+      setDetailData(d)
+      setScheduleData(sched)
+    } catch (e) {
+      toast(e?.message || 'تعذّر تحميل بيانات العقد', 'error')
+      setDetail(null)
+    }
   }
 
   const openScheduleModal = (contractId) => {
-    setScheduleRows([{ label: '', pct: '', days_offset: '0' }])
+    // "تعديل الخطة" كان بيفتح فاضي ويمسح الخطة الحالية عند الحفظ — نملأ الصفوف بالخطة الموجودة
+    const existing = (contractId === detail && scheduleData?.installments?.length)
+      ? scheduleData.installments.map(ins => ({
+          label: ins.label || '', pct: String(ins.pct ?? ''), days_offset: String(ins.days_offset ?? 0),
+        }))
+      : [{ label: '', pct: '', days_offset: '0' }]
+    setScheduleRows(existing)
     setScheduleModal(contractId)
   }
 
   const handleSaveSchedule = async () => {
     await act(async () => {
+      for (const r of scheduleRows) {
+        const pct = Number(r.pct)
+        if (r.pct === '' || !Number.isFinite(pct) || pct <= 0 || pct > 100) {
+          toast('نسبة كل قسط لازم تكون أكبر من صفر ولا تتجاوز 100%', 'error'); return
+        }
+        const days = Number(r.days_offset || 0)
+        if (!Number.isInteger(days) || days < 0) {
+          toast('عدد أيام الاستحقاق لازم يكون عدد صحيح (صفر أو أكثر)', 'error'); return
+        }
+      }
       const total = scheduleRows.reduce((s, r) => s + Number(r.pct || 0), 0)
       if (Math.abs(total - 100) > 0.01) {
         toast(`مجموع النسب ${total.toFixed(1)}% — يجب أن يساوي 100%`, 'error')
@@ -99,6 +129,10 @@ export default function SupplyContracts({ onNavigate }) {
 
   const handleConfirmDelivery = async () => {
     await act(async () => {
+      if (!deliverForm.delivery_date) { toast('أدخل تاريخ التسليم', 'error'); return }
+      if (detailData && detailData.id === deliverModal && detailData.date && deliverForm.delivery_date < detailData.date) {
+        toast('تاريخ التسليم لا يمكن أن يكون قبل تاريخ العقد', 'error'); return
+      }
       const res = await api.supplyContracts.deliver(deliverModal, {
         delivery_date:  deliverForm.delivery_date || null,
         received_by:    deliverForm.received_by || null,
@@ -110,7 +144,7 @@ export default function SupplyContracts({ onNavigate }) {
         driver_license: deliverForm.driver_license || null,
         driver_phone:   deliverForm.driver_phone || null,
       })
-      toast(`✅ تم تأكيد التسليم${res.invoice_code ? ` — فاتورة مبيعات ${res.invoice_code} أُنشئت تلقائياً` : ''}`)
+      toast(`✅ تم تأكيد التسليم${res?.invoice_code ? ` — فاتورة مبيعات ${res.invoice_code} أُنشئت تلقائياً` : ''}`)
       const cid = deliverModal
       setDeliverModal(null)
       openDetail(cid); reload()
@@ -118,6 +152,7 @@ export default function SupplyContracts({ onNavigate }) {
   }
 
   const handleDeleteSchedule = async (contractId) => {
+    setConfirmDelSched(null)
     await act(async () => {
       await api.supplyContracts.deleteScheduleTemplate(contractId)
       toast('تم حذف خطة الأقساط')
@@ -126,10 +161,13 @@ export default function SupplyContracts({ onNavigate }) {
   }
 
   const addLine = () => {
-    if (!newLine.description || !newLine.unit_price) {
+    if (!String(newLine.description || '').trim() || newLine.unit_price === '' || newLine.unit_price == null) {
       toast('أدخل الوصف والسعر قبل إضافة البند', 'error')
       return
     }
+    const q = Number(newLine.qty), p = Number(newLine.unit_price)
+    if (!Number.isFinite(q) || q <= 0) { toast('كمية البند يجب أن تكون أكبر من صفر', 'error'); return }
+    if (!Number.isFinite(p) || p < 0)  { toast('سعر الوحدة لا يمكن أن يكون سالباً', 'error'); return }
     setForm(f => ({ ...f, lines: [...f.lines, { ...newLine }] }))
     setNewLine(EMPTY_LINE)
   }
@@ -146,6 +184,15 @@ export default function SupplyContracts({ onNavigate }) {
     await act(async () => {
       if (!form.customer_id || !form.date) { toast('اختر العميل والتاريخ', 'error'); return }
       if (!form.lines.length) { toast('أضف بنداً واحداً على الأقل', 'error'); return }
+      if (form.valid_until && form.valid_until < form.date) { toast('تاريخ صلاحية العقد يجب أن يكون بعد تاريخه', 'error'); return }
+      // كان Number(...) || 12 بيحوّل صفر (بدون ضمان) لـ 12 شهر بصمت
+      const months = form.warranty_months === '' ? 12 : Number(form.warranty_months)
+      if (!Number.isInteger(months) || months < 0) { toast('فترة الضمان لازم تكون عدد صحيح من الشهور (صفر أو أكثر)', 'error'); return }
+      const taxPct = Number(form.tax_pct || 0), disc = Number(form.discount_amt || 0)
+      if (!Number.isFinite(taxPct) || taxPct < 0 || taxPct > 100) { toast('نسبة الضريبة لازم تكون بين 0 و 100', 'error'); return }
+      const sub = form.lines.reduce((s,l) => s + Number(l.qty||0)*Number(l.unit_price||0), 0)
+      if (!Number.isFinite(disc) || disc < 0) { toast('الخصم لا يمكن أن يكون سالباً', 'error'); return }
+      if (disc > sub + 0.001) { toast('الخصم لا يمكن أن يتجاوز إجمالي البنود', 'error'); return }
       const payload = {
         customer_id:          Number(form.customer_id),
         quotation_id:         form.quotation_id ? Number(form.quotation_id) : null,
@@ -153,7 +200,7 @@ export default function SupplyContracts({ onNavigate }) {
         valid_until:          form.valid_until || null,
         payment_terms:        form.payment_terms || null,
         delivery_terms:       form.delivery_terms || null,
-        warranty_months:      Number(form.warranty_months) || 12,
+        warranty_months:      months,
         warranty_description: form.warranty_description || null,
         tax_pct:              form.tax_pct || '0',
         discount_amt:         form.discount_amt || '0',
@@ -198,6 +245,7 @@ export default function SupplyContracts({ onNavigate }) {
   }
 
   const handleCancel = async (id) => {
+    setConfirmCancel(null)
     await act(async () => {
       await api.supplyContracts.cancel(id)
       toast('تم إيقاف العقد')
@@ -255,7 +303,11 @@ export default function SupplyContracts({ onNavigate }) {
           {onNavigate && (
             <button className="btn-secondary" onClick={() => onNavigate('deliverynotes')}>🚛 سندات التوريد</button>
           )}
-          <button className="btn-primary" onClick={() => setShowCreate(true)}>+ عقد جديد</button>
+          <button className="btn-primary" onClick={() => {
+            // تحديث التاريخ الافتراضي لو النموذج لسه فاضي (الصفحة ممكن تفضل مفتوحة لأيام)
+            setForm(f => (f.lines.length || f.customer_id) ? f : { ...EMPTY_FORM, date: localToday() })
+            setShowCreate(true)
+          }}>+ عقد جديد</button>
         </div>
       </div>
 
@@ -370,8 +422,8 @@ export default function SupplyContracts({ onNavigate }) {
                   {scheduleData?.installments?.length ? '✏️ تعديل الخطة' : '+ إضافة خطة أقساط'}
                 </button>
                 {scheduleData?.installments?.length > 0 && (
-                  <button className="btn btn-sm" style={{ color:'var(--red)' }}
-                    onClick={() => handleDeleteSchedule(detail)}>
+                  <button className="btn btn-sm" style={{ color:'var(--red)' }} disabled={acting}
+                    onClick={() => setConfirmDelSched(detail)}>
                     🗑️ حذف
                   </button>
                 )}
@@ -462,7 +514,7 @@ export default function SupplyContracts({ onNavigate }) {
             )}
             {detailData.status === 'active' && (
               <button className="btn-secondary" style={{ color:'var(--red)' }}
-                onClick={() => handleCancel(detail)} disabled={acting}>
+                onClick={() => setConfirmCancel(detail)} disabled={acting}>
                 ✕ إيقاف العقد
               </button>
             )}
@@ -485,12 +537,12 @@ export default function SupplyContracts({ onNavigate }) {
             </Select>
             <Input label="تاريخ العقد *" type="date" value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} />
             <Input label="صالح حتى" type="date" value={form.valid_until} onChange={e => setForm(f => ({ ...f, valid_until: e.target.value }))} />
-            <Input label="فترة الضمان (شهر)" type="number" value={form.warranty_months} onChange={e => setForm(f => ({ ...f, warranty_months: e.target.value }))} />
+            <Input label="فترة الضمان (شهر)" type="number" min="0" step="1" value={form.warranty_months} onChange={e => setForm(f => ({ ...f, warranty_months: e.target.value }))} />
             <div style={{ gridColumn: '1 / -1' }}>
               <Textarea label="ما يشمله الضمان" value={form.warranty_description || ''} onChange={e => setForm(f => ({ ...f, warranty_description: e.target.value }))} placeholder="وصف تفصيلي لما يغطيه الضمان..." />
             </div>
-            <Input label="ضريبة %" type="number" value={form.tax_pct} onChange={e => setForm(f => ({ ...f, tax_pct: e.target.value }))} />
-            <Input label="خصم (ج.م)" type="number" value={form.discount_amt} onChange={e => setForm(f => ({ ...f, discount_amt: e.target.value }))} />
+            <Input label="ضريبة %" type="number" min="0" max="100" value={form.tax_pct} onChange={e => setForm(f => ({ ...f, tax_pct: e.target.value }))} />
+            <Input label="خصم (ج.م)" type="number" min="0" value={form.discount_amt} onChange={e => setForm(f => ({ ...f, discount_amt: e.target.value }))} />
             <div style={{ gridColumn: '1 / -1' }}>
               <Textarea label="شروط الدفع" value={form.payment_terms} onChange={e => setForm(f => ({ ...f, payment_terms: e.target.value }))} />
             </div>
@@ -514,9 +566,9 @@ export default function SupplyContracts({ onNavigate }) {
             <div style={{ display:'grid', gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr 1fr auto', gap:8, alignItems:'end' }}>
               <Input label="الوصف *" value={newLine.description} onChange={e => setNewLine(n => ({ ...n, description: e.target.value }))} />
               <Input label="الموديل"  value={newLine.model_no}    onChange={e => setNewLine(n => ({ ...n, model_no: e.target.value }))} />
-              <Input label="الكمية"   type="number" value={newLine.qty}        onChange={e => setNewLine(n => ({ ...n, qty: e.target.value }))} />
+              <Input label="الكمية"   type="number" min="0" value={newLine.qty}        onChange={e => setNewLine(n => ({ ...n, qty: e.target.value }))} />
               <Input label="الوحدة"   value={newLine.unit}        onChange={e => setNewLine(n => ({ ...n, unit: e.target.value }))} />
-              <Input label="السعر *"  type="number" value={newLine.unit_price} onChange={e => setNewLine(n => ({ ...n, unit_price: e.target.value }))} />
+              <Input label="السعر *"  type="number" min="0" value={newLine.unit_price} onChange={e => setNewLine(n => ({ ...n, unit_price: e.target.value }))} />
               <Select label="مادة (مخزون)" value={newLine.material_id} onChange={e => setNewLine(n => ({ ...n, material_id: e.target.value }))}
                 options={[{ value:'', label:'— اختياري —' }, ...(materials||[]).map(m => ({ value: String(m.id), label: m.name_ar || m.name || m.code }))]} />
               <button className="btn-teal" style={{ padding:'8px 14px' }} onClick={addLine}>+</button>
@@ -678,9 +730,32 @@ export default function SupplyContracts({ onNavigate }) {
 
       <ConfirmDialog
         open={!!confirmDel}
+        title="حذف العقد"
         message="هل تريد حذف هذا العقد نهائياً؟"
+        confirmLabel="حذف"
+        confirmVariant="danger"
         onConfirm={() => { handleDelete(confirmDel); setConfirmDel(null) }}
         onCancel={() => setConfirmDel(null)}
+      />
+
+      <ConfirmDialog
+        open={!!confirmCancel}
+        title="إيقاف العقد"
+        message="بعد إيقاف العقد لا يمكن إعادة تفعيله أو تأكيد تسليمه. هل تريد المتابعة؟"
+        confirmLabel="إيقاف العقد"
+        confirmVariant="danger"
+        onConfirm={() => handleCancel(confirmCancel)}
+        onCancel={() => setConfirmCancel(null)}
+      />
+
+      <ConfirmDialog
+        open={!!confirmDelSched}
+        title="حذف خطة الأقساط"
+        message="هل تريد حذف خطة الأقساط لهذا العقد؟"
+        confirmLabel="حذف"
+        confirmVariant="danger"
+        onConfirm={() => handleDeleteSchedule(confirmDelSched)}
+        onCancel={() => setConfirmDelSched(null)}
       />
     </div>
   )
