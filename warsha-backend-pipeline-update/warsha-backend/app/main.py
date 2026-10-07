@@ -53,10 +53,15 @@ from app.api.warranty_certs        import router as warranty_router, print_route
 from app.api.delivery_orders       import router as delivery_orders_router
 from app.api.catalog        import router as catalog_router
 from app.api.super_admin    import router as super_admin_router
+from app.api.audit          import router as audit_router
+from app.api.approvals      import router as approvals_router
+from app.api.backups        import router as backups_router, sa_router as backups_sa_router
+from app.services.approvals import ApprovalRequired, approval_required_handler
 
 # ── Multi-tenancy: middleware + event listeners ─────────────
 from app.core.tenant_middleware import TenantMiddleware
 from app.core import tenant_events  # noqa: F401
+from app.core import audit_events  # noqa: F401
 from app.desktop import init_db
 
 
@@ -66,9 +71,25 @@ async def lifespan(app: FastAPI):
     # ── خدمة خلفية: تحديث حالة الأقساط المتأخرة كل ساعة ──
     from app.services.installment_scheduler import start_installment_scheduler
     scheduler_task = asyncio.create_task(start_installment_scheduler())
+    # ── خدمة خلفية: تنظيف سجل التدقيق حسب مدة الاحتفاظ (يومياً) ──
+    from app.services.audit_retention import start_audit_retention_scheduler
+    audit_retention_task = asyncio.create_task(start_audit_retention_scheduler())
+    # ── خدمة خلفية: نسخ احتياطي تلقائي يومي (ERP_BACKUP_AUTO=0 لإيقافه) ──
+    from app.services.backup_scheduler import start_backup_scheduler
+    backup_task = asyncio.create_task(start_backup_scheduler())
     try:
         yield
     finally:
+        backup_task.cancel()
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
+        audit_retention_task.cancel()
+        try:
+            await audit_retention_task
+        except asyncio.CancelledError:
+            pass
         scheduler_task.cancel()
         try:
             await scheduler_task
@@ -127,6 +148,9 @@ async def integrity_error_handler(request: Request, exc: _IntegrityError):
         content={"detail": "تعارض في البيانات — القيمة مستخدمة بالفعل أو السجل مرتبط بسجلات أخرى"},
     )
 
+# دورة الموافقات: الإجراء الحساس مرفوض مؤقتًا لحين الموافقة (428 + code=approval_required)
+app.add_exception_handler(ApprovalRequired, approval_required_handler)
+
 
 # ── Core Modules ──────────────────────────────────────────────
 app.include_router(inventory_router,      prefix="/api/v1")
@@ -179,6 +203,10 @@ app.include_router(warranty_print_router,  prefix="/api/v1")
 app.include_router(catalog_router,         prefix="/api/v1")
 app.include_router(super_admin_router,     prefix="/api/v1")
 app.include_router(delivery_orders_router, prefix="/api/v1")
+app.include_router(audit_router,           prefix="/api/v1")
+app.include_router(approvals_router,       prefix="/api/v1")
+app.include_router(backups_router,         prefix="/api/v1")
+app.include_router(backups_sa_router,      prefix="/api/v1")
 
 
 @app.get("/health")

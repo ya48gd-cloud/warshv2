@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from app.services.analytics import log_event, Events
 from app.core.database import get_db
 from app.api.auth import require_any, get_current_user
+from app.services.approvals import require_approval, to_dec
 from app.models.models import (
     PurchaseOrder, PurchaseOrderLine, Supplier,
     Material, StockMovement, PurchaseInvoice, PurchaseInvoiceLine,
@@ -394,6 +395,15 @@ async def approve_purchase_order(po_id: int, db: AsyncSession = Depends(get_db),
     # أي مورد يتسجل عليه الرصيد — الواجهة أصلاً بتمنع إنشاء أمر بدون مورد.
     if not po.supplier_id:
         raise HTTPException(400, "لا يمكن اعتماد أمر شراء بدون مورد")
+    # دورة الموافقات: اعتماد أمر شراء فوق حد معيّن (مفيش قاعدة = بدون أي تغيير).
+    # قيم عادية فقط (str/Decimal) لأن require_approval قد يعمل rollback.
+    _po_total = to_dec(po.total)
+    await require_approval(
+        db, current_user, "po_approve",
+        entity_type="purchase_order", entity_id=po.id, entity_label=str(po.code),
+        metrics={"amount": _po_total},
+        params={"total": _po_total, "supplier_id": po.supplier_id},
+    )
     po.status = "approved"
     po.approved_at = datetime.utcnow()
     try:

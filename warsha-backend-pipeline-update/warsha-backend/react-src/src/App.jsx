@@ -48,6 +48,9 @@ import InvoicingHub from './pages/InvoicingHub'
 import Equipment  from './pages/Equipment'
 import BOM        from './pages/BOM'
 import SettingsHub from './pages/SettingsHub'
+import ApprovalsHub from './pages/ApprovalsHub'
+import AuditLog from './pages/AuditLog'
+import ApprovalRequiredHost from './components/approvals/ApprovalRequiredHost'
 import Reports    from './pages/Reports'
 import PurchasingHub from './pages/PurchasingHub'
 import Accounting from './pages/Accounting'
@@ -98,6 +101,8 @@ const PAGE_MAP = {
   workcompletioncerts:  CertificatesHub,
   fieldservice:         FieldService,
   installments:         Installments,
+  approvals:            ApprovalsHub,
+  auditlog:             AuditLog,
 }
 
 // مفاتيح صفحات قديمة/بديلة ما زالت تُستدعى من بعض الصفحات (مثل Dashboard و
@@ -217,6 +222,7 @@ export default function App() {
             </ErrorBoundary>
           </main>
         </div>
+        <ApprovalRequiredHost onNavigate={navigate} />
       </div>
     </ErrorBoundary>
   )

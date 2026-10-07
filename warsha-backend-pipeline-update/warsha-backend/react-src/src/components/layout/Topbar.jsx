@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { ROLE_META } from '../../store/auth'
 import api from '../../api/client'
+import { useApprovalsBadge } from '../../hooks/useApprovalsBadge'
 
 const PAGE_TITLES = {
   dashboard:  'لوحة التحكم',
@@ -40,6 +41,8 @@ const PAGE_TITLES = {
   supplycontracts: 'عقود التوريد',
   deliverynotes:   'أوامر التوريد',
   workcompletioncerts: 'الشهادات (إتمام/ضمان)',
+  approvals:       'الموافقات',
+  auditlog:        'سجل التدقيق',
 }
 
 // ── Global Search ─────────────────────────────────────────────
@@ -301,6 +304,40 @@ function NotificationBell() {
   )
 }
 
+// ── Approvals Bell ────────────────────────────────────────────
+function ApprovalsBell({ onNavigate, role }) {
+  const { pending, ready, available } = useApprovalsBadge(!!role && role !== 'viewer')
+  if (!available) return null
+  const bubble = (side, bg) => ({
+    position: 'absolute', top: -5, [side]: -5, background: bg,
+    color: '#fff', borderRadius: '50%', fontSize: 9, fontWeight: 700,
+    width: 16, height: 16, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    border: '2px solid var(--bg)',
+  })
+  return (
+    <button
+      type="button"
+      onClick={() => onNavigate?.('approvals', { tab: pending > 0 ? 'inbox' : (ready > 0 ? 'mine' : (role === 'production' ? 'mine' : 'inbox')) })}
+      style={{
+        position: 'relative', background: 'none', flexShrink: 0,
+        border: '1px solid var(--erp-border)', borderRadius: 8,
+        padding: '5px 9px', cursor: 'pointer', fontSize: 15, lineHeight: 1,
+        color: 'var(--erp-text)',
+      }}
+      onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-card)'}
+      onMouseLeave={e => e.currentTarget.style.background = 'none'}
+      title={pending > 0 ? `${pending} طلب موافقة بانتظار قرارك` : 'الموافقات'}
+      aria-label="الموافقات"
+    >
+      ✅
+      {pending > 0 && <span style={bubble('left', '#ef4444')}>{pending > 9 ? '9+' : pending}</span>}
+      {ready > 0 && (
+        <span style={bubble('right', '#16a34a')} title="طلبات تمت الموافقة عليها وتنتظر إعادة التنفيذ">{ready > 9 ? '9+' : ready}</span>
+      )}
+    </button>
+  )
+}
+
 // ── Main Topbar ───────────────────────────────────────────────
 export default function Topbar({ page, onRefresh, user, onAddClick, showAdd, onNavigate }) {
   const meta = user ? ROLE_META[user.role] : null
@@ -317,6 +354,7 @@ export default function Topbar({ page, onRefresh, user, onAddClick, showAdd, onN
       <GlobalSearch onNavigate={onNavigate} />
 
       <div className="flex items-center gap-2 flex-shrink-0">
+        <ApprovalsBell onNavigate={onNavigate} role={user?.role} />
         <NotificationBell />
 
         {meta && (

@@ -20,6 +20,7 @@ from app.models.models import (
     PaymentScheduleTemplate,
 )
 from app.services.invoice_due import sync_invoice_due_date
+from app.services.approvals import require_approval, to_dec
 from app.services.auto_journal import (
     journal_sales_invoice_create, journal_sales_invoice_payment,
     journal_sales_invoice_delete, journal_cogs,
@@ -508,7 +509,8 @@ async def get_quotation_payment_template(qid: int, db: AsyncSession = Depends(ge
 
 
 @router.post("/quotations/{qid}/to-invoice")
-async def quotation_to_invoice(qid: int, invoice_code: str, db: AsyncSession = Depends(get_db)):
+async def quotation_to_invoice(qid: int, invoice_code: str, db: AsyncSession = Depends(get_db),
+                                current_user: dict = Depends(get_current_user)):
     """تحويل عرض سعر إلى فاتورة"""
     from app.core.database import current_tenant_id as _ctid_q2i
     _tid_q2i = _ctid_q2i.get() or 1
@@ -535,6 +537,15 @@ async def quotation_to_invoice(qid: int, invoice_code: str, db: AsyncSession = D
         raise HTTPException(400, f"رقم الفاتورة '{invoice_code}' مستخدم بالفعل")
     # تحقق حد الائتمان
     await _check_credit_limit(db, q.customer_id, q.total)
+    # دورة الموافقات: خصم على الفاتورة (نفس قاعدة create_invoice حتى لا يُتحايل عبر التحويل)
+    _q_pct, _q_amt, _q_total = to_dec(q.discount_pct), to_dec(q.discount_amt), to_dec(q.total)
+    if _q_pct > 0 or _q_amt > 0:
+        await require_approval(
+            db, current_user, "invoice_discount",
+            entity_type="quotation", entity_id=qid, entity_label=str(q.code),
+            metrics={"percent": _q_pct, "amount": _q_amt},
+            params={"quotation_id": qid, "discount_pct": _q_pct, "total": _q_total},
+        )
     inv = Invoice(
         tenant_id=_tid_q2i,
         code=invoice_code, customer_id=q.customer_id, location_id=q.location_id, quotation_id=qid,
@@ -634,7 +645,8 @@ async def _issue_fg_for_wo_invoice(db: AsyncSession, tid: int, wo: WorkOrder, in
 
 
 @router.post("/invoices", status_code=201)
-async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db)):
+async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db),
+                         current_user: dict = Depends(get_current_user)):
     if not data.lines:
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
     # إصلاح ثغرة تحقق: إنشاء فاتورة لعميل رقمه غير موجود (أو تابع لـ tenant
@@ -664,6 +676,17 @@ async def create_invoice(data: InvoiceIn, db: AsyncSession = Depends(get_db)):
     # فيرجع 500 بدل رسالة واضحة
     if await db.scalar(select(Invoice.id).where(Invoice.code == code)):
         raise HTTPException(400, f"رقم الفاتورة '{code}' مستخدم بالفعل")
+    # دورة الموافقات: خصم على الفاتورة فوق حد (نسبة/قيمة). بدون خصم لا يُستدعى أصلاً.
+    _c_pct, _c_amt = to_dec(data.discount_pct), to_dec(disc_amt)
+    if _c_pct > 0 or _c_amt > 0:
+        await require_approval(
+            db, current_user, "invoice_discount",
+            entity_type="invoice", entity_id=None, entity_label=str(code),
+            metrics={"percent": _c_pct, "amount": _c_amt},
+            params={"customer_id": data.customer_id, "discount_pct": _c_pct,
+                    "subtotal": to_dec(subtotal), "tax_pct": to_dec(data.tax_pct),
+                    "work_order_id": data.work_order_id, "quotation_id": data.quotation_id},
+        )
     inv = Invoice(
         tenant_id=_tid,
         code=code, customer_id=data.customer_id, quotation_id=data.quotation_id,
@@ -712,7 +735,8 @@ async def get_invoice(iid: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/invoices/{iid}")
-async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(get_db)):
+async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(get_db),
+                         current_user: dict = Depends(get_current_user)):
     inv = await db.get(Invoice, iid)
     if not inv: raise HTTPException(404)
     if not data.lines:
@@ -760,6 +784,19 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
             f"لا يمكن تعديل بنود الفاتورة — الإجمالي الجديد ({float(new_total):,.2f}) "
             f"يختلف عن مجموع خطة الأقساط الحالية ({float(schedule_total):,.2f}). "
             f"عدّل خطة الأقساط أولاً (أو احذفها/استبدلها) ثم عدّل الفاتورة.",
+        )
+
+    # دورة الموافقات: رفع/تغيير الخصم (الجديد > 0 ويختلف عن المخزَّن). تعديل البنود/الملاحظات
+    # من غير تغيير الخصم لا يحتاج موافقة. قبل أول تعديل (رصيد العميل تحته).
+    _u_pct, _u_amt = to_dec(data.discount_pct), to_dec(disc_amt)
+    if (_u_pct > 0 or _u_amt > 0) and (
+        _u_pct != to_dec(inv.discount_pct) or _u_amt != to_dec(inv.discount_amt)
+    ):
+        await require_approval(
+            db, current_user, "invoice_discount",
+            entity_type="invoice", entity_id=iid, entity_label=str(inv.code),
+            metrics={"percent": _u_pct, "amount": _u_amt},
+            params={"invoice_id": iid, "discount_pct": _u_pct, "subtotal": to_dec(subtotal)},
         )
 
     # رصيد العميل القديم: نرجّع الإجمالي الكامل لأنه خُصم كاملاً عند الإنشاء
@@ -1346,7 +1383,8 @@ async def run_installment_scheduler_now(
 
 
 @router.delete("/invoices/{iid}")
-async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db)):
+async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db),
+                         current_user: dict = Depends(get_current_user)):
     inv = await db.get(Invoice, iid)
     if not inv: raise HTTPException(404)
     # إصلاح ثغرة تكامل: حذف فاتورة عليها دفعات مسجّلة كان يعكس القيد المحاسبي
@@ -1371,6 +1409,16 @@ async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db)):
 
     from app.core.database import current_tenant_id as _ctid_del
     _tid_del = _ctid_del.get() or 1
+
+    # دورة الموافقات: حذف/إلغاء فاتورة صادرة. بعد كل الحراس وقبل أي عكس (مخزون/قيد/رصيد)،
+    # فالعكس الكامل بيتنفذ مرة واحدة بعد الموافقة وما فيش حالة نصف منفّذة.
+    _del_total = to_dec(inv.total)
+    await require_approval(
+        db, current_user, "invoice_delete",
+        entity_type="invoice", entity_id=iid, entity_label=str(inv.code),
+        metrics={"amount": _del_total},
+        params={"invoice_id": iid, "total": _del_total},
+    )
 
     # إصلاح ثغرة تكامل: فاتورة أمر الإنتاج (work_order_to_invoice) بتخصم رصيد
     # تام الصنع (FG) وتسجّل قيد COGS — حذفها كان بيعكس الإيراد بس ويسيب
@@ -1610,7 +1658,8 @@ async def order_to_work_order(order_id: int, data: OrderToWorkOrderRequest,
 
 @router.post("/work-orders/{wo_id}/to-invoice", status_code=201)
 async def work_order_to_invoice(wo_id: int, data: WorkOrderToInvoiceRequest,
-                                db: AsyncSession = Depends(get_db)):
+                                db: AsyncSession = Depends(get_db),
+                                current_user: dict = Depends(get_current_user)):
     """
     تحويل أمر إنتاج → فاتورة مبيعات.
     يستخدم actual_cost أو planned_cost كسعر البند الوحيد للفاتورة.
@@ -1662,6 +1711,16 @@ async def work_order_to_invoice(wo_id: int, data: WorkOrderToInvoiceRequest,
 
     # تحقق حد الائتمان قبل إنشاء الفاتورة
     await _check_credit_limit(db, wo.customer_order.customer_id, total)
+
+    # دورة الموافقات: خصم على فاتورة أمر الإنتاج (نفس قاعدة create_invoice)
+    _w_pct, _w_amt, _w_total = to_dec(data.discount_pct), to_dec(disc_amt), to_dec(total)
+    if _w_pct > 0 or _w_amt > 0:
+        await require_approval(
+            db, current_user, "invoice_discount",
+            entity_type="work_order", entity_id=wo_id, entity_label=str(wo.code),
+            metrics={"percent": _w_pct, "amount": _w_amt},
+            params={"work_order_id": wo_id, "discount_pct": _w_pct, "total": _w_total},
+        )
 
     inv = Invoice(
         tenant_id=tid,

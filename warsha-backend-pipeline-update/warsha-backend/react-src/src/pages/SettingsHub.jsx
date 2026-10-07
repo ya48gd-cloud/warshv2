@@ -5,20 +5,25 @@ import { useState } from 'react'
 import { useAuth } from '../store/auth'
 import Users from './Users'
 import WorkshopProfile from './WorkshopProfile'
+import TenantBackup from './TenantBackup'
 
 const TABS = [
   { key: 'users',    label: '👥 المستخدمون' },
   { key: 'workshop', label: '🏭 بروفايل الورشة' },
+  { key: 'backup',   label: '💾 النسخ الاحتياطي' },
 ]
 
-export default function SettingsHub() {
+// تبويبات للمدير (admin) فقط
+const ADMIN_ONLY_TABS = ['workshop', 'backup']
+
+export default function SettingsHub({ onNavigate }) {
   const { user: me } = useAuth()
   const [activeTab, setActiveTab] = useState('users')
 
   // إصلاح: تبويب "بروفايل الورشة" كان ظاهراً وقابلاً للتعديل لكل الأدوار
   // (حتى "مشاهد" read-only) رغم أن هذه بيانات على مستوى الورشة كلها —
   // نعرضه للمديرين فقط، ونمنع البقاء على تبويب غير متاح لو تغيّر الدور.
-  const tabs = me?.role === 'admin' ? TABS : TABS.filter(t => t.key !== 'workshop')
+  const tabs = me?.role === 'admin' ? TABS : TABS.filter(t => !ADMIN_ONLY_TABS.includes(t.key))
   const currentTab = tabs.some(t => t.key === activeTab) ? activeTab : tabs[0]?.key
 
   return (
@@ -38,8 +43,9 @@ export default function SettingsHub() {
         ))}
       </div>
 
-      {currentTab === 'users'    && <Users />}
+      {currentTab === 'users'    && <Users onNavigate={onNavigate} />}
       {currentTab === 'workshop' && <WorkshopProfile />}
+      {currentTab === 'backup'   && <TenantBackup />}
     </div>
   )
 }

@@ -12,6 +12,9 @@ export function ToastProvider({ children }) {
     // حماية: رسالة undefined/كائن (مثلاً err.message فاضية) كانت بتكسر msg.length
     msg = msg == null ? '' : (typeof msg === 'string' ? msg : (msg.message || String(msg)))
     if (!msg) msg = type === 'error' ? 'حدث خطأ غير متوقع' : 'تم'
+    // رسالة approval_required بتظهر في نافذة الموافقات العامة — نتجاهل نفس النص كـ toast لمدة 3 ثواني
+    const sup = typeof window !== 'undefined' ? window.__ERP_APPROVAL_SUPPRESS__ : null
+    if (type === 'error' && sup && sup.msg && sup.msg === msg && Date.now() - sup.ts < 3000) return
     const id = ++counter.current
     // إصلاح شكوى متكررة: مدة العرض كانت ثابتة (3.2 ثانية) لكل رسالة —
     // رسالة خطأ طويلة (زي "الكمية المتاحة غير كافية — الرصيد الكلي...")

@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field, validator
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, get_current_user
+from app.services.approvals import require_approval, to_dec
 from app.models.models import (
     Treasury, TreasuryCategory, TreasuryTransaction,
 )
@@ -505,7 +506,8 @@ async def list_transactions(
 
 
 @router.post("/transactions", status_code=201)
-async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db)):
+async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db),
+                             current_user: dict = Depends(get_current_user)):
     if data.direction not in ("in", "out"):
         raise HTTPException(400, "الاتجاه لازم يكون in أو out")
     amt = _money(data.amount)
@@ -528,6 +530,17 @@ async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db)):
         if amt > current:
             raise HTTPException(400,
                 f"الرصيد الحالي للخزنة ({float(current):,.2f}) أقل من المبلغ المطلوب صرفه ({float(amt):,.2f})")
+    # دورة الموافقات: صرف من الخزنة فوق حد (الإيداع "in" لا يتأثر). بعد كل التحققات وقبل أي تعديل.
+    if data.direction == "out":
+        _t_amt = to_dec(amt)
+        await require_approval(
+            db, current_user, "treasury_out",
+            entity_type="treasury_transaction", entity_id=None,
+            entity_label=(data.description or "صرف من الخزنة"),
+            metrics={"amount": _t_amt},
+            params={"treasury_id": data.treasury_id, "amount": _t_amt,
+                    "category_id": data.category_id, "payment_method": payment_method},
+        )
     receipt_no = await _next_receipt_no(db, data.direction)
     x = TreasuryTransaction(
         tenant_id=tid,
@@ -569,7 +582,8 @@ async def create_transaction(data: TxnIn, db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/transactions/{txn_id}")
-async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depends(get_db)):
+async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depends(get_db),
+                             current_user: dict = Depends(get_current_user)):
     """تعديل حركة خزينة — مسموح فقط للحركات اليدوية غير المقاصة"""
     from app.core.database import current_tenant_id as _ctid_utx
     tid = _ctid_utx.get() or 1
@@ -602,6 +616,19 @@ async def update_transaction(txn_id: int, data: TxnIn, db: AsyncSession = Depend
             raise HTTPException(404, "الخزنة غير موجودة")
     await _get_category_checked(db, tid, data.category_id, data.direction)
     _before_bal = await _balances_snapshot(db, [x.treasury_id, data.treasury_id])
+
+    # دورة الموافقات: تعديل يزوّد المصروف (out) فقط — خفض المبلغ أو تعديل حقول أخرى لا يحتاج موافقة.
+    # قبل عكس القيد/الرصيد القديم (أول تعديل فعلي).
+    _new_out = to_dec(amt) if data.direction == "out" else to_dec(0)
+    _old_out = to_dec(x.amount) if (x.direction == "out" and old_balance_active) else to_dec(0)
+    if _new_out > _old_out:
+        await require_approval(
+            db, current_user, "treasury_out",
+            entity_type="treasury_transaction", entity_id=txn_id,
+            entity_label=(data.description or "صرف من الخزنة"),
+            metrics={"amount": _new_out},
+            params={"txn_id": txn_id, "treasury_id": data.treasury_id, "amount": _new_out},
+        )
 
     # عكس القيد المحاسبي القديم المرتبط بالحركة — وإلا يفضل قيد بالبيانات القديمة
     # في دليل الحسابات (COA) بعد ما نعدّل بيانات الحركة، وميزان المراجعة يبقى غير متوافق

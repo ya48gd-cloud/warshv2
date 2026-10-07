@@ -9,7 +9,7 @@ from typing import Optional, List
 
 from sqlalchemy import (
     String, Numeric, Integer, Boolean, Text, DateTime, Date, JSON,
-    ForeignKey, func, UniqueConstraint
+    ForeignKey, func, UniqueConstraint, Index, BigInteger
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
@@ -2141,3 +2141,159 @@ class AnalyticsEvent(Base):
     # اسم الـ endpoint اللي أطلق الحدث، لتحليل استخدام الميزات (feature adoption)
     source_path: Mapped[Optional[str]]       = mapped_column(String(200), nullable=True)
     created_at:  Mapped[datetime]            = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ===== FEATURE: audit (سجل التدقيق) =====
+# سجل تدقيق غير قابل للتعديل: مين أضاف/عدّل/حذف إيه ومتى وبأي قيم قبل/بعد.
+# الالتقاط مركزي عبر app/core/audit_events.py (Session events) — لا يلمس أي endpoint.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        Index("ix_audit_tenant_created", "tenant_id", "created_at"),
+        Index("ix_audit_tenant_entity", "tenant_id", "entity_type", "entity_id"),
+        Index("ix_audit_tenant_user", "tenant_id", "user_id", "created_at"),
+        Index("ix_audit_tenant_action", "tenant_id", "action", "created_at"),
+    )
+    id:          Mapped[int]                = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    # بدون ForeignKey عمدًا: سجل التدقيق يبقى حتى لو الورشة اتشالت
+    tenant_id:   Mapped[int]                = mapped_column(Integer, nullable=False)
+    created_at:  Mapped[datetime]           = mapped_column(DateTime, nullable=False)
+    user_id:     Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    user_name:   Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    action:      Mapped[str]                = mapped_column(String(20), nullable=False)
+    entity_type: Mapped[Optional[str]]      = mapped_column(String(60), nullable=True)
+    entity_id:   Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    entity_ref:  Mapped[Optional[str]]      = mapped_column(String(200), nullable=True)
+    summary:     Mapped[Optional[str]]      = mapped_column(String(300), nullable=True)
+    changes:     Mapped[Optional[dict]]     = mapped_column(JSON, nullable=True)
+    extra:       Mapped[Optional[dict]]     = mapped_column(JSON, nullable=True)
+    ip:          Mapped[Optional[str]]      = mapped_column(String(64), nullable=True)
+    path:        Mapped[Optional[str]]      = mapped_column(String(200), nullable=True)
+    request_id:  Mapped[Optional[str]]      = mapped_column(String(36), nullable=True)
+
+
+class AuditSetting(Base):
+    """إعداد مدة الاحتفاظ بسجل التدقيق لكل ورشة (لا صف = القيمة الافتراضية من البيئة)."""
+    __tablename__ = "audit_settings"
+    __table_args__ = (UniqueConstraint("tenant_id", name="uq_audit_setting_tenant"),)
+    id:             Mapped[int]            = mapped_column(primary_key=True)
+    tenant_id:      Mapped[int]            = mapped_column(ForeignKey("tenants.id"), index=True)
+    # 0 = احتفاظ دائم، 90..3650 = أيام
+    retention_days: Mapped[Optional[int]]  = mapped_column(Integer, nullable=True)
+    updated_by:     Mapped[Optional[int]]  = mapped_column(Integer, nullable=True)
+    updated_at:     Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ===== APPROVALS FEATURE =====
+# دورة الموافقات: قواعد (متى يحتاج الإجراء موافقة؟) وطلبات (حالة كل طلب).
+# الخدمة العامة: app/services/approvals.py — require_approval(...)
+# requested_by/decided_by/consumed_by أعمدة Integer بدون FK عمدًا (يبقى السجل
+# التاريخي حتى لو اتحذف المستخدم)، ومعاها لقطة باسم المستخدم.
+# ═════════════════════════════════════════════════════════════════════════════
+
+from sqlalchemy import text as _approvals_sa_text  # noqa: E402
+
+
+class ApprovalRule(Base):
+    __tablename__ = "approval_rules"
+    __table_args__ = (
+        Index("ix_approval_rule_tenant_action", "tenant_id", "action_key", "is_active"),
+    )
+    id:             Mapped[int]                 = mapped_column(primary_key=True)
+    tenant_id:      Mapped[int]                 = mapped_column(ForeignKey("tenants.id"), index=True)
+    name:           Mapped[str]                 = mapped_column(String(100))
+    # po_approve | invoice_discount | invoice_delete | worker_advance | credit_note_issue | treasury_out
+    action_key:     Mapped[str]                 = mapped_column(String(40))
+    # always | amount_gt | percent_gt
+    condition_type: Mapped[str]                 = mapped_column(String(20), default="amount_gt")
+    threshold:      Mapped[Optional[Decimal]]   = mapped_column(Numeric(14, 2), nullable=True)
+    # admin | accountant
+    required_role:  Mapped[str]                 = mapped_column(String(20), default="admin")
+    valid_hours:    Mapped[int]                 = mapped_column(Integer, default=24)
+    # CSV من الأدوار المعفاة (admin,accountant,production)
+    exempt_roles:   Mapped[Optional[str]]       = mapped_column(String(100), nullable=True)
+    is_active:      Mapped[bool]                = mapped_column(Boolean, default=True)
+    created_by:     Mapped[Optional[int]]       = mapped_column(Integer, nullable=True)
+    created_at:     Mapped[datetime]            = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at:     Mapped[Optional[datetime]]  = mapped_column(DateTime, nullable=True, onupdate=datetime.utcnow)
+
+
+class ApprovalRequest(Base):
+    __tablename__ = "approval_requests"
+    __table_args__ = (
+        Index("ix_approval_req_tenant_status", "tenant_id", "status"),
+        Index("ix_approval_req_tenant_fp", "tenant_id", "fingerprint"),
+        # يمنع طلبين مفتوحين (pending/approved) لنفس المستخدم ونفس الإجراء (double-click)
+        Index("uq_approval_open_fingerprint", "tenant_id", "requested_by", "fingerprint",
+              unique=True,
+              postgresql_where=_approvals_sa_text("status IN ('pending','approved')"),
+              sqlite_where=_approvals_sa_text("status IN ('pending','approved')")),
+    )
+    id:               Mapped[int]                = mapped_column(primary_key=True)
+    tenant_id:        Mapped[int]                = mapped_column(ForeignKey("tenants.id"), index=True)
+    # بدون FK: تاريخ الطلبات يبقى حتى لو القاعدة اتغيّرت
+    rule_id:          Mapped[Optional[int]]      = mapped_column(Integer, nullable=True, index=True)
+    action_key:       Mapped[str]                = mapped_column(String(40))
+    entity_type:      Mapped[str]                = mapped_column(String(40))
+    entity_id:        Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    entity_label:     Mapped[Optional[str]]      = mapped_column(String(200), nullable=True)
+    fingerprint:      Mapped[str]                = mapped_column(String(64))
+    amount:           Mapped[Optional[Decimal]]  = mapped_column(Numeric(14, 2), nullable=True)
+    percent:          Mapped[Optional[Decimal]]  = mapped_column(Numeric(7, 2), nullable=True)
+    snapshot:         Mapped[Optional[dict]]     = mapped_column(JSON, nullable=True)
+    # pending | approved | rejected | consumed | cancelled | expired
+    status:           Mapped[str]                = mapped_column(String(20), default="pending")
+    required_role:    Mapped[str]                = mapped_column(String(20), default="admin")
+    valid_hours:      Mapped[int]                = mapped_column(Integer, default=24)
+    requested_by:     Mapped[int]                = mapped_column(Integer)
+    requested_by_name: Mapped[Optional[str]]     = mapped_column(String(100), nullable=True)
+    requested_by_role: Mapped[Optional[str]]     = mapped_column(String(20), nullable=True)
+    requested_at:     Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
+    decided_by:       Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    decided_by_name:  Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    decided_at:       Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    decision_reason:  Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    expires_at:       Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    consumed_at:      Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    consumed_by:      Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    created_at:       Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at:       Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, onupdate=datetime.utcnow)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BACKUP & RESTORE (feature: backup)
+# سجل عمليات النسخ الاحتياطي/الاسترجاع/تصدير بيانات الورشة. tenant_id = NULL
+# معناه عملية على مستوى النظام (نسخة كاملة / استرجاع / نسخة أمان / حذف).
+# kind=tenant_export فقط عندها tenant_id (الورشة المصدّرة).
+# ═════════════════════════════════════════════════════════════════════════════
+
+from sqlalchemy import BigInteger as _BackupBigInt  # noqa: E402
+
+
+class BackupRun(Base):
+    __tablename__ = "backup_runs"
+    id:                  Mapped[int]                = mapped_column(primary_key=True)
+    tenant_id:           Mapped[Optional[int]]      = mapped_column(ForeignKey("tenants.id"), nullable=True, index=True)
+    # full_backup | pre_restore | restore | delete | tenant_export
+    kind:                Mapped[str]                = mapped_column(String(30), index=True)
+    # manual | scheduled | pre_restore | restore | delete
+    trigger:             Mapped[str]                = mapped_column(String(20), default="manual")
+    # running | success | failed
+    status:              Mapped[str]                = mapped_column(String(20), default="running", index=True)
+    db_engine:           Mapped[str]                = mapped_column(String(20), default="sqlite")
+    file_name:           Mapped[Optional[str]]      = mapped_column(String(255), nullable=True)
+    file_deleted:        Mapped[bool]               = mapped_column(Boolean, default=False)
+    size_bytes:          Mapped[Optional[int]]      = mapped_column(_BackupBigInt, nullable=True)
+    checksum_sha256:     Mapped[Optional[str]]      = mapped_column(String(64), nullable=True)
+    integrity_ok:        Mapped[Optional[bool]]     = mapped_column(Boolean, nullable=True)
+    created_by:          Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    created_by_user_id:  Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    started_at:          Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    finished_at:         Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error:               Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    details:             Mapped[Optional[dict]]     = mapped_column(JSON, nullable=True)

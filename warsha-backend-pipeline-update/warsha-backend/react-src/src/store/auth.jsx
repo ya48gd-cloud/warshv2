@@ -16,14 +16,14 @@ export const ROLE_NAV = {
                'suppliers','purchaseorders','extprojects','fieldservice','pricecatalog','production','mrp',
                'scrap','stockcount','accounting','treasury',
                'supplycontracts','deliverynotes','workcompletioncerts',
-               'users','reports'],
+               'users','reports','approvals','auditlog'],
   accountant: ['dashboard','analytics','inventory','stockbatches','warehouses','workorders','pipeline','workers','payroll','attendance',
                'customers','orders','invoices','installments','suppliers','purchaseorders','extprojects','fieldservice',
                'pricecatalog','scrap','accounting','treasury',
                'supplycontracts','deliverynotes','workcompletioncerts',
-               'reports','users'],
+               'reports','users','approvals'],
   production: ['dashboard','analytics','inventory','stockbatches','warehouses','workorders','pipeline','equipment','bom',
-               'extprojects','fieldservice','pricecatalog','production','mrp','scrap','stockcount','reports','users'],
+               'extprojects','fieldservice','pricecatalog','production','mrp','scrap','stockcount','reports','users','approvals'],
   viewer:     ['dashboard','analytics','inventory','stockbatches','warehouses','workorders','pipeline','equipment','bom','customers','orders','invoices','installments',
                'supplycontracts','deliverynotes','treasury','reports','users'],
 }
@@ -58,6 +58,8 @@ export function AuthProvider({ children }) {
   }, [])
 
   const logout = useCallback(() => {
+    // يسجّل صف 'logout' في سجل التدقيق — قبل مسح التوكن (يُقرأ synchronously)، بدون انتظار ولا فشل ظاهر
+    api.logout()
     sessionStorage.removeItem('erp_token')
     sessionStorage.removeItem('erp_role')
     sessionStorage.removeItem('erp_tenant_id')

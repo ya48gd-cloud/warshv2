@@ -20,6 +20,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from app.services.analytics import log_event, Events
+from app.services.audit import record_event as _audit_record_event
+import logging as _logging
 
 from app.core.database import get_db, current_tenant_id, _is_sqlite as _DB_IS_SQLITE
 from app.models.models import User, Tenant
@@ -419,6 +421,28 @@ def _login_register_failure(key: str) -> None:
             _login_failures.pop(k, None)
 
 
+_audit_logger = _logging.getLogger("warsha.audit")
+
+
+async def _audit_auth_event(db: AsyncSession, action: str, tenant_id: int, user_id, username,
+                            reason: Optional[str] = None) -> None:
+    """يسجّل حدث دخول/خروج في سجل التدقيق داخل جلسة الطلب ثم commit.
+    لا يكسر الطلب أبداً (أي فشل يُسجَّل كتحذير فقط). لا يُخزَّن أي كلمة مرور."""
+    try:
+        uname = (username or "").strip()[:100] or "?"
+        extra = {"reason": reason, "username_attempted": uname} if reason else None
+        _audit_record_event(
+            db, action, int(tenant_id), user_id=user_id, user_name=uname,
+            entity_type="users", entity_id=user_id, entity_ref=uname, extra=extra)
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        _audit_logger.warning("audit auth event '%s' failed", action, exc_info=True)
+
+
 @router.post("/login")
 async def login(data: LoginIn, request: Request, db: AsyncSession = Depends(get_db)):
     _key = _login_key(request, data.username, data.tenant_slug)
@@ -433,6 +457,7 @@ async def login(data: LoginIn, request: Request, db: AsyncSession = Depends(get_
         if not tenant:
             raise HTTPException(status_code=401, detail="ورشة غير معروفة")
         if not tenant.is_active:
+            await _audit_auth_event(db, "login_failed", tenant.id, None, data.username, "tenant_disabled")
             raise HTTPException(status_code=403, detail="هذه الورشة معطّلة")
         result = await db.execute(
             select(User).where(
@@ -454,12 +479,23 @@ async def login(data: LoginIn, request: Request, db: AsyncSession = Depends(get_
         )
     if not user or not verify_password(data.password, user.password_hash):
         _login_register_failure(_key)
+        # تدقيق: نسجّل فقط لو الورشة معروفة بلا لبس (slug صريح، أو اسم مستخدم موجود في ورشة واحدة فقط)
+        _t_id, _u_id = None, None
+        if data.tenant_slug:
+            _t_id = tenant.id
+            _u_id = user.id if user else None
+        elif len(candidates) == 1:
+            _t_id, _u_id = candidates[0].tenant_id, candidates[0].id
+        if _t_id is not None:
+            await _audit_auth_event(db, "login_failed", _t_id, _u_id, data.username, "bad_password")
         raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة")
     if not user.is_active:
+        await _audit_auth_event(db, "login_failed", user.tenant_id, user.id, data.username, "inactive")
         raise HTTPException(status_code=403, detail="الحساب معطل")
     # SECURITY (fixed): الدخول بدون tenant_slug كان بيتخطى فحص "الورشة معطّلة"
     _user_tenant = await db.get(Tenant, user.tenant_id)
     if _user_tenant is not None and _user_tenant.is_active is False:
+        await _audit_auth_event(db, "login_failed", user.tenant_id, user.id, data.username, "tenant_disabled")
         raise HTTPException(status_code=403, detail="هذه الورشة معطّلة")
     _login_failures.pop(_key, None)
     user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -467,6 +503,7 @@ async def login(data: LoginIn, request: Request, db: AsyncSession = Depends(get_
     if not user.password_hash.startswith("pbkdf2$"):
         user.password_hash = hash_password(data.password)
     await db.commit()
+    await _audit_auth_event(db, "login", user.tenant_id, user.id, user.username)
     token = create_token(user.id, user.username, user.role, user.tenant_id)
     await log_event(Events.USER_LOGIN, tenant_id=user.tenant_id, user_id=user.id,
                      entity_type="user", entity_id=user.id, source_path="/api/v1/auth/login")
@@ -481,6 +518,19 @@ async def login(data: LoginIn, request: Request, db: AsyncSession = Depends(get_
         },
         "expires_in_hours": TOKEN_EXPIRE_HOURS,
     }
+
+
+@router.post("/logout")
+async def logout(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """تسجيل خروج في سجل التدقيق فقط. الـ JWT عديم الحالة (stateless) ولا يُلغى هنا —
+    الواجهة هي التي تمسح التوكن."""
+    uid = int(current_user["sub"])
+    await _audit_auth_event(db, "logout", int(current_user["tenant_id"]), uid,
+                            current_user.get("username"))
+    return {"message": "تم تسجيل الخروج"}
 
 
 @router.get("/me")

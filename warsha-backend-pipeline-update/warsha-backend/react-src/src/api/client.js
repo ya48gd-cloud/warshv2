@@ -105,7 +105,20 @@ async function request(method, path, body = null) {
         }
         // استخراج رسالة الخطأ بشكل آمن (detail نصي / قائمة validation / كائن / حسب كود الحالة)
         const msg = extractErrorMessage(data, res.status)
-        throw Object.assign(new Error(msg), { status: res.status, data })
+        const err = Object.assign(new Error(msg), { status: res.status, data })
+        // دورة الموافقات: الإجراء الحساس ممكن يرجّع 428 + code=approval_required.
+        // نعلّم الخطأ ونبلّغ نافذة الموافقة العامة (ApprovalRequiredHost) — الرسالة العربية
+        // في detail فالـ toast الحالي في الصفحات يفضل شغال.
+        if (data && data.code === 'approval_required') {
+          err.code = 'approval_required'
+          err.approval = data.approval || null
+          try {
+            window.dispatchEvent(new CustomEvent('erp:approval-required', {
+              detail: { message: msg, ...(data.approval || {}) },
+            }))
+          } catch { /* بيئة بدون window */ }
+        }
+        throw err
       }
       return data
     } catch (err) {
@@ -755,6 +768,21 @@ api.warrantyCerts = {
   delete: (id)  => request('DELETE',`/warranty-certs/${id}`),
 }
 
+// دورة الموافقات (Approval Workflow)
+api.approvals = {
+  meta:         ()      => request('GET',    '/approvals/meta'),
+  rules:        ()      => request('GET',    '/approvals/rules').then(r => r?.items || []),
+  createRule:   (b)     => request('POST',   '/approvals/rules', b),
+  updateRule:   (id, b) => request('PUT',    `/approvals/rules/${id}`, b),
+  deleteRule:   (id)    => request('DELETE', `/approvals/rules/${id}`),
+  requests:     (p)     => request('GET',    `/approvals/requests${p ? '?' + new URLSearchParams(p) : ''}`).then(r => r?.items || []),
+  get:          (id)    => request('GET',    `/approvals/requests/${id}`),
+  approve:      (id, reason) => request('POST', `/approvals/requests/${id}/approve`, { reason: reason || null }),
+  reject:       (id, reason) => request('POST', `/approvals/requests/${id}/reject`, { reason }),
+  cancel:       (id)    => request('POST',   `/approvals/requests/${id}/cancel`),
+  pendingCount: ()      => request('GET',    '/approvals/pending-count'),
+}
+
 // Patch: add aging print + CSV export
 const _reportsOrig2 = api.reports
 api.reports = {
@@ -808,3 +836,58 @@ api.listAttachments = (entityType, entityId) =>
 api.print = printPopup
 api.download = download
 api.openFile = openFile
+
+// ── النسخ الاحتياطي: تصدير بيانات الورشة (للمدير فقط) ─────────────────
+// تصدير الورشة = POST (يسجّل عملية)، لذلك لا نستخدم download() (GET فقط)؛
+// نفس منطق الحفظ (blob → رابط مؤقت) مع authedFetch لإبقاء التوكن ومعالجة 401.
+api.backup = {
+  exportTenant: async (format = 'zip') => {
+    const fmt = format === 'json' ? 'json' : 'zip'
+    const res = await authedFetch(`/backups/tenant-export?format=${encodeURIComponent(fmt)}`, { method: 'POST' })
+    const blob = await res.blob()
+    let name = null
+    const cd = res.headers.get('content-disposition')
+    if (cd) {
+      const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd)
+      if (m) { try { name = decodeURIComponent(m[1]) } catch { name = m[1] } }
+    }
+    if (!name) name = `warsha-export-data-${new Date().toISOString().slice(0, 10)}.${fmt}`
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    return { filename: name, size: blob.size, runId: res.headers.get('x-export-run-id') }
+  },
+  tenantRuns: (limit = 20) =>
+    request('GET', `/backups/exports?limit=${encodeURIComponent(limit)}`)
+      .then(r => Array.isArray(r) ? r : (r?.items || [])),
+}
+
+// ── سجل التدقيق (Audit Log) — للمدير فقط، قراءة فقط ───────────────────
+// list يستقبل query string جاهز (utils/audit.js buildAuditQuery) لأن القيم الفارغة تُستبعد هناك.
+api.audit = {
+  meta:   ()         => request('GET', '/audit/meta'),
+  list:   (qs = '')  => request('GET', `/audit/logs${qs ? '?' + qs : ''}`),
+  get:    (id)       => request('GET', `/audit/logs/${encodeURIComponent(id)}`),
+  entity: (type, id, { limit = 20, offset = 0 } = {}) =>
+    request('GET', `/audit/entities/${encodeURIComponent(type)}/${encodeURIComponent(id)}?limit=${limit}&offset=${offset}`),
+}
+
+// تسجيل الخروج في الخادم (يكتب صف 'logout' في سجل التدقيق) — fire-and-forget:
+// JWT عديم الحالة فلا يعتمد الخروج المحلي على نجاح هذا الطلب، وlogout() لا تنتظره.
+// keepalive عشان الطلب يكتمل حتى لو الصفحة اتقفلت/اتنقلت مباشرة بعده.
+api.logout = () => {
+  const token = getToken()
+  if (!token) return
+  try {
+    fetch(`${BASES[0]}/auth/logout`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      keepalive: true,
+    }).catch(() => {})
+  } catch (_) { /* لا شيء — الخروج المحلي يكمل */ }
+}

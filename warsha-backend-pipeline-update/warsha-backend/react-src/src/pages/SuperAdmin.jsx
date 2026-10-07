@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import SuperAdminBackups from "./SuperAdminBackups";
 
 // إصلاح: كان العنوان ثابت على http://localhost:8000 لو VITE_API_URL مش متضبط —
 // يعني لوحة Super Admin ماكانتش بتشتغل خالص لما النظام يتنشر على سيرفر (نفس
@@ -98,7 +99,7 @@ export default function SuperAdmin() {
   const [token, setToken] = useState(() => sessionStorage.getItem("sa_token") || "");
   const [loginData, setLoginData] = useState({ username: "", password: "" });
   const [loginErr, setLoginErr] = useState("");
-  const [tab, setTab] = useState("workshops"); // workshops | catalog
+  const [tab, setTab] = useState("workshops"); // workshops | catalog | backups
 
   const [workshops, setWorkshops] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -429,7 +430,7 @@ export default function SuperAdmin() {
 
       {/* Tabs */}
       <div style={{ background: "#1E293B", borderBottom: "1px solid #334155", padding: "0 28px", display: "flex", gap: 4 }}>
-        {[["workshops", "🏭 الورش"], ["catalog", "📦 الكتالوج العام"]].map(([key, label]) => (
+        {[["workshops", "🏭 الورش"], ["catalog", "📦 الكتالوج العام"], ["backups", "💾 النسخ الاحتياطي"]].map(([key, label]) => (
           <button key={key} onClick={() => setTab(key)}
             style={{
               background: "transparent", border: "none", borderBottom: tab === key ? "2px solid #6366F1" : "2px solid transparent",
@@ -719,6 +720,9 @@ export default function SuperAdmin() {
             </div>
           </>
         )}
+
+        {/* ════════ BACKUPS TAB ════════ */}
+        {tab === "backups" && <SuperAdminBackups />}
       </div>
     </div>
   );

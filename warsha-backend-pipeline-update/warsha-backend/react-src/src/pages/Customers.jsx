@@ -15,6 +15,7 @@ import SearchInput from '../components/ui/SearchInput'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
 import { PageSpinner } from '../components/ui/Spinner'
 import PaymentAttachment from '../components/ui/PaymentAttachment'
+import { EntityHistoryButton } from '../components/audit/EntityHistory'
 
 const MOVEMENT_TYPE_AR = {
   manufactured:'تصنيع', delivered:'تسليم للعميل', installed:'تركيب',
@@ -1190,6 +1191,7 @@ export default function Customers({ onNavigate }) {
                         onClick={() => setProfile(c)}>
                         بروفايل
                       </button>
+                      <EntityHistoryButton entityType="customers" entityId={c.id} label={c.name} onNavigate={onNavigate} />
                       {write && (
                         <>
                           <button className="btn btn-sm text-xs" onClick={() => openEdit(c)}>تعديل</button>

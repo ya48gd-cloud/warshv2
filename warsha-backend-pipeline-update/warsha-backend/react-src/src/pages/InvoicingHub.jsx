@@ -13,7 +13,7 @@ const TABS = [
 ]
 
 export default function InvoicingHub({ onNavigate, pageParams }) {
-  const [activeTab, setActiveTab] = useState('invoices')
+  const [activeTab, setActiveTab] = useState(TABS.some(t => t.key === pageParams?.tab) ? pageParams.tab : 'invoices')
   const [highlightId, setHighlightId] = useState(pageParams?.highlight ?? null)
 
   // إصلاح: الضغط على كود الفاتورة من تبويب الأقساط كان بينادي navigate('invoices')

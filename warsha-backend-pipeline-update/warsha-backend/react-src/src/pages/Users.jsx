@@ -7,6 +7,7 @@ import Modal, { ModalFooter } from '../components/ui/Modal'
 import { Input, FormGrid } from '../components/ui/Field'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
 import { PageSpinner } from '../components/ui/Spinner'
+import { EntityHistoryButton } from '../components/audit/EntityHistory'
 
 const ROLE_DESCS = {
   admin:      { icon: '🔑', desc: 'وصول كامل — إدارة المستخدمين وجميع الأقسام' },
@@ -68,7 +69,7 @@ function RolePicker({ value, onChange }) {
   )
 }
 
-export default function Users() {
+export default function Users({ onNavigate }) {
   const { user: me } = useAuth()
   const toast = useToast()
 
@@ -204,6 +205,7 @@ export default function Users() {
                 </span>
                 <div className="flex gap-1">
                   <button className="btn btn-sm text-xs" onClick={() => openEdit(u)} title="تعديل">✏️</button>
+                  <EntityHistoryButton entityType="users" entityId={u.id} label={u.username} onNavigate={onNavigate} />
                   <button className="btn btn-sm text-xs" onClick={() => { setPwModal(u); setPwForm('') }} title="إعادة تعيين كلمة المرور">🔑</button>
                   {!isSelf && (
                     <button

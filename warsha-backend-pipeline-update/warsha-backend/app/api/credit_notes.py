@@ -15,7 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, get_current_user
+from app.services.approvals import require_approval, to_dec
 from app.models.models import (
     CreditNote, CreditNoteLine, Customer, Invoice, InvoiceLine, WorkOrder, Material,
 )
@@ -520,7 +521,8 @@ async def credit_note_from_invoice(invoice_id: int, db: AsyncSession = Depends(g
 
 
 @router.patch("/{cn_id}/issue")
-async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
+async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db),
+                            current_user: dict = Depends(get_current_user)):
     """إصدار الإشعار — يُخفّض رصيد العميل، ولو مرتجع بضاعة فعلي (is_return)
     يرجّع رصيد المخزون ويعكس تكلفة البضاعة المباعة أيضاً."""
     res = await db.execute(
@@ -539,6 +541,15 @@ async def issue_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
         # إعادة فحص الحد وقت الإصدار (مسودتين ممكن يتعملوا قبل ما أي واحدة تتصدر)
         await _check_invoice_credit_room(db, cn.invoice_id, cn.lines, Decimal(str(cn.total)),
                                          exclude_cn_id=cn.id)
+
+    # دورة الموافقات: إصدار إشعار دائن (بعد الفحوصات، قبل أي تعديل رصيد/مخزون/قيد)
+    _cn_total = to_dec(cn.total)
+    await require_approval(
+        db, current_user, "credit_note_issue",
+        entity_type="credit_note", entity_id=cn_id, entity_label=str(cn.code),
+        metrics={"amount": _cn_total},
+        params={"credit_note_id": cn_id, "total": _cn_total, "invoice_id": cn.invoice_id},
+    )
 
     # خفّض رصيد العميل
     cust = await db.get(Customer, cn.customer_id)

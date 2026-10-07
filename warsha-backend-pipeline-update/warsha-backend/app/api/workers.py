@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
 from app.core.database import get_db
-from app.api.auth import require_any
+from app.api.auth import require_any, get_current_user
+from app.services.approvals import require_approval, to_dec
 from app.models.models import Worker, PayrollRun, PayrollLine, Attendance, WorkerAdvance, ExtProjectMember
 
 _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -181,7 +182,8 @@ async def deactivate(wid: int, db: AsyncSession = Depends(get_db)):
 _VALID_ADVANCE_TYPES = {"advance", "deduction", "bonus"}
 
 @router.post("/advances", status_code=201)
-async def add_advance(data: AdvanceIn, db: AsyncSession = Depends(get_db)):
+async def add_advance(data: AdvanceIn, db: AsyncSession = Depends(get_db),
+                      current_user: dict = Depends(get_current_user)):
     if data.advance_type not in _VALID_ADVANCE_TYPES:
         raise HTTPException(400, f"نوع غير صالح. القيم المسموحة: {sorted(_VALID_ADVANCE_TYPES)}")
     if data.amount is None or data.amount <= 0:
@@ -195,6 +197,16 @@ async def add_advance(data: AdvanceIn, db: AsyncSession = Depends(get_db)):
         # العامل المعطَّل مابيدخلش كشوف الرواتب (إلا لو له حضور في الفترة)،
         # فسلفة جديدة له بتطلع فلوس من الخزنة من غير أي فرصة استرداد.
         raise HTTPException(400, "لا يمكن تسجيل سلفة/منحة لعامل معطَّل")
+
+    # دورة الموافقات: السلفة/الخصم بيخرّجوا فلوس من الخزنة (bonus لا — بيتصرف مع الراتب)
+    if data.advance_type in ("advance", "deduction"):
+        _adv_amt = to_dec(data.amount)
+        await require_approval(
+            db, current_user, "worker_advance",
+            entity_type="worker", entity_id=worker.id, entity_label=str(worker.name),
+            metrics={"amount": _adv_amt},
+            params={"worker_id": worker.id, "amount": _adv_amt, "advance_type": data.advance_type},
+        )
 
     adv_payload = data.model_dump()
     adv_payload['tenant_id'] = tid_adv
