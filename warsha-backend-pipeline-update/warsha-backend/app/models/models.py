@@ -745,6 +745,14 @@ class Invoice(Base):
     notes:        Mapped[Optional[str]]  = mapped_column(Text)
     terms:        Mapped[Optional[str]]  = mapped_column(Text)
     created_at:   Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+    # ── الفاتورة الإلكترونية (einvoice) — مرآة من صف التسليم؛ NULL = لم تُرسل
+    eta_uuid:          Mapped[Optional[str]]      = mapped_column(String(64), nullable=True, index=True)
+    eta_status:        Mapped[Optional[str]]      = mapped_column(String(20), nullable=True, index=True)
+    eta_submission_id: Mapped[Optional[str]]      = mapped_column(String(64), nullable=True)
+    eta_long_id:       Mapped[Optional[str]]      = mapped_column(String(128), nullable=True)
+    eta_internal_id:   Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    eta_submitted_at:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    eta_errors:        Mapped[Optional[list]]     = mapped_column(JSON, nullable=True)
     customer:     Mapped["Customer"]     = relationship("Customer")
     lines:        Mapped[List["InvoiceLine"]] = relationship("InvoiceLine", back_populates="invoice", order_by="InvoiceLine.sort_order")
 
@@ -2020,6 +2028,14 @@ class CreditNote(Base):
     notes:        Mapped[Optional[str]]  = mapped_column(Text, nullable=True)
     issued_at:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at:   Mapped[datetime]       = mapped_column(DateTime, server_default=func.now())
+    # ── الفاتورة الإلكترونية (einvoice) — مرآة من صف التسليم؛ NULL = لم يُرسل
+    eta_uuid:          Mapped[Optional[str]]      = mapped_column(String(64), nullable=True, index=True)
+    eta_status:        Mapped[Optional[str]]      = mapped_column(String(20), nullable=True, index=True)
+    eta_submission_id: Mapped[Optional[str]]      = mapped_column(String(64), nullable=True)
+    eta_long_id:       Mapped[Optional[str]]      = mapped_column(String(128), nullable=True)
+    eta_internal_id:   Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    eta_submitted_at:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    eta_errors:        Mapped[Optional[list]]     = mapped_column(JSON, nullable=True)
 
     customer: Mapped["Customer"]               = relationship("Customer")
     invoice:  Mapped[Optional["Invoice"]]      = relationship("Invoice")
@@ -2297,3 +2313,82 @@ class BackupRun(Base):
     finished_at:         Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     error:               Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
     details:             Mapped[Optional[dict]]     = mapped_column(JSON, nullable=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FEATURE: einvoice — الفاتورة الإلكترونية (مصلحة الضرائب المصرية ETA)
+# إعدادات لكل ورشة (الأسرار مشفّرة Fernet — أسماء الأعمدة تحتوي secret/token/credential
+# عشان سجل التدقيق وتصدير الورشة يستثنوها تلقائيًا) + صف تسليم واحد لكل مستند
+# (invoice | credit_note) يحمل حالة الإرسال وقائمة الانتظار وآخر حمولة موقّعة.
+# ملاحظة: التكامل غير مُجرَّب على بيئة ETA الفعلية.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class EInvoiceSettings(Base):
+    __tablename__ = "einvoice_settings"
+    __table_args__ = (UniqueConstraint("tenant_id", name="uq_einvoice_settings_tenant"),)
+    id:                      Mapped[int]                = mapped_column(primary_key=True)
+    tenant_id:               Mapped[int]                = mapped_column(ForeignKey("tenants.id"), index=True)
+    enabled:                 Mapped[bool]               = mapped_column(Boolean, default=False)
+    # preprod | prod | custom
+    environment:             Mapped[str]                = mapped_column(String(10), default="preprod")
+    tax_registration_number: Mapped[Optional[str]]      = mapped_column(String(20), nullable=True)
+    activity_code:           Mapped[Optional[str]]      = mapped_column(String(10), nullable=True)
+    issuer_name:             Mapped[Optional[str]]      = mapped_column(String(200), nullable=True)
+    branch_id:               Mapped[Optional[str]]      = mapped_column(String(20), default="0", nullable=True)
+    governate:               Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    region_city:             Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    street:                  Mapped[Optional[str]]      = mapped_column(String(200), nullable=True)
+    building_number:         Mapped[Optional[str]]      = mapped_column(String(50), nullable=True)
+    # اسم العمود يحتوي credential عمدًا ليُستثنى من التدقيق والتصدير
+    client_credential_id_enc: Mapped[Optional[str]]     = mapped_column(Text, nullable=True)
+    client_secret_enc:       Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    custom_id_base_url:      Mapped[Optional[str]]      = mapped_column(String(300), nullable=True)
+    custom_api_base_url:     Mapped[Optional[str]]      = mapped_column(String(300), nullable=True)
+    # none | mock | external
+    signer_mode:             Mapped[str]                = mapped_column(String(10), default="none")
+    signer_url:              Mapped[Optional[str]]      = mapped_column(String(300), nullable=True)
+    signer_token_enc:        Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    default_item_type:       Mapped[str]                = mapped_column(String(5), default="EGS")
+    default_item_code:       Mapped[str]                = mapped_column(String(50), default="GEN")
+    default_unit_type:       Mapped[str]                = mapped_column(String(10), default="EA")
+    vat_subtype:             Mapped[str]                = mapped_column(String(10), default="V009")
+    zero_vat_subtype:        Mapped[str]                = mapped_column(String(10), default="V003")
+    person_id_threshold:     Mapped[Decimal]            = mapped_column(Numeric(14, 2), default=50000)
+    max_backdate_days:       Mapped[int]                = mapped_column(Integer, default=7)
+    last_connection_ok:      Mapped[Optional[bool]]     = mapped_column(Boolean, nullable=True)
+    last_connection_at:      Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_connection_error:   Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    created_at:              Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at:              Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, onupdate=datetime.utcnow)
+
+
+class EInvoiceSubmission(Base):
+    __tablename__ = "einvoice_submissions"
+    __table_args__ = (UniqueConstraint("tenant_id", "doc_type", "doc_id", name="uq_einvoice_sub_doc"),)
+    id:                 Mapped[int]                = mapped_column(primary_key=True)
+    tenant_id:          Mapped[int]                = mapped_column(ForeignKey("tenants.id"), index=True)
+    # invoice | credit_note
+    doc_type:           Mapped[str]                = mapped_column(String(15))
+    doc_id:             Mapped[int]                = mapped_column(Integer)
+    # queued | submitting | submitted | valid | invalid | rejected | failed | cancelled
+    status:             Mapped[str]                = mapped_column(String(15), index=True)
+    internal_id:        Mapped[Optional[str]]      = mapped_column(String(100), nullable=True)
+    eta_uuid:           Mapped[Optional[str]]      = mapped_column(String(64), nullable=True, index=True)
+    eta_long_id:        Mapped[Optional[str]]      = mapped_column(String(128), nullable=True)
+    eta_submission_id:  Mapped[Optional[str]]      = mapped_column(String(64), nullable=True, index=True)
+    payload_json:       Mapped[Optional[dict]]     = mapped_column(JSON, nullable=True)
+    payload_sha256:     Mapped[Optional[str]]      = mapped_column(String(64), nullable=True)
+    signer_mode_used:   Mapped[Optional[str]]      = mapped_column(String(10), nullable=True)
+    environment_used:   Mapped[Optional[str]]      = mapped_column(String(10), nullable=True)
+    attempts:           Mapped[int]                = mapped_column(Integer, default=0)
+    next_attempt_at:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    last_attempt_at:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    locked_at:          Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_error:         Mapped[Optional[str]]      = mapped_column(Text, nullable=True)
+    errors:             Mapped[Optional[list]]     = mapped_column(JSON, nullable=True)
+    history:            Mapped[Optional[list]]     = mapped_column(JSON, nullable=True)
+    submitted_at:       Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    validated_at:       Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_by_user_id: Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    created_at:         Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at:         Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, onupdate=datetime.utcnow)

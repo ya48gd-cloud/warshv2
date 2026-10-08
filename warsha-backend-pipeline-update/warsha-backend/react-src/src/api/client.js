@@ -891,3 +891,30 @@ api.logout = () => {
     }).catch(() => {})
   } catch (_) { /* لا شيء — الخروج المحلي يكمل */ }
 }
+
+
+// ── الفاتورة الإلكترونية (ETA) ────────────────────────────────────────────
+// FEATURE: einvoice — التكامل غير مُجرَّب على بيئة مصلحة الضرائب الفعلية.
+// kind: 'invoice' | 'credit_note' (أو 'credit-note') — يتحوّل لجزء المسار 'invoice' | 'credit-note'.
+// الأسرار (client_id / client_secret / signer_token) write-only: لا تُرجَع من الخادم أبداً.
+const _etaKind = (k) => (k === 'credit_note' || k === 'credit-note') ? 'credit-note' : 'invoice'
+const _etaQs = (p) => {
+  const q = new URLSearchParams()
+  Object.entries(p || {}).forEach(([k, v]) => { if (v !== '' && v != null) q.append(k, v) })
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+api.einvoice = {
+  status:         ()          => request('GET',  '/einvoice/status'),
+  settings:       ()          => request('GET',  '/einvoice/settings'),
+  saveSettings:   (b)         => request('PUT',  '/einvoice/settings', b),
+  testConnection: ()          => request('POST', '/einvoice/settings/test-connection'),
+  preview:        (kind, id)  => request('GET',  `/einvoice/documents/${_etaKind(kind)}/${id}/preview`),
+  send:           (kind, id)  => request('POST', `/einvoice/documents/${_etaKind(kind)}/${id}/submit`),
+  resend:         (kind, id)  => request('POST', `/einvoice/documents/${_etaKind(kind)}/${id}/resubmit`),
+  refreshStatus:  (kind, id)  => request('POST', `/einvoice/documents/${_etaKind(kind)}/${id}/refresh-status`),
+  cancel:         (kind, id, reason) => request('POST', `/einvoice/documents/${_etaKind(kind)}/${id}/cancel`, { reason }),
+  state:          (kind, id)  => request('GET',  `/einvoice/documents/${_etaKind(kind)}/${id}`),
+  submissions:    (p)         => request('GET',  `/einvoice/submissions${_etaQs(p)}`),
+  runQueue:       ()          => request('POST', '/einvoice/queue/run'),
+}

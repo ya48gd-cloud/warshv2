@@ -5,15 +5,25 @@ import { useState } from 'react'
 import Invoices from './Invoices'
 import CreditNotes from './CreditNotes'
 import Installments from './Installments'
+import EInvoiceQueue from './EInvoiceQueue'
+import { useAuth } from '../store/auth'
+import useEtaEnabled from '../hooks/useEtaEnabled'
 
 const TABS = [
   { key: 'invoices',      label: '🧾 الفواتير' },
   { key: 'creditnotes',   label: '📋 إشعارات دائنة' },
   { key: 'installments',  label: '📅 الأقساط' },
 ]
+// تبويب الفاتورة الإلكترونية: يظهر للمحاسب/المدير عند التفعيل، وللمدير دائماً (لرابط الإعدادات)
+const ETA_TAB = { key: 'einvoice', label: '🇪🇬 الفاتورة الإلكترونية' }
 
 export default function InvoicingHub({ onNavigate, pageParams }) {
-  const [activeTab, setActiveTab] = useState(TABS.some(t => t.key === pageParams?.tab) ? pageParams.tab : 'invoices')
+  const { user: me, canWrite } = useAuth()
+  const eta = useEtaEnabled()
+  const showEta = canWrite('sales') && (eta.enabled || me?.role === 'admin')
+  const tabs = showEta ? [...TABS, ETA_TAB] : TABS
+  const [activeTab, setActiveTab] = useState([...TABS, ETA_TAB].some(t => t.key === pageParams?.tab) ? pageParams.tab : 'invoices')
+  const currentTab = tabs.some(t => t.key === activeTab) ? activeTab : 'invoices'
   const [highlightId, setHighlightId] = useState(pageParams?.highlight ?? null)
 
   // إصلاح: الضغط على كود الفاتورة من تبويب الأقساط كان بينادي navigate('invoices')
@@ -30,11 +40,11 @@ export default function InvoicingHub({ onNavigate, pageParams }) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex gap-1 border-b border-erp-border pb-0">
-        {TABS.map(tab => (
+        {tabs.map(tab => (
           <button
             key={tab.key}
             className="px-4 py-2 text-sm font-medium transition-colors"
-            style={activeTab === tab.key
+            style={currentTab === tab.key
               ? { color: 'var(--teal)', borderBottom: '2px solid var(--teal)' }
               : { color: 'var(--erp-muted)', borderBottom: '2px solid transparent' }}
             onClick={() => setActiveTab(tab.key)}
@@ -44,9 +54,10 @@ export default function InvoicingHub({ onNavigate, pageParams }) {
         ))}
       </div>
 
-      {activeTab === 'invoices'     && <Invoices highlightId={highlightId} />}
-      {activeTab === 'creditnotes'  && <CreditNotes />}
-      {activeTab === 'installments' && <Installments onNavigate={handleNavigate} />}
+      {currentTab === 'invoices'     && <Invoices highlightId={highlightId} onNavigate={handleNavigate} />}
+      {currentTab === 'creditnotes'  && <CreditNotes onNavigate={handleNavigate} />}
+      {currentTab === 'installments' && <Installments onNavigate={handleNavigate} />}
+      {currentTab === 'einvoice'     && <EInvoiceQueue onNavigate={handleNavigate} />}
     </div>
   )
 }

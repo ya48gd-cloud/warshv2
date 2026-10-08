@@ -309,6 +309,11 @@ def inv_dict(inv: Invoice, has_schedule: Optional[bool] = None):
         "paid_amount": float(inv.paid_amount), "remaining": remaining,
         "notes": inv.notes, "terms": inv.terms,
         "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        # الفاتورة الإلكترونية (ETA) — NULL = لم تُرسل
+        "eta_status": inv.eta_status, "eta_uuid": inv.eta_uuid,
+        "eta_submission_id": inv.eta_submission_id,
+        "eta_submitted_at": inv.eta_submitted_at.isoformat() if inv.eta_submitted_at else None,
+        "eta_errors": inv.eta_errors if isinstance(inv.eta_errors, list) else None,
         "lines": [{"id": l.id,
                    "item_type":   getattr(l, "item_type", None) or "",
                    "model_no":    getattr(l, "model_no",  None) or "",
@@ -739,6 +744,9 @@ async def update_invoice(iid: int, data: InvoiceIn, db: AsyncSession = Depends(g
                          current_user: dict = Depends(get_current_user)):
     inv = await db.get(Invoice, iid)
     if not inv: raise HTTPException(404)
+    # الفاتورة الإلكترونية: ممنوع تعديل فاتورة أُرسلت لمصلحة الضرائب (قبل الموافقات وأي عكس)
+    from app.services.einvoice_guard import assert_editable as _eta_editable
+    _eta_editable(inv, "الفاتورة")
     if not data.lines:
         raise HTTPException(400, "أضف بنداً واحداً على الأقل")
     _validate_doc_lines(data.lines, data.tax_pct, data.discount_pct)
@@ -1387,6 +1395,9 @@ async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db),
                          current_user: dict = Depends(get_current_user)):
     inv = await db.get(Invoice, iid)
     if not inv: raise HTTPException(404)
+    # الفاتورة الإلكترونية: ممنوع حذف فاتورة أُرسلت لمصلحة الضرائب (قبل الموافقات وأي عكس)
+    from app.services.einvoice_guard import assert_deletable as _eta_deletable
+    _eta_deletable(inv, "الفاتورة")
     # إصلاح ثغرة تكامل: حذف فاتورة عليها دفعات مسجّلة كان يعكس القيد المحاسبي
     # للفاتورة بالكامل (بما فيها الجزء المدفوع) من غير ما يمس قيد الدفعة نفسه
     # أو سجلات CustomerPayment/الخزنة المرتبطة — فيفضل حساب العملاء (AR) في
@@ -1459,6 +1470,8 @@ async def delete_invoice(iid: int, db: AsyncSession = Depends(get_db),
         cust.balance = cust.balance - unpaid
     # قيد عكسي في دفتر الأستاذ
     await journal_sales_invoice_delete(db, _tid_del, inv.id, inv.code, inv.tax_amount, inv.total, inv.date)
+    from app.services.einvoice_guard import purge_submissions as _eta_purge
+    await _eta_purge(db, _tid_del, "invoice", iid)  # صف تسليم يتيم (rejected/failed/cancelled)
     await db.delete(inv)
     await db.commit()
     return {"message": "تم الحذف"}

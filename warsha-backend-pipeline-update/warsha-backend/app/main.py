@@ -56,6 +56,7 @@ from app.api.super_admin    import router as super_admin_router
 from app.api.audit          import router as audit_router
 from app.api.approvals      import router as approvals_router
 from app.api.backups        import router as backups_router, sa_router as backups_sa_router
+from app.api.einvoice       import router as einvoice_router
 from app.services.approvals import ApprovalRequired, approval_required_handler
 
 # ── Multi-tenancy: middleware + event listeners ─────────────
@@ -77,9 +78,17 @@ async def lifespan(app: FastAPI):
     # ── خدمة خلفية: نسخ احتياطي تلقائي يومي (ERP_BACKUP_AUTO=0 لإيقافه) ──
     from app.services.backup_scheduler import start_backup_scheduler
     backup_task = asyncio.create_task(start_backup_scheduler())
+    # ── خدمة خلفية: طابور الفاتورة الإلكترونية (ERP_EINVOICE_WORKER=0 لإيقافه) ──
+    from app.services.einvoice_worker import start_einvoice_worker
+    einvoice_task = asyncio.create_task(start_einvoice_worker())
     try:
         yield
     finally:
+        einvoice_task.cancel()
+        try:
+            await einvoice_task
+        except asyncio.CancelledError:
+            pass
         backup_task.cancel()
         try:
             await backup_task
@@ -207,6 +216,7 @@ app.include_router(audit_router,           prefix="/api/v1")
 app.include_router(approvals_router,       prefix="/api/v1")
 app.include_router(backups_router,         prefix="/api/v1")
 app.include_router(backups_sa_router,      prefix="/api/v1")
+app.include_router(einvoice_router,         prefix="/api/v1")
 
 
 @app.get("/health")

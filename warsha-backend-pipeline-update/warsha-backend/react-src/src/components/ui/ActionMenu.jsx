@@ -8,7 +8,9 @@ import { useState, useRef, useEffect } from 'react'
  */
 export default function ActionMenu({ items, title = 'إجراءات أخرى' }) {
   const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState(null)   // موضع ثابت (fixed) كي لا تُقصّ القائمة داخل جداول overflow:hidden
   const ref = useRef(null)
+  const btnRef = useRef(null)
 
   useEffect(() => {
     const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
@@ -24,6 +26,15 @@ export default function ActionMenu({ items, title = 'إجراءات أخرى' })
     return () => document.removeEventListener('keydown', k)
   }, [open])
 
+  // القائمة position:fixed فتقفل عند التمرير/تغيير الحجم بدل ما تفضل معلّقة في مكانها
+  useEffect(() => {
+    if (!open) return
+    const c = () => setOpen(false)
+    window.addEventListener('scroll', c, true)
+    window.addEventListener('resize', c)
+    return () => { window.removeEventListener('scroll', c, true); window.removeEventListener('resize', c) }
+  }, [open])
+
   const visibleItems = (items || []).filter(Boolean)
   if (visibleItems.length === 0) return null
 
@@ -36,14 +47,26 @@ export default function ActionMenu({ items, title = 'إجراءات أخرى' })
         aria-label={title}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen(o => !o)}
+        ref={btnRef}
+        onClick={() => {
+          if (!open && btnRef.current) {
+            const r = btnRef.current.getBoundingClientRect()
+            const estH = visibleItems.length * 38 + 8
+            const flip = r.bottom + estH + 8 > window.innerHeight && r.top > estH
+            setPos({
+              left: Math.max(8, Math.min(r.left, window.innerWidth - 260)),
+              ...(flip ? { bottom: window.innerHeight - r.top + 4 } : { top: r.bottom + 4 }),
+            })
+          }
+          setOpen(o => !o)
+        }}
         style={{ padding: '4px 8px' }}
       >⋮</button>
 
       {open && (
         <div role="menu" style={{
-          position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 30,
-          minWidth: 160, background: 'var(--bg)', border: '1px solid var(--erp-border)',
+          position: 'fixed', ...(pos || { top: 0, left: 0 }), zIndex: 60,
+          minWidth: 160, maxWidth: 'calc(100vw - 16px)', background: 'var(--bg)', border: '1px solid var(--erp-border)',
           borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.12)', overflow: 'hidden',
         }}>
           {visibleItems.map((item, i) => (

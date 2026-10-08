@@ -822,6 +822,11 @@ async def _seed_tenant_data():
         await s.commit()
 
 
+# الأعمدة السرية المحجوبة من التصدير: كلمة مرور المستخدمين + أسرار الفاتورة الإلكترونية (مشفرة)
+REDACTED_COLUMNS = ["einvoice_settings.client_credential_id_enc", "einvoice_settings.client_secret_enc",
+                    "einvoice_settings.signer_token_enc", "users.password_hash"]
+
+
 def test_export_guard_covers_all_tables():
     plan = {p["table"].name: p["mode"] for p in texp.table_plan()}
     assert set(plan) == set(Base.metadata.tables)
@@ -833,7 +838,7 @@ def test_export_guard_covers_all_tables():
     for name, t in Base.metadata.tables.items():
         if "tenant_id" in t.c and name not in texp.EXPORT_EXCLUDE_TABLES:
             assert plan[name] in ("tenant", "tenant_row")
-    assert texp.redacted_columns() == ["users.password_hash"]
+    assert texp.redacted_columns() == REDACTED_COLUMNS
     assert "global_catalog" in texp.GLOBAL_TABLES and texp.EXPORT_EXCLUDE_TABLES >= {"backup_runs"}
 
 
@@ -859,7 +864,7 @@ async def test_tenant_export_zip_content_and_isolation(cli, cli2, tmp_path, monk
     names = set(z.namelist())
     man = json.loads(z.read("manifest.json"))
     assert man["tenant"] == {"id": 1, "name": "Tenant 1", "slug": "tenant-1"}
-    assert man["redacted_columns"] == ["users.password_hash"]
+    assert man["redacted_columns"] == REDACTED_COLUMNS
     assert man["format_version"] == 1 and "الملفات" in man["note"]
     assert man["exported_at"].endswith("Z")
     assert set(man["tables"]) | {"manifest"} == {n[:-5] for n in names}

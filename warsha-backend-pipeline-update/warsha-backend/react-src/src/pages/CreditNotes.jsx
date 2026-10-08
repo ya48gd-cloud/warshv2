@@ -4,6 +4,10 @@ import { useApi } from '../hooks/useApi'
 import Modal, { ModalFooter } from '../components/ui/Modal'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
 import { useToast } from '../store/toast'
+import ActionMenu from '../components/ui/ActionMenu'
+import EtaBadge from '../components/einvoice/EtaBadge'
+import useEta from '../components/einvoice/useEta'
+import { isEtaLocked } from '../utils/einvoice'
 
 /* ─── helpers ─────────────────────────────────────────────── */
 const egp = (v) => {
@@ -38,7 +42,7 @@ const today = () => new Date().toISOString().slice(0, 10)
 const emptyLine = () => ({ description: '', qty: 1, unit: 'قطعة', unit_price: '', sort_order: 0 })
 
 /* ─── Component ──────────────────────────────────────────── */
-export default function CreditNotes() {
+export default function CreditNotes({ onNavigate } = {}) {
   const addToast = useToast()
   const [notes, setNotes]         = useState([])
   const [loading, setLoading]     = useState(true)
@@ -76,6 +80,9 @@ export default function CreditNotes() {
   }, [filterStatus])
 
   useEffect(() => { load() }, [load])
+
+  // الفاتورة الإلكترونية (ETA): تظهر فقط عند تفعيل التكامل
+  const eta = useEta({ kind: 'credit_note', reload: load, onNavigate })
 
   /* ── computed totals for form ── */
   const formSubtotal = form.lines.reduce((s, l) =>
@@ -347,7 +354,7 @@ export default function CreditNotes() {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: '#0C2340', color: '#fff' }}>
-                {['رقم الإشعار', 'العميل', 'الفاتورة المرجعية', 'التاريخ', 'نوع المرتجع', 'الإجمالي', 'الحالة', ''].map(h => (
+                {['رقم الإشعار', 'العميل', 'الفاتورة المرجعية', 'التاريخ', 'نوع المرتجع', 'الإجمالي', 'الحالة', ...(eta.enabled ? ['الضرائب'] : []), ''].map(h => (
                   <th key={h} style={{ padding: '11px 14px', fontSize: 12, fontWeight: 700,
                     textAlign: 'right', whiteSpace: 'nowrap' }}>{h}</th>
                 ))}
@@ -371,6 +378,11 @@ export default function CreditNotes() {
                   </td>
                   <td style={{ padding: '10px 14px', fontWeight: 700, fontSize: 13 }}>{egp(n.total)}</td>
                   <td style={{ padding: '10px 14px' }}><StatusPill status={n.status} /></td>
+                  {eta.enabled && (
+                    <td style={{ padding: '10px 14px' }} onClick={e => e.stopPropagation()}>
+                      <EtaBadge doc={n} onClick={() => eta.openState(n, 'credit_note')} />
+                    </td>
+                  )}
                   <td style={{ padding: '10px 14px' }} onClick={e => e.stopPropagation()}>
                     <div style={{ display: 'flex', gap: 6 }}>
                       <button onClick={() => printNote(n.id)}
@@ -389,6 +401,7 @@ export default function CreditNotes() {
                           style={{ background: '#FEE2E2', border: 'none', borderRadius: 6,
                             padding: '5px 10px', cursor: 'pointer', fontSize: 14 }}>🗑️</button>
                       )}
+                      <ActionMenu items={eta.menuItems(n)} />
                     </div>
                   </td>
                 </tr>
@@ -411,6 +424,7 @@ export default function CreditNotes() {
               { label: 'نوع المرتجع', val: selected.return_type === 'full' ? 'مرتجع كامل' : 'مرتجع جزئي' },
               { label: 'مرتجع بضاعة فعلي', val: selected.is_return ? '🔄 نعم — يرجّع المخزون' : 'لا (تسوية مالية فقط)' },
               { label: 'الحالة', val: <StatusPill status={selected.status} /> },
+              ...(eta.enabled || selected.eta_status ? [{ label: 'الفاتورة الإلكترونية', val: <EtaBadge doc={selected} /> }] : []),
               { label: 'سبب الإشعار', val: selected.reason || '—' },
               { label: 'ضريبة', val: `${selected.tax_pct}%` },
               { label: 'خصم', val: egp(selected.discount_amt) },
@@ -489,7 +503,8 @@ export default function CreditNotes() {
             )}
             {selected.status === 'issued' && (
               <button onClick={() => setConfirmAct({ kind: 'cancel', id: selected.id, label: selected.code })}
-                disabled={busyId === selected.id}
+                disabled={busyId === selected.id || isEtaLocked(selected)}
+                title={isEtaLocked(selected) ? 'الإشعار أُرسل للضرائب ولا يمكن إلغاؤه' : undefined}
                 style={{ background: '#FEF3C7', color: '#92400E', border: 'none', borderRadius: 8,
                   padding: '9px 20px', fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
                 ❌ إلغاء
@@ -735,6 +750,8 @@ export default function CreditNotes() {
         onConfirm={() => handleDelete(confirmDel)}
         onCancel={() => setConfirmDel(null)}
       />
+
+      {eta.element}
     </div>
   )
 }

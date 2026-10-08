@@ -229,6 +229,11 @@ def _cn_dict(c: CreditNote) -> dict:
         "notes": c.notes,
         "issued_at": c.issued_at.isoformat() if c.issued_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
+        # الفاتورة الإلكترونية (ETA) — NULL = لم يُرسل
+        "eta_status": c.eta_status, "eta_uuid": c.eta_uuid,
+        "eta_submission_id": c.eta_submission_id,
+        "eta_submitted_at": c.eta_submitted_at.isoformat() if c.eta_submitted_at else None,
+        "eta_errors": c.eta_errors if isinstance(c.eta_errors, list) else None,
         "lines": [
             {
                 "id": l.id,
@@ -371,6 +376,8 @@ async def update_credit_note(cn_id: int, data: CNIn, db: AsyncSession = Depends(
     cn = res.scalar_one_or_none()
     if not cn:
         raise HTTPException(404)
+    from app.services.einvoice_guard import assert_editable as _eta_editable
+    _eta_editable(cn, "الإشعار الدائن")  # الفاتورة الإلكترونية
     if cn.status != "draft":
         raise HTTPException(400, "لا يمكن تعديل إشعار دائن بعد إصداره أو إلغائه")
     _validate_cn_input(data)
@@ -640,6 +647,8 @@ async def cancel_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
     cn = res.scalar_one_or_none()
     if not cn:
         raise HTTPException(404)
+    from app.services.einvoice_guard import assert_cancellable as _eta_cancellable
+    _eta_cancellable(cn, "الإشعار الدائن")  # الفاتورة الإلكترونية: قبل عكس الرصيد/القيد
     if cn.status == "applied":
         raise HTTPException(400, "لا يمكن إلغاء إشعار مُطبَّق")
 
@@ -736,6 +745,8 @@ async def delete_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
     cn = await db.get(CreditNote, cn_id)
     if not cn:
         raise HTTPException(404)
+    from app.services.einvoice_guard import assert_deletable as _eta_deletable, purge_submissions as _eta_purge
+    _eta_deletable(cn, "الإشعار الدائن")  # الفاتورة الإلكترونية
     if cn.status not in ("draft", "cancelled"):
         raise HTTPException(400, "يمكن حذف المسودات والملغية فقط")
     lines = (await db.execute(
@@ -743,6 +754,7 @@ async def delete_credit_note(cn_id: int, db: AsyncSession = Depends(get_db)):
     )).scalars().all()
     for l in lines:
         await db.delete(l)
+    await _eta_purge(db, cn.tenant_id, "credit_note", cn_id)
     await db.delete(cn)
     await db.commit()
 

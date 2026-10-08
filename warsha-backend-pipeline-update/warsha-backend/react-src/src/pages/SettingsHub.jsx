@@ -6,19 +6,21 @@ import { useAuth } from '../store/auth'
 import Users from './Users'
 import WorkshopProfile from './WorkshopProfile'
 import TenantBackup from './TenantBackup'
+import EInvoiceSettings from './EInvoiceSettings'
 
 const TABS = [
   { key: 'users',    label: '👥 المستخدمون' },
   { key: 'workshop', label: '🏭 بروفايل الورشة' },
   { key: 'backup',   label: '💾 النسخ الاحتياطي' },
+  { key: 'einvoice', label: '🧾 الفاتورة الإلكترونية' },
 ]
 
 // تبويبات للمدير (admin) فقط
-const ADMIN_ONLY_TABS = ['workshop', 'backup']
+const ADMIN_ONLY_TABS = ['workshop', 'backup', 'einvoice']
 
-export default function SettingsHub({ onNavigate }) {
+export default function SettingsHub({ onNavigate, pageParams }) {
   const { user: me } = useAuth()
-  const [activeTab, setActiveTab] = useState('users')
+  const [activeTab, setActiveTab] = useState(TABS.some(t => t.key === pageParams?.tab) ? pageParams.tab : 'users')
 
   // إصلاح: تبويب "بروفايل الورشة" كان ظاهراً وقابلاً للتعديل لكل الأدوار
   // (حتى "مشاهد" read-only) رغم أن هذه بيانات على مستوى الورشة كلها —
@@ -46,6 +48,7 @@ export default function SettingsHub({ onNavigate }) {
       {currentTab === 'users'    && <Users onNavigate={onNavigate} />}
       {currentTab === 'workshop' && <WorkshopProfile />}
       {currentTab === 'backup'   && <TenantBackup />}
+      {currentTab === 'einvoice' && <EInvoiceSettings />}
     </div>
   )
 }

@@ -17,6 +17,9 @@ import { PageSpinner } from '../components/ui/Spinner'
 import CatalogPickerModal from '../components/ui/CatalogPicker'
 import ConfirmDialog from '../components/ui/ConfirmDialog'
 import ActionMenu from '../components/ui/ActionMenu'
+import EtaBadge from '../components/einvoice/EtaBadge'
+import useEta from '../components/einvoice/useEta'
+import { isEtaEditBlocked, isEtaLocked } from '../utils/einvoice'
 
 const UNITS = ['قطعة', 'كجم', 'طن', 'متر', 'م²', 'م³', 'لتر', 'ساعة', 'رحلة', 'مجموعة']
 
@@ -300,13 +303,15 @@ function InvoiceForm({ customers, onSave, onCancel, initial }) {
 }
 
 // ── Invoices list ──────────────────────────────────────────────
-export default function Invoices({ highlightId = null } = {}) {
+export default function Invoices({ highlightId = null, onNavigate } = {}) {
   const { canWrite } = useAuth()
   const write = canWrite('sales')
   const toast = useToast()
 
   const { data: invoices, loading, reload } = useApi(() => api.sales.invoices())
   const { data: customers } = useApi(() => api.customers.list())
+  // الفاتورة الإلكترونية (ETA): الأعمدة والإجراءات تظهر فقط عند تفعيل التكامل
+  const eta = useEta({ kind: 'invoice', reload, onNavigate })
 
   const [q, setQ] = useState('')
   const [view, setView] = useState('list')   // 'list' | 'create' | 'edit'
@@ -550,12 +555,13 @@ export default function Invoices({ highlightId = null } = {}) {
               <th>الإجمالي</th>
               <th>المدفوع</th>
               <th>الحالة</th>
+              {eta.enabled && <th>الضرائب</th>}
               <th style={{ width: 110 }}></th>
             </tr>
           </thead>
           <tbody>
             {!filtered.length && (
-              <tr><td colSpan={8} className="text-center text-erp-muted py-10">لا توجد فواتير</td></tr>
+              <tr><td colSpan={eta.enabled ? 9 : 8} className="text-center text-erp-muted py-10">لا توجد فواتير</td></tr>
             )}
             {filtered.map(inv => {
               const statusMap = {
@@ -579,6 +585,7 @@ export default function Invoices({ highlightId = null } = {}) {
                   <td className="font-semibold">{egp(inv.total)}</td>
                   <td style={{ color: 'var(--green)' }}>{egp(inv.paid_amount || 0)}</td>
                   <td><span className={`badge ${st.cls}`}>{st.label}</span></td>
+                  {eta.enabled && <td><EtaBadge doc={inv} onClick={() => eta.openState(inv, 'invoice')} /></td>}
                   <td>
                     <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
                       {write && inv.status !== 'paid' && outstanding > 0 && (
@@ -605,11 +612,14 @@ export default function Invoices({ highlightId = null } = {}) {
                           اتجمعوا في قائمة واحدة بدل ما يتكرروا كأزرار منفصلة في كل صف */}
                       <ActionMenu items={[
                         { label: 'طباعة الفاتورة', icon: '🖨️', onClick: () => api.sales.printInvoice(inv.id) },
+                        ...eta.menuItems(inv),
                         write && { label: 'نسخ الفاتورة', icon: '📋', disabled: copyingId === inv.id,
                           onClick: () => copyInvoice(inv) },
-                        write && inv.status !== 'paid' && { label: 'تعديل الفاتورة', icon: '✏️',
+                        write && inv.status !== 'paid' && { label: isEtaEditBlocked(inv) ? 'تعديل الفاتورة (مقفلة — أُرسلت للضرائب)' : 'تعديل الفاتورة', icon: '✏️',
+                          disabled: isEtaEditBlocked(inv),
                           onClick: () => { setEditingInvoice(inv); setView('edit') } },
-                        write && { label: 'حذف الفاتورة', icon: '🗑️', danger: true,
+                        write && { label: isEtaLocked(inv) ? 'حذف الفاتورة (مقفلة — أُرسلت للضرائب)' : 'حذف الفاتورة', icon: '🗑️', danger: true,
+                          disabled: isEtaLocked(inv),
                           onClick: () => setConfirmDelete(inv.id) },
                       ]} />
                     </div>
@@ -665,6 +675,8 @@ export default function Invoices({ highlightId = null } = {}) {
         message="هل تريد حذف هذه الفاتورة نهائياً؟"
         onConfirm={() => { handleDelete(confirmDelete); setConfirmDelete(null) }}
         onCancel={() => setConfirmDelete(null)} />
+
+      {eta.element}
 
       {/* محطة 4: جدولة أقساط الفاتورة */}
       <Modal open={!!scheduleModal} onClose={() => setScheduleModal(null)}

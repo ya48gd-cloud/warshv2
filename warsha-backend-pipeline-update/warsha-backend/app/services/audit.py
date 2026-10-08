@@ -42,6 +42,7 @@ ACTION_LABELS: Dict[str, str] = {
 IGNORED_TABLES = frozenset({
     "audit_logs", "analytics_events", "stock_quants", "material_bin_stock",
     "mrp_suggestions", "material_price_history", "backup_runs",
+    "einvoice_submissions",
 })
 GLOBAL_IGNORED_COLUMNS = frozenset({"created_at", "updated_at"})
 TABLE_IGNORED_COLUMNS: Dict[str, frozenset] = {"users": frozenset({"last_login"})}
